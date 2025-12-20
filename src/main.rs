@@ -615,32 +615,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&uniqid);
         }
         ubx::UbxCommand::Poll { class, id } => {
-            // Get message flags to check if message is enabled
-            let flags = {
-                let flags = MSG_FLAGS_STATE.lock().await;
-                *flags
-            };
-
-            match (*class, *id) {
-                // MON-HW poll (0x0A 0x09)
-                (0x0A, 0x09) if flags.mon_hw => {
-                    info!("MON-HW poll received");
-                    send_ubx_message(&MonHw::default());
-                }
-                // MON-COMMS poll (0x0A 0x36)
-                (0x0A, 0x36) if flags.mon_comms => {
-                    info!("MON-COMMS poll received");
-                    send_ubx_message(&MonComms::default());
-                }
-                // MON-RF poll (0x0A 0x38)
-                (0x0A, 0x38) if flags.mon_rf => {
-                    info!("MON-RF poll received");
-                    send_ubx_message(&MonRf::default());
-                }
-                _ => {
-                    info!("Unhandled poll: class=0x{:02X} id=0x{:02X}", class, id);
-                }
-            }
+            info!("Unhandled poll: class=0x{:02X} id=0x{:02X}", class, id);
         }
         ubx::UbxCommand::Unknown => {
             warn!("Unknown UBX command");
@@ -933,14 +908,63 @@ async fn nav_message_task() {
     }
 }
 
-/// MON message task - placeholder (MON messages are poll-only)
-/// MON-HW, MON-COMMS, MON-RF are sent only in response to poll requests
+/// MON message task - sends monitoring messages at 1Hz when enabled
 #[embassy_executor::task]
 async fn mon_message_task() {
-    // MON messages are poll-only, not periodic
-    // Poll handling is done in handle_ubx_command
+    // Wait for message output to start
+    MSG_OUTPUT_STARTED.wait().await;
+    Timer::after(Duration::from_secs(1)).await;
+    info!("MON message task started");
+
+    let mut ticker = Ticker::every(Duration::from_secs(1));
+    let mut buf = [0u8; 128];
+
     loop {
-        Timer::after(Duration::from_secs(60)).await;
+        ticker.next().await;
+
+        let mode = OperatingMode::load();
+        if mode != OperatingMode::Emulation {
+            continue;
+        }
+
+        // Get current message flags
+        let flags = {
+            let flags = MSG_FLAGS_STATE.lock().await;
+            *flags
+        };
+
+        // MON-HW (0x0A 0x09)
+        if flags.mon_hw {
+            let msg = MonHw::default();
+            let len = msg.build(&mut buf);
+            if len > 0 {
+                let mut vec = heapless::Vec::new();
+                let _ = vec.extend_from_slice(&buf[..len]);
+                let _ = TX_CHANNEL.try_send(vec);
+            }
+        }
+
+        // MON-COMMS (0x0A 0x36)
+        if flags.mon_comms {
+            let msg = MonComms::default();
+            let len = msg.build(&mut buf);
+            if len > 0 {
+                let mut vec = heapless::Vec::new();
+                let _ = vec.extend_from_slice(&buf[..len]);
+                let _ = TX_CHANNEL.try_send(vec);
+            }
+        }
+
+        // MON-RF (0x0A 0x38)
+        if flags.mon_rf {
+            let msg = MonRf::default();
+            let len = msg.build(&mut buf);
+            if len > 0 {
+                let mut vec = heapless::Vec::new();
+                let _ = vec.extend_from_slice(&buf[..len]);
+                let _ = TX_CHANNEL.try_send(vec);
+            }
+        }
     }
 }
 
