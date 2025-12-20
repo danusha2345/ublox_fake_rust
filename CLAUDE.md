@@ -121,10 +121,12 @@ Algorithm:
 
 | Metric | C/FreeRTOS | Rust/Embassy |
 |--------|------------|--------------|
-| text (code) | 55.8 KB | 52.7 KB |
-| bss (RAM) | **133 KB** | **3.8 KB** |
+| text (code) | 55.8 KB | **34.8 KB** |
+| bss (RAM) | **133 KB** | **13.5 KB** |
 
-Embassy async uses stackless coroutines - no separate stack per task. FreeRTOS allocates fixed stacks for each task.
+Rust/Embassy advantages:
+- Stackless coroutines - no separate stack per task (FreeRTOS allocates fixed stacks)
+- Messages built dynamically from struct fields instead of static byte arrays
 
 ## Dynamic Configuration
 
@@ -153,12 +155,52 @@ Uses direct UART0 register access via `rp-pac` crate (embassy-rp doesn't expose 
 
 ## Known TODOs
 
-1. ~~`nav_message_task` - message sending~~ ✅ Implemented: NAV-PVT, NAV-STATUS, NAV-DOP, NAV-EOE
-2. `mon_message_task` - MON-HW, MON-COMMS, MON-RF message structs not implemented
+1. ~~`nav_message_task` - message sending~~ ✅ Implemented: All NAV, TIM, RXM messages
+2. ~~`mon_message_task` - MON messages~~ ✅ Implemented: MON-HW, MON-COMMS, MON-RF
 3. Passthrough mode - not implemented
 4. ECDSA signing - placeholder only (p192 v0.13 lacks SignPrimitive trait), generates deterministic but not cryptographically valid signatures
 5. ~~CFG-PRT baudrate change~~ ✅ Implemented via direct PAC register access
 6. Release build needs `cc` in PATH for build scripts
+
+## Implemented UBX Messages
+
+### NAV Class (0x01) - Navigation
+| ID | Name | Payload | Description |
+|----|------|---------|-------------|
+| 0x01 | NAV-POSECEF | 20 | Position in ECEF |
+| 0x02 | NAV-POSLLH | 28 | Position in LLH |
+| 0x03 | NAV-STATUS | 16 | Receiver status |
+| 0x04 | NAV-DOP | 18 | Dilution of precision |
+| 0x07 | NAV-PVT | 92 | Position/Velocity/Time |
+| 0x11 | NAV-VELECEF | 20 | Velocity in ECEF |
+| 0x12 | NAV-VELNED | 36 | Velocity in NED |
+| 0x13 | NAV-HPPOSECEF | 28 | High precision ECEF |
+| 0x20 | NAV-TIMEGPS | 16 | GPS time solution |
+| 0x21 | NAV-TIMEUTC | 20 | UTC time solution |
+| 0x22 | NAV-CLOCK | 20 | Clock solution |
+| 0x26 | NAV-TIMELS | 24 | Leap second info |
+| 0x30 | NAV-SVINFO | 8+12n | Satellite info (legacy) |
+| 0x35 | NAV-SAT | 8+12n | Satellite info (M10) |
+| 0x36 | NAV-COV | 64 | Covariance matrices |
+| 0x60 | NAV-AOPSTATUS | 16 | AssistNow status |
+| 0x61 | NAV-EOE | 4 | End of epoch |
+
+### MON Class (0x0A) - Monitoring
+| ID | Name | Payload | Description |
+|----|------|---------|-------------|
+| 0x04 | MON-VER | 160 | Version info (poll) |
+| 0x09 | MON-HW | 60 | Hardware status |
+| 0x36 | MON-COMMS | 8 | Communication port info |
+| 0x38 | MON-RF | 24 | RF information |
+
+### Other Classes
+| Class | ID | Name | Payload | Description |
+|-------|-----|------|---------|-------------|
+| 0x02 | 0x15 | RXM-RAWX | 16+ | Raw measurements |
+| 0x05 | 0x01 | ACK-ACK | 2 | Acknowledgement |
+| 0x0D | 0x01 | TIM-TP | 16 | Timepulse |
+| 0x27 | 0x01 | SEC-SIGN | 108 | Signature |
+| 0x27 | 0x03 | SEC-UNIQID | 10 | Unique ID (poll) |
 
 ## Embassy 0.9 API Notes
 

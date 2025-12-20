@@ -447,3 +447,791 @@ impl UbxMessage for SecUniqid {
         10
     }
 }
+
+// ============================================================================
+// Additional NAV messages
+// ============================================================================
+
+/// UBX-NAV-VELNED (0x01 0x12) - Velocity in NED frame
+#[derive(Clone, Default)]
+pub struct NavVelned {
+    pub itow: u32,
+    pub vel_n: i32,     // cm/s
+    pub vel_e: i32,     // cm/s
+    pub vel_d: i32,     // cm/s
+    pub speed: u32,     // cm/s (3D speed)
+    pub g_speed: u32,   // cm/s (ground speed)
+    pub heading: i32,   // deg * 1e-5
+    pub s_acc: u32,     // cm/s
+    pub c_acc: u32,     // deg * 1e-5
+}
+
+impl UbxMessage for NavVelned {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x12 }
+    fn payload_len(&self) -> u16 { 36 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.vel_n.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.vel_e.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.vel_d.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.speed.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.g_speed.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.heading.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.s_acc.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.c_acc.to_le_bytes());
+        36
+    }
+}
+
+/// UBX-NAV-VELECEF (0x01 0x11) - Velocity in ECEF coordinates
+#[derive(Clone, Default)]
+pub struct NavVelecef {
+    pub itow: u32,
+    pub ecef_vx: i32,   // cm/s
+    pub ecef_vy: i32,   // cm/s
+    pub ecef_vz: i32,   // cm/s
+    pub s_acc: u32,     // cm/s
+}
+
+impl UbxMessage for NavVelecef {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x11 }
+    fn payload_len(&self) -> u16 { 20 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.ecef_vx.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.ecef_vy.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.ecef_vz.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.s_acc.to_le_bytes());
+        20
+    }
+}
+
+/// UBX-NAV-TIMEUTC (0x01 0x21) - UTC Time Solution
+#[derive(Clone)]
+pub struct NavTimeutc {
+    pub itow: u32,
+    pub t_acc: u32,     // ns
+    pub nano: i32,      // ns
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub min: u8,
+    pub sec: u8,
+    pub valid: u8,
+}
+
+impl Default for NavTimeutc {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            t_acc: 20,
+            nano: 0,
+            year: 2025,
+            month: 1,
+            day: 1,
+            hour: 12,
+            min: 0,
+            sec: 0,
+            valid: 0xF7,  // UTC valid
+        }
+    }
+}
+
+impl UbxMessage for NavTimeutc {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x21 }
+    fn payload_len(&self) -> u16 { 20 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.t_acc.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.nano.to_le_bytes());
+        buf[12..14].copy_from_slice(&self.year.to_le_bytes());
+        buf[14] = self.month;
+        buf[15] = self.day;
+        buf[16] = self.hour;
+        buf[17] = self.min;
+        buf[18] = self.sec;
+        buf[19] = self.valid;
+        20
+    }
+}
+
+/// UBX-NAV-TIMEGPS (0x01 0x20) - GPS Time Solution
+#[derive(Clone)]
+pub struct NavTimegps {
+    pub itow: u32,
+    pub f_tow: i32,     // ns (fractional)
+    pub week: i16,
+    pub leap_s: i8,
+    pub valid: u8,
+    pub t_acc: u32,     // ns
+}
+
+impl Default for NavTimegps {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            f_tow: 0,
+            week: 2349,  // Example GPS week
+            leap_s: 18,
+            valid: 0x07, // towValid|weekValid|leapSValid
+            t_acc: 20,
+        }
+    }
+}
+
+impl UbxMessage for NavTimegps {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x20 }
+    fn payload_len(&self) -> u16 { 16 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.f_tow.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.week.to_le_bytes());
+        buf[10] = self.leap_s as u8;
+        buf[11] = self.valid;
+        buf[12..16].copy_from_slice(&self.t_acc.to_le_bytes());
+        16
+    }
+}
+
+/// UBX-NAV-CLOCK (0x01 0x22) - Clock Solution
+#[derive(Clone, Default)]
+pub struct NavClock {
+    pub itow: u32,
+    pub clk_b: i32,     // ns (clock bias)
+    pub clk_d: i32,     // ns/s (clock drift)
+    pub t_acc: u32,     // ns
+    pub f_acc: u32,     // ps/s
+}
+
+impl UbxMessage for NavClock {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x22 }
+    fn payload_len(&self) -> u16 { 20 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.clk_b.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.clk_d.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.t_acc.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.f_acc.to_le_bytes());
+        20
+    }
+}
+
+/// UBX-NAV-TIMELS (0x01 0x26) - Leap Second Event Information
+#[derive(Clone)]
+pub struct NavTimels {
+    pub itow: u32,
+    pub version: u8,
+    pub reserved1: [u8; 3],
+    pub src_of_curr_ls: u8,
+    pub curr_ls: i8,
+    pub src_of_ls_change: u8,
+    pub ls_change: i8,
+    pub time_to_ls_event: i32,
+    pub date_of_ls_gps_wn: u16,
+    pub date_of_ls_gps_dn: u16,
+    pub reserved2: [u8; 3],
+    pub valid: u8,
+}
+
+impl Default for NavTimels {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            version: 0x01,
+            reserved1: [0; 3],
+            src_of_curr_ls: 0x02,  // GPS
+            curr_ls: 18,
+            src_of_ls_change: 0x02,
+            ls_change: 0,
+            time_to_ls_event: 0,
+            date_of_ls_gps_wn: 0,
+            date_of_ls_gps_dn: 0,
+            reserved2: [0; 3],
+            valid: 0x03,
+        }
+    }
+}
+
+impl UbxMessage for NavTimels {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x26 }
+    fn payload_len(&self) -> u16 { 24 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4] = self.version;
+        buf[5..8].copy_from_slice(&self.reserved1);
+        buf[8] = self.src_of_curr_ls;
+        buf[9] = self.curr_ls as u8;
+        buf[10] = self.src_of_ls_change;
+        buf[11] = self.ls_change as u8;
+        buf[12..16].copy_from_slice(&self.time_to_ls_event.to_le_bytes());
+        buf[16..18].copy_from_slice(&self.date_of_ls_gps_wn.to_le_bytes());
+        buf[18..20].copy_from_slice(&self.date_of_ls_gps_dn.to_le_bytes());
+        buf[20..23].copy_from_slice(&self.reserved2);
+        buf[23] = self.valid;
+        24
+    }
+}
+
+/// UBX-NAV-AOPSTATUS (0x01 0x60) - AssistNow Autonomous Status
+#[derive(Clone)]
+pub struct NavAopstatus {
+    pub itow: u32,
+    pub config: u8,
+    pub status: u8,
+    pub reserved1: [u8; 10],
+}
+
+impl Default for NavAopstatus {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            config: 0x01,  // AOP enabled
+            status: 0x00,  // idle
+            reserved1: [0; 10],
+        }
+    }
+}
+
+impl UbxMessage for NavAopstatus {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x60 }
+    fn payload_len(&self) -> u16 { 16 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4] = self.config;
+        buf[5] = self.status;
+        buf[6..16].copy_from_slice(&self.reserved1);
+        16
+    }
+}
+
+/// UBX-NAV-COV (0x01 0x36) - Covariance Matrices
+#[derive(Clone)]
+pub struct NavCov {
+    pub itow: u32,
+    pub version: u8,
+    pub pos_cov_valid: u8,
+    pub vel_cov_valid: u8,
+    pub reserved1: [u8; 9],
+    pub pos_cov_nn: f32,
+    pub pos_cov_ne: f32,
+    pub pos_cov_nd: f32,
+    pub pos_cov_ee: f32,
+    pub pos_cov_ed: f32,
+    pub pos_cov_dd: f32,
+    pub vel_cov_nn: f32,
+    pub vel_cov_ne: f32,
+    pub vel_cov_nd: f32,
+    pub vel_cov_ee: f32,
+    pub vel_cov_ed: f32,
+    pub vel_cov_dd: f32,
+}
+
+impl Default for NavCov {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            version: 0,
+            pos_cov_valid: 0x03,
+            vel_cov_valid: 0x03,
+            reserved1: [0; 9],
+            pos_cov_nn: 1.0,
+            pos_cov_ne: 0.0,
+            pos_cov_nd: 0.0,
+            pos_cov_ee: 1.0,
+            pos_cov_ed: 0.0,
+            pos_cov_dd: 1.0,
+            vel_cov_nn: 1.0,
+            vel_cov_ne: 0.0,
+            vel_cov_nd: 0.0,
+            vel_cov_ee: 1.0,
+            vel_cov_ed: 0.0,
+            vel_cov_dd: 1.0,
+        }
+    }
+}
+
+impl UbxMessage for NavCov {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x36 }
+    fn payload_len(&self) -> u16 { 64 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4] = self.version;
+        buf[5] = self.pos_cov_valid;
+        buf[6] = self.vel_cov_valid;
+        buf[7..16].copy_from_slice(&self.reserved1);
+        buf[16..20].copy_from_slice(&self.pos_cov_nn.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.pos_cov_ne.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.pos_cov_nd.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.pos_cov_ee.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.pos_cov_ed.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.pos_cov_dd.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.vel_cov_nn.to_le_bytes());
+        buf[44..48].copy_from_slice(&self.vel_cov_ne.to_le_bytes());
+        buf[48..52].copy_from_slice(&self.vel_cov_nd.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.vel_cov_ee.to_le_bytes());
+        buf[56..60].copy_from_slice(&self.vel_cov_ed.to_le_bytes());
+        buf[60..64].copy_from_slice(&self.vel_cov_dd.to_le_bytes());
+        64
+    }
+}
+
+/// UBX-NAV-HPPOSECEF (0x01 0x13) - High Precision Position ECEF
+#[derive(Clone, Default)]
+pub struct NavHpposecef {
+    pub version: u8,
+    pub reserved1: [u8; 3],
+    pub itow: u32,
+    pub ecef_x: i32,     // cm
+    pub ecef_y: i32,     // cm
+    pub ecef_z: i32,     // cm
+    pub ecef_x_hp: i8,   // 0.1mm
+    pub ecef_y_hp: i8,   // 0.1mm
+    pub ecef_z_hp: i8,   // 0.1mm
+    pub flags: u8,
+    pub p_acc: u32,      // 0.1mm
+}
+
+impl UbxMessage for NavHpposecef {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x13 }
+    fn payload_len(&self) -> u16 { 28 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.version;
+        buf[1..4].copy_from_slice(&self.reserved1);
+        buf[4..8].copy_from_slice(&self.itow.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.ecef_x.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.ecef_y.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.ecef_z.to_le_bytes());
+        buf[20] = self.ecef_x_hp as u8;
+        buf[21] = self.ecef_y_hp as u8;
+        buf[22] = self.ecef_z_hp as u8;
+        buf[23] = self.flags;
+        buf[24..28].copy_from_slice(&self.p_acc.to_le_bytes());
+        28
+    }
+}
+
+/// Satellite info entry for NAV-SAT
+#[derive(Clone, Copy, Default)]
+pub struct SatInfo {
+    pub gnss_id: u8,
+    pub sv_id: u8,
+    pub cno: u8,        // dBHz
+    pub elev: i8,       // degrees
+    pub azim: i16,      // degrees
+    pub pr_res: i16,    // 0.1m
+    pub flags: u32,
+}
+
+/// UBX-NAV-SAT (0x01 0x35) - Satellite Information (M10)
+#[derive(Clone)]
+pub struct NavSat {
+    pub itow: u32,
+    pub version: u8,
+    pub num_svs: u8,
+    pub reserved1: [u8; 2],
+    pub sats: [SatInfo; 12],  // Max 12 satellites
+}
+
+impl Default for NavSat {
+    fn default() -> Self {
+        // Default satellite constellation (like C version)
+        let mut sats = [SatInfo::default(); 12];
+        let flags = 0x0000191F_u32; // qualityInd=7, svUsed=1, health=1, etc.
+
+        sats[0] = SatInfo { gnss_id: 0, sv_id: 2, cno: 46, elev: 52, azim: 154, pr_res: 0, flags };
+        sats[1] = SatInfo { gnss_id: 0, sv_id: 7, cno: 46, elev: 59, azim: 206, pr_res: 0, flags };
+        sats[2] = SatInfo { gnss_id: 0, sv_id: 8, cno: 46, elev: 51, azim: 56, pr_res: 0, flags };
+        sats[3] = SatInfo { gnss_id: 0, sv_id: 13, cno: 46, elev: 30, azim: 314, pr_res: 0, flags };
+        sats[4] = SatInfo { gnss_id: 0, sv_id: 14, cno: 46, elev: 32, azim: 295, pr_res: 0, flags };
+        sats[5] = SatInfo { gnss_id: 0, sv_id: 17, cno: 46, elev: 28, azim: 240, pr_res: 0, flags };
+        sats[6] = SatInfo { gnss_id: 0, sv_id: 21, cno: 46, elev: 59, azim: 119, pr_res: 0, flags };
+        sats[7] = SatInfo { gnss_id: 0, sv_id: 22, cno: 46, elev: 13, azim: 290, pr_res: 0, flags };
+        sats[8] = SatInfo { gnss_id: 0, sv_id: 27, cno: 46, elev: 29, azim: 18, pr_res: 0, flags };
+        sats[9] = SatInfo { gnss_id: 0, sv_id: 30, cno: 46, elev: 17, azim: 59, pr_res: 0, flags };
+        sats[10] = SatInfo { gnss_id: 1, sv_id: 133, cno: 46, elev: 56, azim: 276, pr_res: 0, flags };
+        sats[11] = SatInfo { gnss_id: 1, sv_id: 138, cno: 46, elev: 53, azim: 1, pr_res: 0, flags };
+
+        Self {
+            itow: 0,
+            version: 0x01,
+            num_svs: 12,
+            reserved1: [0; 2],
+            sats,
+        }
+    }
+}
+
+impl UbxMessage for NavSat {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x35 }
+    fn payload_len(&self) -> u16 { 8 + 12 * self.num_svs as u16 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4] = self.version;
+        buf[5] = self.num_svs;
+        buf[6..8].copy_from_slice(&self.reserved1);
+
+        let mut offset = 8;
+        for i in 0..self.num_svs as usize {
+            let sat = &self.sats[i];
+            buf[offset] = sat.gnss_id;
+            buf[offset + 1] = sat.sv_id;
+            buf[offset + 2] = sat.cno;
+            buf[offset + 3] = sat.elev as u8;
+            buf[offset + 4..offset + 6].copy_from_slice(&sat.azim.to_le_bytes());
+            buf[offset + 6..offset + 8].copy_from_slice(&sat.pr_res.to_le_bytes());
+            buf[offset + 8..offset + 12].copy_from_slice(&sat.flags.to_le_bytes());
+            offset += 12;
+        }
+        offset
+    }
+}
+
+/// Satellite info entry for NAV-SVINFO (legacy)
+#[derive(Clone, Copy, Default)]
+pub struct SvInfo {
+    pub chn: u8,
+    pub svid: u8,
+    pub flags: u8,
+    pub quality: u8,
+    pub cno: u8,
+    pub elev: i8,
+    pub azim: i16,
+    pub pr_res: i32,    // cm
+}
+
+/// UBX-NAV-SVINFO (0x01 0x30) - Satellite Information (legacy)
+#[derive(Clone)]
+pub struct NavSvinfo {
+    pub itow: u32,
+    pub num_ch: u8,
+    pub global_flags: u8,
+    pub reserved1: [u8; 2],
+    pub svs: [SvInfo; 12],
+}
+
+impl Default for NavSvinfo {
+    fn default() -> Self {
+        let mut svs = [SvInfo::default(); 12];
+        let flags = 0x0D;
+        let quality = 0x07;
+
+        svs[0] = SvInfo { chn: 4, svid: 2, flags, quality, cno: 46, elev: 52, azim: 154, pr_res: -1511 };
+        svs[1] = SvInfo { chn: 0, svid: 7, flags, quality, cno: 46, elev: 59, azim: 206, pr_res: -1455 };
+        svs[2] = SvInfo { chn: 7, svid: 8, flags, quality, cno: 46, elev: 51, azim: 56, pr_res: -1411 };
+        svs[3] = SvInfo { chn: 10, svid: 13, flags, quality, cno: 46, elev: 30, azim: 314, pr_res: -1387 };
+        svs[4] = SvInfo { chn: 5, svid: 14, flags, quality, cno: 46, elev: 32, azim: 295, pr_res: -1366 };
+        svs[5] = SvInfo { chn: 1, svid: 17, flags, quality, cno: 46, elev: 28, azim: 240, pr_res: -1439 };
+        svs[6] = SvInfo { chn: 3, svid: 21, flags, quality, cno: 46, elev: 59, azim: 119, pr_res: -1373 };
+        svs[7] = SvInfo { chn: 9, svid: 22, flags, quality, cno: 46, elev: 13, azim: 290, pr_res: -1409 };
+        svs[8] = SvInfo { chn: 6, svid: 27, flags, quality, cno: 46, elev: 29, azim: 18, pr_res: -1359 };
+        svs[9] = SvInfo { chn: 8, svid: 30, flags, quality, cno: 46, elev: 17, azim: 59, pr_res: -1484 };
+        svs[10] = SvInfo { chn: 2, svid: 133, flags, quality, cno: 46, elev: 56, azim: 276, pr_res: -1431 };
+        svs[11] = SvInfo { chn: 11, svid: 138, flags, quality, cno: 46, elev: 53, azim: 1, pr_res: -1431 };
+
+        Self {
+            itow: 0,
+            num_ch: 12,
+            global_flags: 0x04,
+            reserved1: [0; 2],
+            svs,
+        }
+    }
+}
+
+impl UbxMessage for NavSvinfo {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x30 }
+    fn payload_len(&self) -> u16 { 8 + 12 * self.num_ch as u16 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4] = self.num_ch;
+        buf[5] = self.global_flags;
+        buf[6..8].copy_from_slice(&self.reserved1);
+
+        let mut offset = 8;
+        for i in 0..self.num_ch as usize {
+            let sv = &self.svs[i];
+            buf[offset] = sv.chn;
+            buf[offset + 1] = sv.svid;
+            buf[offset + 2] = sv.flags;
+            buf[offset + 3] = sv.quality;
+            buf[offset + 4] = sv.cno;
+            buf[offset + 5] = sv.elev as u8;
+            buf[offset + 6..offset + 8].copy_from_slice(&sv.azim.to_le_bytes());
+            buf[offset + 8..offset + 12].copy_from_slice(&sv.pr_res.to_le_bytes());
+            offset += 12;
+        }
+        offset
+    }
+}
+
+// ============================================================================
+// MON messages
+// ============================================================================
+
+/// UBX-MON-HW (0x0A 0x09) - Hardware Status
+#[derive(Clone)]
+pub struct MonHw {
+    pub pin_sel: u32,
+    pub pin_bank: u32,
+    pub pin_dir: u32,
+    pub pin_val: u32,
+    pub noise_per_ms: u16,
+    pub agc_cnt: u16,
+    pub a_status: u8,
+    pub a_power: u8,
+    pub flags: u8,
+    pub reserved1: u8,
+    pub used_mask: u32,
+    pub vp: [u8; 17],
+    pub jam_ind: u8,
+    pub reserved2: [u8; 2],
+    pub pin_irq: u32,
+    pub pull_h: u32,
+    pub pull_l: u32,
+}
+
+impl Default for MonHw {
+    fn default() -> Self {
+        Self {
+            pin_sel: 0x00000020,
+            pin_bank: 0x00000003,
+            pin_dir: 0,
+            pin_val: 0,
+            noise_per_ms: 231,
+            agc_cnt: 66,
+            a_status: 76,
+            a_power: 0,
+            flags: 0xCE,
+            reserved1: 0x0D,
+            used_mask: 0x0FFC,
+            vp: [0x01, 0x02, 0x25, 0x86, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0F, 0x0E, 0x10, 0x12, 0x0A, 0x0B, 0x13],
+            jam_ind: 0x13,
+            reserved2: [0x0E, 0x5A],
+            pin_irq: 0,
+            pull_h: 0x000000ED,
+            pull_l: 0,
+        }
+    }
+}
+
+impl UbxMessage for MonHw {
+    fn class(&self) -> u8 { 0x0A }
+    fn id(&self) -> u8 { 0x09 }
+    fn payload_len(&self) -> u16 { 60 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.pin_sel.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.pin_bank.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.pin_dir.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.pin_val.to_le_bytes());
+        buf[16..18].copy_from_slice(&self.noise_per_ms.to_le_bytes());
+        buf[18..20].copy_from_slice(&self.agc_cnt.to_le_bytes());
+        buf[20] = self.a_status;
+        buf[21] = self.a_power;
+        buf[22] = self.flags;
+        buf[23] = self.reserved1;
+        buf[24..28].copy_from_slice(&self.used_mask.to_le_bytes());
+        buf[28..45].copy_from_slice(&self.vp);
+        buf[45] = self.jam_ind;
+        buf[46..48].copy_from_slice(&self.reserved2);
+        buf[48..52].copy_from_slice(&self.pin_irq.to_le_bytes());
+        buf[52..56].copy_from_slice(&self.pull_h.to_le_bytes());
+        buf[56..60].copy_from_slice(&self.pull_l.to_le_bytes());
+        60
+    }
+}
+
+/// UBX-MON-RF (0x0A 0x38) - RF Information
+#[derive(Clone)]
+pub struct MonRf {
+    pub version: u8,
+    pub n_blocks: u8,
+    pub reserved1: [u8; 2],
+    // One RF block:
+    pub block_id: u8,
+    pub flags: u8,
+    pub ant_status: u8,
+    pub ant_power: u8,
+    pub post_status: u32,
+    pub reserved2: [u8; 2],
+    pub noise_per_ms: u16,
+    pub agc_cnt: u16,
+    pub jam_ind: u8,
+    pub ofs_i: i8,
+    pub mag_i: u8,
+    pub ofs_q: i8,
+    pub mag_q: u8,
+    pub reserved3: u8,
+}
+
+impl Default for MonRf {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            n_blocks: 1,
+            reserved1: [0; 2],
+            block_id: 0,
+            flags: 0,
+            ant_status: 0,
+            ant_power: 0,
+            post_status: 0,
+            reserved2: [0; 2],
+            noise_per_ms: 90,
+            agc_cnt: 1488,
+            jam_ind: 8,
+            ofs_i: 0,
+            mag_i: 0,
+            ofs_q: 0,
+            mag_q: 0,
+            reserved3: 0,
+        }
+    }
+}
+
+impl UbxMessage for MonRf {
+    fn class(&self) -> u8 { 0x0A }
+    fn id(&self) -> u8 { 0x38 }
+    fn payload_len(&self) -> u16 { 24 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.version;
+        buf[1] = self.n_blocks;
+        buf[2..4].copy_from_slice(&self.reserved1);
+        buf[4] = self.block_id;
+        buf[5] = self.flags;
+        buf[6] = self.ant_status;
+        buf[7] = self.ant_power;
+        buf[8..12].copy_from_slice(&self.post_status.to_le_bytes());
+        buf[12..14].copy_from_slice(&self.reserved2);
+        buf[14..16].copy_from_slice(&self.noise_per_ms.to_le_bytes());
+        buf[16..18].copy_from_slice(&self.agc_cnt.to_le_bytes());
+        buf[18] = self.jam_ind;
+        buf[19] = self.ofs_i as u8;
+        buf[20] = self.mag_i;
+        buf[21] = self.ofs_q as u8;
+        buf[22] = self.mag_q;
+        buf[23] = self.reserved3;
+        24
+    }
+}
+
+/// UBX-MON-COMMS (0x0A 0x36) - Communication Port Information (minimal)
+#[derive(Clone, Default)]
+pub struct MonComms {
+    pub version: u8,
+    pub n_ports: u8,
+    pub tx_errors: u8,
+    pub reserved1: u8,
+    pub reserved2: [u8; 4],
+}
+
+impl UbxMessage for MonComms {
+    fn class(&self) -> u8 { 0x0A }
+    fn id(&self) -> u8 { 0x36 }
+    fn payload_len(&self) -> u16 { 8 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.version;
+        buf[1] = self.n_ports;
+        buf[2] = self.tx_errors;
+        buf[3] = self.reserved1;
+        buf[4..8].copy_from_slice(&self.reserved2);
+        8
+    }
+}
+
+// ============================================================================
+// TIM and RXM messages
+// ============================================================================
+
+/// UBX-TIM-TP (0x0D 0x01) - Timepulse
+#[derive(Clone)]
+pub struct TimTp {
+    pub tow_ms: u32,
+    pub tow_sub_ms: u32,
+    pub q_err: i32,
+    pub week: u16,
+    pub flags: u8,
+    pub ref_info: u8,
+}
+
+impl Default for TimTp {
+    fn default() -> Self {
+        Self {
+            tow_ms: 0,
+            tow_sub_ms: 0,
+            q_err: 0,
+            week: 2349,
+            flags: 0x1A,
+            ref_info: 0,
+        }
+    }
+}
+
+impl UbxMessage for TimTp {
+    fn class(&self) -> u8 { 0x0D }
+    fn id(&self) -> u8 { 0x01 }
+    fn payload_len(&self) -> u16 { 16 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.tow_ms.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.tow_sub_ms.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.q_err.to_le_bytes());
+        buf[12..14].copy_from_slice(&self.week.to_le_bytes());
+        buf[14] = self.flags;
+        buf[15] = self.ref_info;
+        16
+    }
+}
+
+/// UBX-RXM-RAWX (0x02 0x15) - Raw Measurement Data (minimal, no measurements)
+#[derive(Clone, Default)]
+pub struct RxmRawx {
+    pub rcv_tow: f64,
+    pub week: u16,
+    pub leap_s: i8,
+    pub num_meas: u8,
+    pub rec_stat: u8,
+    pub version: u8,
+    pub reserved1: [u8; 2],
+}
+
+impl UbxMessage for RxmRawx {
+    fn class(&self) -> u8 { 0x02 }
+    fn id(&self) -> u8 { 0x15 }
+    fn payload_len(&self) -> u16 { 16 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..8].copy_from_slice(&self.rcv_tow.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.week.to_le_bytes());
+        buf[10] = self.leap_s as u8;
+        buf[11] = self.num_meas;
+        buf[12] = self.rec_stat;
+        buf[13] = self.version;
+        buf[14..16].copy_from_slice(&self.reserved1);
+        16
+    }
+}
