@@ -126,13 +126,38 @@ Algorithm:
 
 Embassy async uses stackless coroutines - no separate stack per task. FreeRTOS allocates fixed stacks for each task.
 
+## Dynamic Configuration
+
+NAV message rate and UART baudrate can be changed at runtime via:
+
+### CFG-RATE (0x06, 0x08)
+- `meas_rate` (u16): Measurement period in ms (50-10000)
+- `nav_rate` (u16): Cycles per navigation solution (1-127)
+- `time_ref` (u16): Time reference (0=UTC, 1=GPS, etc.)
+
+Effective NAV period = `meas_rate × nav_rate`
+
+### CFG-VALSET (0x06, 0x8A) Keys
+| Key | Description | Type |
+|-----|-------------|------|
+| `0x30210001` | CFG-RATE-MEAS | u16 |
+| `0x30210002` | CFG-RATE-NAV | u16 |
+| `0x20210003` | CFG-RATE-TIMEREF | u8 |
+| `0x40520001` | CFG-UART1-BAUDRATE | u32 |
+| `0x20910007` | NAV-PVT enable | u8 |
+| `0x2091001B` | NAV-STATUS enable | u8 |
+| ... | (see `valset_keys` module in main.rs) | |
+
+### Baudrate Change Implementation
+Uses direct UART0 register access via `rp-pac` crate (embassy-rp doesn't expose baudrate change on BufferedUart).
+
 ## Known TODOs
 
 1. ~~`nav_message_task` - message sending~~ ✅ Implemented: NAV-PVT, NAV-STATUS, NAV-DOP, NAV-EOE
 2. `mon_message_task` - MON-HW, MON-COMMS, MON-RF message structs not implemented
 3. Passthrough mode - not implemented
 4. ECDSA signing - placeholder only (p192 v0.13 lacks SignPrimitive trait), generates deterministic but not cryptographically valid signatures
-5. CFG-PRT baudrate change - parsed but not applied
+5. ~~CFG-PRT baudrate change~~ ✅ Implemented via direct PAC register access
 6. Release build needs `cc` in PATH for build scripts
 
 ## Embassy 0.9 API Notes
