@@ -658,6 +658,13 @@ async fn nav_message_task() {
             *flags
         };
 
+        // Get system time (seconds since start)
+        let now = embassy_time::Instant::now();
+        let total_secs = (now.as_millis() / 1000) as u32;
+        let sec = (total_secs % 60) as u8;
+        let min = ((total_secs / 60) % 60) as u8;
+        let hour = ((total_secs / 3600) % 24) as u8;
+
         // Build and send enabled NAV messages
         // Use 256-byte buffer for larger messages like NAV-SAT
         let mut buf = [0u8; 256];
@@ -666,6 +673,9 @@ async fn nav_message_task() {
         if flags.nav_pvt {
             let mut msg = NavPvt::default();
             msg.itow = itow;
+            msg.hour = hour;
+            msg.min = min;
+            msg.sec = sec;
             let len = msg.build(&mut buf);
             if len > 0 {
                 let mut vec = heapless::Vec::new();
@@ -789,6 +799,9 @@ async fn nav_message_task() {
         if flags.nav_timeutc {
             let mut msg = NavTimeutc::default();
             msg.itow = itow;
+            msg.hour = hour;
+            msg.min = min;
+            msg.sec = sec;
             let len = msg.build(&mut buf);
             if len > 0 {
                 let mut vec = heapless::Vec::new();
