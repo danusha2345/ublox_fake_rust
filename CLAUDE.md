@@ -6,6 +6,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 u-blox GNSS M8/M10 emulator written in Rust for RP2040/RP2350 microcontrollers. Uses Embassy async framework instead of FreeRTOS.
 
+**Original C version**: `../ublox_fake_unified/` - FreeRTOS based, for reference.
+
+## CRITICAL: Version Dependencies
+
+These version mismatches caused build failures - DO NOT change without testing:
+
+| Crate | Version | Why |
+|-------|---------|-----|
+| `embedded-io-async` | **0.6** | MUST match embassy-rp internals. v0.7 breaks trait resolution! |
+| `pio` | **0.3** | Only v0.3 exports `pio_asm!` macro. v0.2 has only struct API |
+| `embassy-rp` | 0.9 | Latest as of Dec 2024. API changed from 0.8 |
+
+## Build Environment
+
+```bash
+# Rust may not be in PATH, check:
+PATH="/home2/.cargo/bin:$PATH"
+
+# Required target
+rustup target add thumbv6m-none-eabi      # RP2040
+rustup target add thumbv8m.main-none-eabihf  # RP2350
+```
+
+## Required Files
+
+- `memory.x` - Linker script defining RP2040 memory layout (BOOT2, FLASH, RAM). Build fails without it!
+- `.cargo/config.toml` - Target selection and linker flags
+
 ## Build Commands
 
 ```bash
@@ -72,3 +100,37 @@ cargo rp2350    # build for RP2350
 - All messages use 0xB5 0x62 sync header
 - Checksum: Fletcher 8-bit over class, id, length, payload
 - SEC-SIGN uses SHA256 hash folded to 24 bytes, signed with SECP192R1
+
+## SEC-SIGN Cryptography
+
+Private key location: `src/sec_sign.rs` line 8 (`PRIVATE_KEY` constant)
+
+Algorithm:
+1. Accumulate all transmitted UBX messages in SHA256 hasher
+2. Compute `z = fold(SHA256(sha256_field || session_id))` - fold 32→24 bytes via XOR
+3. Sign `z` with ECDSA SECP192R1 (P-192 curve)
+4. Output: 48-byte signature (r=24, s=24) in UBX-SEC-SIGN message
+
+## RAM Usage Comparison (vs C/FreeRTOS)
+
+| Metric | C/FreeRTOS | Rust/Embassy |
+|--------|------------|--------------|
+| text (code) | 55.8 KB | 52.7 KB |
+| bss (RAM) | **133 KB** | **3.8 KB** |
+
+Embassy async uses stackless coroutines - no separate stack per task. FreeRTOS allocates fixed stacks for each task.
+
+## Known TODOs
+
+1. `nav_message_task` / `mon_message_task` - message sending not implemented (just timers)
+2. Passthrough mode - not implemented
+3. Actual ECDSA signing in `sec_sign.rs` - placeholder only, needs `p192::ecdsa::SigningKey`
+4. CFG-PRT baudrate change - parsed but not applied
+5. Release build needs `cc` in PATH for build scripts
+
+## Embassy 0.9 API Notes
+
+- `BufferedUartTx` / `BufferedUartRx` have no lifetime parameters (changed from 0.8)
+- `Signal::try_get()` doesn't exist - use `AtomicU8` for shared mode state
+- PIO pin wrapping: `Peri<'d, PIN>` not raw pin type
+- Interrupt binding: `bind_interrupts!` macro required
