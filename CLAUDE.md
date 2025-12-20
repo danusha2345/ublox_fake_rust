@@ -86,13 +86,32 @@ cargo rp2350    # build for RP2350
 - `src/led.rs` - WS2812 driver using PIO (`pio::pio_asm!` macro)
 - `src/sec_sign.rs` - SHA256 accumulator for SEC-SIGN authentication
 - `src/config.rs` - Pin assignments, timing constants, default position
+- `src/passthrough.rs` - PIO-based UART passthrough driver
+- `src/flash_storage.rs` - Flash persistence for operating mode
 
 ### Operating Modes
-- **Emulation**: Generates fake GNSS data with SEC-SIGN authentication
-- **Passthrough**: Forwards data from real GNSS module (not yet implemented)
+- **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green)
+- **Passthrough**: Forwards data from real GNSS module via PIO (LED blue)
+
+Mode is persisted to flash and survives reboots. Button press toggles mode and reboots.
+
+### Passthrough Implementation
+- Uses PIO1 state machine 0 for signal copying
+- Input: GPIO3 (from external GNSS TX)
+- Output: GPIO0 (to host, same as UART TX)
+- PIO program waits for pin state changes and copies them:
+```asm
+.wrap_target
+    wait 1 pin 0    ; wait for input high
+    set pins, 1     ; set output high
+    wait 0 pin 0    ; wait for input low
+    set pins, 0     ; set output low
+.wrap
+```
 
 ## Hardware Pins (RP2040)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud default)
+- Passthrough input: GPIO3 (external GNSS TX)
 - WS2812 LED: GPIO16 (PIO0)
 - Mode button: GPIO6 (input), GPIO5 (power)
 
@@ -109,24 +128,31 @@ cargo rp2350    # build for RP2350
 
 ## SEC-SIGN Cryptography
 
-Private key location: `src/sec_sign.rs` line 8 (`PRIVATE_KEY` constant)
+Private key location: `src/sec_sign.rs` line 19 (`PRIVATE_KEY` constant)
+
+**Implementation**: Pure Rust using `p192` crate primitives (no C dependencies)
 
 Algorithm:
 1. Accumulate all transmitted UBX messages in SHA256 hasher
 2. Compute `z = fold(SHA256(sha256_field || session_id))` - fold 32→24 bytes via XOR
-3. Sign `z` with ECDSA SECP192R1 (P-192 curve)
-4. Output: 48-byte signature (r=24, s=24) in UBX-SEC-SIGN message
+3. Generate deterministic `k` using HMAC-SHA256 (simplified RFC6979)
+4. Compute R = k * G, r = R.x mod n
+5. Compute s = k^(-1) * (z + r * d) mod n
+6. Output: 48-byte signature (r=24, s=24) in UBX-SEC-SIGN message
 
-## RAM Usage Comparison (vs C/FreeRTOS)
+Key crates: `p192` (elliptic curve), `sha2` (hashing), `hmac` (deterministic k)
+
+## RAM/Flash Usage Comparison (vs C/FreeRTOS)
 
 | Metric | C/FreeRTOS | Rust/Embassy |
 |--------|------------|--------------|
-| text (code) | 55.8 KB | **34.8 KB** |
+| text (code) | 55.8 KB | **97.7 KB** |
 | bss (RAM) | **133 KB** | **13.5 KB** |
 
-Rust/Embassy advantages:
-- Stackless coroutines - no separate stack per task (FreeRTOS allocates fixed stacks)
-- Messages built dynamically from struct fields instead of static byte arrays
+Notes:
+- Code size increased due to pure Rust P-192 elliptic curve arithmetic (vs C micro-ecc)
+- RAM usage remains 10x lower - stackless coroutines vs FreeRTOS task stacks
+- Trade-off: larger code, no C dependencies, fully auditable Rust crypto
 
 ## Dynamic Configuration
 
@@ -157,10 +183,10 @@ Uses direct UART0 register access via `rp-pac` crate (embassy-rp doesn't expose 
 
 1. ~~`nav_message_task` - message sending~~ ✅ Implemented: All NAV, TIM, RXM messages
 2. ~~`mon_message_task` - MON messages~~ ✅ Implemented: MON-HW, MON-COMMS, MON-RF
-3. Passthrough mode - not implemented
-4. ECDSA signing - placeholder only (p192 v0.13 lacks SignPrimitive trait), generates deterministic but not cryptographically valid signatures
+3. ~~Passthrough mode~~ ✅ Implemented: PIO-based GPIO3→GPIO0 with flash mode persistence
+4. ~~ECDSA signing~~ ✅ Implemented: Pure Rust using p192 primitives with RFC6979 deterministic k
 5. ~~CFG-PRT baudrate change~~ ✅ Implemented via direct PAC register access
-6. Release build needs `cc` in PATH for build scripts
+6. ~~Release build~~ ✅ No C dependencies, pure Rust build
 
 ## Implemented UBX Messages
 

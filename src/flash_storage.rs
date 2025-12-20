@@ -1,0 +1,68 @@
+//! Flash storage for persistent mode
+
+use embassy_rp::flash::{Async, Flash, ERASE_SIZE};
+use embassy_rp::peripherals::FLASH;
+
+/// Magic value to identify valid flash data
+const FLASH_MAGIC: u32 = 0xDEADBEEF;
+
+/// Flash offset - last sector (2MB flash - 4KB sector)
+/// RP2040 has 2MB flash, last sector at 0x1FF000
+const FLASH_OFFSET: u32 = 0x1FF000;
+
+/// Mode data stored in flash
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModeData {
+    pub magic: u32,
+    pub mode: u8,  // 0 = emulation, 1 = passthrough
+    pub _reserved: [u8; 3],
+}
+
+impl Default for ModeData {
+    fn default() -> Self {
+        Self {
+            magic: FLASH_MAGIC,
+            mode: 0,
+            _reserved: [0; 3],
+        }
+    }
+}
+
+/// Save mode to flash
+pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>, mode: u8) {
+    let mut data = [0u8; ERASE_SIZE];
+
+    // Prepare data
+    let mode_data = ModeData {
+        magic: FLASH_MAGIC,
+        mode,
+        _reserved: [0; 3],
+    };
+
+    // Copy to buffer
+    unsafe {
+        let ptr = &mode_data as *const ModeData as *const u8;
+        core::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), core::mem::size_of::<ModeData>());
+    }
+
+    // Erase sector
+    let _ = flash.blocking_erase(FLASH_OFFSET, FLASH_OFFSET + ERASE_SIZE as u32);
+
+    // Write data
+    let _ = flash.blocking_write(FLASH_OFFSET, &data[..256]); // Write one page
+}
+
+/// Load mode from flash, returns None if no valid data
+pub fn load_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>) -> Option<u8> {
+    let mut buf = [0u8; 8];
+
+    if flash.blocking_read(FLASH_OFFSET, &mut buf).is_ok() {
+        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic == FLASH_MAGIC {
+            return Some(buf[4]);
+        }
+    }
+
+    None
+}

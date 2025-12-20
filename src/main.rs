@@ -10,18 +10,21 @@
 #![no_main]
 
 mod config;
+mod flash_storage;
 mod led;
+mod passthrough;
 mod sec_sign;
 mod ubx;
 
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicPtr, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
+use embassy_rp::flash::{Async, Flash};
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
-use embassy_rp::peripherals::{PIO0, UART0};
+use embassy_rp::peripherals::{FLASH, PIO0, PIO1, UART0};
 use embassy_rp::pio::Pio;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -30,6 +33,7 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker, Timer};
 use embedded_io_async::{Read, Write};
+use cortex_m::peripheral::SCB;
 use panic_probe as _;
 use static_cell::StaticCell;
 
@@ -46,10 +50,11 @@ use ubx::{
     TimTp, RxmRawx,
 };
 
-// UART interrupt binding
+// Interrupt bindings
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
 });
 
 // ============================================================================
@@ -88,6 +93,13 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
+
+/// Flash for mode persistence
+static FLASH_CELL: StaticCell<Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>> = StaticCell::new();
+
+/// Pointer to flash mutex (set after FLASH_CELL.init())
+type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>;
+static FLASH_PTR: AtomicPtr<FlashMutex> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Core1 stack
 static mut CORE1_STACK: Stack<4096> = Stack::new();
@@ -131,35 +143,38 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(Default::default());
 
-    // Initialize UART buffers
-    static TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
-    static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-    let tx_buf = &mut TX_BUF.init([0; 512])[..];
-    let rx_buf = &mut RX_BUF.init([0; 256])[..];
+    // Initialize flash for mode persistence
+    let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
+    let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
+    // Store pointer for global access in button_task
+    FLASH_PTR.store(flash_mutex as *const _ as *mut _, Ordering::Release);
 
-    // Configure UART
-    let mut uart_config = UartConfig::default();
-    uart_config.baudrate = DEFAULT_BAUDRATE;
-    let uart = BufferedUart::new(
-        p.UART0,
-        p.PIN_0, // TX
-        p.PIN_1, // RX
-        Irqs,
-        tx_buf,
-        rx_buf,
-        uart_config,
-    );
-    let (tx, rx) = uart.split();
+    // Load saved mode from flash
+    let is_passthrough = {
+        let mut flash = flash_mutex.lock().await;
+        if let Some(saved_mode) = flash_storage::load_mode(&mut flash) {
+            if saved_mode == 1 {
+                info!("Loaded passthrough mode from flash");
+                OperatingMode::Passthrough.store();
+                true
+            } else {
+                info!("Loaded emulation mode from flash");
+                OperatingMode::Emulation.store();
+                false
+            }
+        } else {
+            info!("No saved mode, defaulting to emulation");
+            OperatingMode::Emulation.store();
+            false
+        }
+    };
 
-    // Initialize PIO for WS2812 LED
+    // Initialize PIO0 for WS2812 LED
     let pio0 = Pio::new(p.PIO0, Irqs);
 
     // Mode button (GPIO5 = power, GPIO6 = input)
     let _btn_pwr = Output::new(p.PIN_5, Level::High);
     let btn_input = Input::new(p.PIN_6, Pull::Down);
-
-    // Set initial mode
-    OperatingMode::Emulation.store();
 
     // Spawn Core1 for LED and SEC-SIGN computation
     info!("Spawning Core1...");
@@ -176,15 +191,58 @@ async fn main(spawner: Spawner) {
         },
     );
 
-    // Core0 tasks
-    spawner.must_spawn(uart_tx_task(tx));
-    spawner.must_spawn(uart_rx_task(rx));
-    spawner.must_spawn(nav_message_task());
-    spawner.must_spawn(mon_message_task());
-    spawner.must_spawn(sec_sign_timer_task());
-    spawner.must_spawn(button_task(btn_input));
+    if is_passthrough {
+        // Passthrough mode: PIO copies GPIO3 -> GPIO0
+        info!("Starting in PASSTHROUGH mode");
 
-    info!("All tasks spawned, emulator running");
+        let mut pio1 = Pio::new(p.PIO1, Irqs);
+        let mut passthrough = passthrough::Passthrough::new(
+            &mut pio1.common,
+            pio1.sm0,
+            p.PIN_3,  // Input from external GNSS
+            p.PIN_0,  // Output to host
+        );
+        passthrough.enable();
+
+        // Prevent drop - keep PIO running (sm0 is owned by passthrough)
+        core::mem::forget(passthrough);
+
+        // Only button task in passthrough mode
+        spawner.must_spawn(button_task(btn_input));
+
+        info!("Passthrough active, press button to switch to emulation");
+    } else {
+        // Emulation mode: UART for UBX messages
+        info!("Starting in EMULATION mode");
+
+        static TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+        static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+        let tx_buf = &mut TX_BUF.init([0; 512])[..];
+        let rx_buf = &mut RX_BUF.init([0; 256])[..];
+
+        let mut uart_config = UartConfig::default();
+        uart_config.baudrate = DEFAULT_BAUDRATE;
+        let uart = BufferedUart::new(
+            p.UART0,
+            p.PIN_0, // TX
+            p.PIN_1, // RX
+            Irqs,
+            tx_buf,
+            rx_buf,
+            uart_config,
+        );
+        let (tx, rx) = uart.split();
+
+        // All Core0 tasks for emulation
+        spawner.must_spawn(uart_tx_task(tx));
+        spawner.must_spawn(uart_rx_task(rx));
+        spawner.must_spawn(nav_message_task());
+        spawner.must_spawn(mon_message_task());
+        spawner.must_spawn(sec_sign_timer_task());
+        spawner.must_spawn(button_task(btn_input));
+    }
+
+    info!("All tasks spawned, running");
 
     // Core0 main loop - idle
     loop {
@@ -231,6 +289,9 @@ async fn led_task(
 #[embassy_executor::task]
 async fn sec_sign_compute_task() {
     info!("SEC-SIGN compute task starting on Core1");
+
+    // Initialize RNG for micro-ecc (uses RP2040 ROSC)
+    sec_sign::init_rng();
 
     loop {
         // Wait for request from Core0
@@ -1024,7 +1085,7 @@ async fn sec_sign_timer_task() {
     }
 }
 
-/// Mode button task
+/// Mode button task - switches mode, saves to flash, and reboots
 #[embassy_executor::task]
 async fn button_task(mut btn: Input<'static>) {
     loop {
@@ -1037,12 +1098,24 @@ async fn button_task(mut btn: Input<'static>) {
                 OperatingMode::Emulation => OperatingMode::Passthrough,
                 OperatingMode::Passthrough => OperatingMode::Emulation,
             };
-            new_mode.store();
-            info!("Mode changed to {:?}", new_mode);
 
-            // Wait for button release
+            info!("Switching to {:?}, saving to flash...", new_mode);
+
+            // Save new mode to flash
+            {
+                let flash_mutex = unsafe { &*FLASH_PTR.load(Ordering::Acquire) };
+                let mut flash = flash_mutex.lock().await;
+                flash_storage::save_mode(&mut flash, new_mode as u8).await;
+            }
+
+            info!("Mode saved, rebooting...");
+
+            // Wait for button release before reboot
             btn.wait_for_low().await;
             Timer::after(Duration::from_millis(100)).await;
+
+            // Reboot to apply new mode
+            SCB::sys_reset();
         }
     }
 }
