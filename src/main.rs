@@ -68,8 +68,14 @@ static SEC_SIGN_RESULT: Signal<CriticalSectionRawMutex, SecSignResult> = Signal:
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(0);
 
-/// NAV message period in milliseconds (default 200ms = 5Hz)
-static NAV_PERIOD_MS: AtomicU32 = AtomicU32::new(200);
+/// NAV message measurement period in milliseconds (default 200ms)
+static NAV_MEAS_PERIOD_MS: AtomicU32 = AtomicU32::new(200);
+
+/// NAV message rate (cycles per navigation solution, default 1)
+static NAV_RATE: AtomicU32 = AtomicU32::new(1);
+
+/// Time reference (0=UTC, 1=GPS, 2=GLONASS, etc.) - stored but not used
+static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
@@ -427,7 +433,9 @@ mod valset_keys {
     pub const MON_RF: u32 = 0x2091035A;
 
     // Rate configuration keys
-    pub const RATE_MEAS: u32 = 0x30210001;  // Measurement period in ms (u16)
+    pub const RATE_MEAS: u32 = 0x30210001;     // Measurement period in ms (u16)
+    pub const RATE_NAV: u32 = 0x30210002;      // Navigation rate cycles (u16)
+    pub const RATE_TIMEREF: u32 = 0x20210003;  // Time reference (u8)
 
     // UART baudrate keys
     pub const UART1_BAUDRATE: u32 = 0x40520001;  // UART1 baudrate (u32)
@@ -469,8 +477,19 @@ fn process_valset_config_key(key: u32, val: u32) {
         valset_keys::RATE_MEAS => {
             // Measurement period in ms (clamp to 50-10000ms)
             let period = (val as u16).clamp(50, 10000) as u32;
-            NAV_PERIOD_MS.store(period, Ordering::Release);
-            info!("VALSET: NAV period changed to {}ms", period);
+            NAV_MEAS_PERIOD_MS.store(period, Ordering::Release);
+            info!("VALSET: NAV meas period changed to {}ms", period);
+        }
+        valset_keys::RATE_NAV => {
+            // Navigation rate (cycles per solution, clamp to 1-127)
+            let rate = (val as u8).clamp(1, 127) as u32;
+            NAV_RATE.store(rate, Ordering::Release);
+            info!("VALSET: NAV rate changed to {}", rate);
+        }
+        valset_keys::RATE_TIMEREF => {
+            // Time reference (0=UTC, 1=GPS, etc.)
+            NAV_TIMEREF.store(val as u8, Ordering::Release);
+            info!("VALSET: Time ref changed to {}", val);
         }
         valset_keys::UART1_BAUDRATE => {
             // UART baudrate
@@ -513,14 +532,22 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
                 MSG_OUTPUT_STARTED.signal(());
             }
         }
-        ubx::UbxCommand::CfgRate { meas_rate, .. } => {
-            info!("CFG-RATE: meas_rate={}", meas_rate);
+        ubx::UbxCommand::CfgRate { meas_rate, nav_rate, time_ref } => {
+            info!("CFG-RATE: meas_rate={}, nav_rate={}, time_ref={}", meas_rate, nav_rate, time_ref);
             send_ack(0x06, 0x08); // ACK for CFG-RATE
 
-            // Update NAV message period (clamp to reasonable range: 50-10000ms)
+            // Update measurement period (clamp to 50-10000ms)
             let period = (*meas_rate).clamp(50, 10000) as u32;
-            NAV_PERIOD_MS.store(period, Ordering::Release);
-            info!("NAV period changed to {}ms", period);
+            NAV_MEAS_PERIOD_MS.store(period, Ordering::Release);
+
+            // Update navigation rate (clamp to 1-127)
+            let rate = (*nav_rate).clamp(1, 127) as u32;
+            NAV_RATE.store(rate, Ordering::Release);
+
+            // Store time reference
+            NAV_TIMEREF.store(*time_ref as u8, Ordering::Release);
+
+            info!("NAV config: meas={}ms, rate={}, timeref={}", period, rate, time_ref);
         }
         ubx::UbxCommand::CfgCfg => {
             info!("CFG-CFG received");
@@ -604,16 +631,18 @@ async fn nav_message_task() {
     let mut itow: u32 = 0;
 
     loop {
-        // Read current period (can be changed via CFG-RATE)
-        let period_ms = NAV_PERIOD_MS.load(Ordering::Acquire);
-        Timer::after(Duration::from_millis(period_ms as u64)).await;
+        // Calculate effective period = meas_period * nav_rate
+        let meas_period = NAV_MEAS_PERIOD_MS.load(Ordering::Acquire);
+        let nav_rate = NAV_RATE.load(Ordering::Acquire);
+        let effective_period = meas_period * nav_rate;
+        Timer::after(Duration::from_millis(effective_period as u64)).await;
 
         let mode = OperatingMode::load();
         if mode != OperatingMode::Emulation {
             continue;
         }
 
-        itow = itow.wrapping_add(period_ms);
+        itow = itow.wrapping_add(effective_period);
 
         // Get current message flags
         let flags = {
