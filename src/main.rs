@@ -636,8 +636,6 @@ async fn nav_message_task() {
     Timer::after(Duration::from_secs(1)).await;
     info!("NAV message output started");
 
-    let mut itow: u32 = 0;
-
     loop {
         // Calculate effective period = meas_period * nav_rate
         let meas_period = NAV_MEAS_PERIOD_MS.load(Ordering::Acquire);
@@ -650,16 +648,15 @@ async fn nav_message_task() {
             continue;
         }
 
-        itow = itow.wrapping_add(effective_period);
-
         // Get current message flags
         let flags = {
             let flags = MSG_FLAGS_STATE.lock().await;
             *flags
         };
 
-        // Get system time (seconds since start)
+        // Get system time - all time fields derived from same source
         let now = embassy_time::Instant::now();
+        let itow = (now.as_millis() % (7 * 24 * 3600 * 1000)) as u32; // ms in week
         let total_secs = (now.as_millis() / 1000) as u32;
         let sec = (total_secs % 60) as u8;
         let min = ((total_secs / 60) % 60) as u8;
