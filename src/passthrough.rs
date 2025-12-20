@@ -1,5 +1,7 @@
 //! PIO-based UART passthrough for transparent forwarding
 
+#![allow(dead_code)]
+
 use embassy_rp::pio::{Common, Config, Instance, PioPin, StateMachine};
 use embassy_rp::Peri;
 use fixed::traits::ToFixed;
@@ -43,8 +45,9 @@ impl<'d, P: Instance, const S: usize> Passthrough<'d, P, S> {
         cfg.set_in_pins(&[&pio_in_pin]);
         cfg.set_set_pins(&[&pio_out_pin]);
 
-        // Fast clock for accurate signal copying
-        let clock_freq = fixed!(1_000_000: U24F8);
+        // Fast clock for accurate signal copying at 921600 baud
+        // 8MHz gives ~8 samples per bit at 921600 baud
+        let clock_freq = fixed!(8_000_000: U24F8);
         cfg.clock_divider = (U24F8::from_num(125_000_000u32) / clock_freq).to_fixed();
 
         sm.set_config(&cfg);

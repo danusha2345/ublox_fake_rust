@@ -40,7 +40,7 @@ use static_cell::StaticCell;
 use config::*;
 use sec_sign::{SecSignAccumulator, SecSignRequest, SecSignResult, Signature, DEFAULT_SESSION_ID, PRIVATE_KEY};
 use ubx::{
-    AckAck, MessageFlags, MonVer, NavDop, NavEoe, NavPvt, NavStatus, SecSign, SecUniqid, UbxMessage,
+    AckAck, AckNak, MessageFlags, MonVer, NavDop, NavEoe, NavPvt, NavStatus, SecSign, SecUniqid, UbxMessage,
     // Additional NAV messages
     NavPosecef, NavPosllh, NavVelned, NavVelecef, NavTimeutc, NavTimegps, NavClock, NavTimels,
     NavAopstatus, NavCov, NavHpposecef, NavSat, NavSvinfo,
@@ -465,6 +465,19 @@ fn send_ack(cls_id: u8, msg_id: u8) {
     }
 }
 
+/// Send ACK-NAK response for unknown/failed command
+#[allow(dead_code)]
+fn send_nak(cls_id: u8, msg_id: u8) {
+    let nak = AckNak { cls_id, msg_id };
+    let mut buf = [0u8; 16];
+    let len = nak.build(&mut buf);
+    if len > 0 {
+        let mut vec = heapless::Vec::new();
+        let _ = vec.extend_from_slice(&buf[..len]);
+        let _ = TX_CHANNEL.try_send(vec);
+    }
+}
+
 /// Send a UBX message
 fn send_ubx_message<M: UbxMessage>(msg: &M) {
     let mut buf = [0u8; 256];
@@ -639,7 +652,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-PMS received");
             send_ack(0x06, 0x86); // ACK for CFG-PMS
         }
-        ubx::UbxCommand::CfgValset { layer: _, keys } => {
+        ubx::UbxCommand::CfgValset { _layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
 
             // Process all keys

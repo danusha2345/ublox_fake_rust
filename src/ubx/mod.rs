@@ -11,6 +11,7 @@ pub const SYNC1: u8 = 0xB5;
 pub const SYNC2: u8 = 0x62;
 
 /// UBX message classes
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Class {
@@ -26,6 +27,7 @@ pub enum Class {
 }
 
 /// UBX message IDs for NAV class
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum NavId {
@@ -49,6 +51,7 @@ pub enum NavId {
 }
 
 /// UBX message IDs for CFG class
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum CfgId {

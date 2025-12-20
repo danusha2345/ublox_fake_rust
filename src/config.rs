@@ -1,5 +1,7 @@
 //! Hardware configuration and constants
 
+#![allow(dead_code)]
+
 /// Default UART baudrate
 pub const DEFAULT_BAUDRATE: u32 = 921600;
 

@@ -6,7 +6,6 @@
 use sha2::{Digest, Sha256};
 use p192::{ProjectivePoint, Scalar};
 use p192::elliptic_curve::group::GroupEncoding;
-use p192::elliptic_curve::Field;
 use subtle::CtOption;
 use hmac::{Hmac, Mac};
 
@@ -37,14 +36,6 @@ impl SecSignAccumulator {
         }
     }
 
-    /// Const constructor for static initialization (empty, must call reset before use)
-    pub const fn new_const() -> Self {
-        Self {
-            hasher: unsafe { core::mem::zeroed() },
-            packet_count: 0,
-        }
-    }
-
     /// Initialize or reset the accumulator
     pub fn reset(&mut self) {
         self.hasher = Sha256::new();
@@ -58,6 +49,7 @@ impl SecSignAccumulator {
     }
 
     /// Get current packet count
+    #[allow(dead_code)]
     pub fn packet_count(&self) -> u16 {
         self.packet_count
     }

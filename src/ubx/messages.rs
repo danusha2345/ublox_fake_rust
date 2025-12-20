@@ -302,6 +302,26 @@ impl UbxMessage for AckAck {
     }
 }
 
+/// UBX-ACK-NAK message (negative acknowledgement)
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct AckNak {
+    pub cls_id: u8,
+    pub msg_id: u8,
+}
+
+impl UbxMessage for AckNak {
+    fn class(&self) -> u8 { 0x05 }
+    fn id(&self) -> u8 { 0x00 }  // NAK = 0x00, ACK = 0x01
+    fn payload_len(&self) -> u16 { 2 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.cls_id;
+        buf[1] = self.msg_id;
+        2
+    }
+}
+
 /// UBX-SEC-SIGN message
 #[derive(Clone)]
 pub struct SecSign {

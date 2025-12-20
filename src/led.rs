@@ -1,5 +1,7 @@
 //! WS2812 LED driver using PIO
 
+#![allow(dead_code)]
+
 use embassy_rp::pio::{Common, Config, Instance, PioPin, ShiftDirection, StateMachine};
 use embassy_rp::Peri;
 use fixed::traits::ToFixed;

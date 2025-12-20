@@ -31,7 +31,7 @@ pub enum UbxCommand {
 
     /// CFG-VALSET: Value set (M10)
     /// keys: Vec of (key_id, value) pairs - value stored as u32 for all sizes
-    CfgValset { layer: u8, keys: heapless::Vec<(u32, u32), 32> },
+    CfgValset { _layer: u8, keys: heapless::Vec<(u32, u32), 32> },
 
     /// MON-VER poll: Version request
     MonVerPoll,
@@ -226,7 +226,7 @@ impl UbxParser {
 
             // CFG-VALSET (0x06, 0x8A) - M10
             (0x06, 0x8A) if self.len >= 4 => {
-                let layer = self.payload[1];
+                let _layer = self.payload[1];
                 let mut keys: heapless::Vec<(u32, u32), 32> = heapless::Vec::new();
 
                 // Parse key-value pairs starting at offset 4 (after version, layers, reserved, reserved)
@@ -273,7 +273,7 @@ impl UbxParser {
                     }
                 }
 
-                UbxCommand::CfgValset { layer, keys }
+                UbxCommand::CfgValset { _layer, keys }
             }
 
             // MON-VER poll (0x0A, 0x04)

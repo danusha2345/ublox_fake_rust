@@ -99,6 +99,7 @@ Mode is persisted to flash and survives reboots. Button press toggles mode and r
 - Uses PIO1 state machine 0 for signal copying
 - Input: GPIO3 (from external GNSS TX)
 - Output: GPIO0 (to host, same as UART TX)
+- PIO clock: 8MHz (~8 samples per bit at 921600 baud)
 - PIO program waits for pin state changes and copies them:
 ```asm
 .wrap_target
@@ -128,7 +129,7 @@ Mode is persisted to flash and survives reboots. Button press toggles mode and r
 
 ## SEC-SIGN Cryptography
 
-Private key location: `src/sec_sign.rs` line 19 (`PRIVATE_KEY` constant)
+Private key location: `src/sec_sign.rs` line 16 (`PRIVATE_KEY` constant)
 
 **Implementation**: Pure Rust using `p192` crate primitives (no C dependencies)
 
@@ -146,7 +147,7 @@ Key crates: `p192` (elliptic curve), `sha2` (hashing), `hmac` (deterministic k)
 
 | Metric | C/FreeRTOS | Rust/Embassy |
 |--------|------------|--------------|
-| text (code) | 55.8 KB | **97.7 KB** |
+| text (code) | 55.8 KB | **97.3 KB** |
 | bss (RAM) | **133 KB** | **13.5 KB** |
 
 Notes:
@@ -179,14 +180,19 @@ Effective NAV period = `meas_rate × nav_rate`
 ### Baudrate Change Implementation
 Uses direct UART0 register access via `rp-pac` crate (embassy-rp doesn't expose baudrate change on BufferedUart).
 
-## Known TODOs
+## Implementation Status
 
-1. ~~`nav_message_task` - message sending~~ ✅ Implemented: All NAV, TIM, RXM messages
-2. ~~`mon_message_task` - MON messages~~ ✅ Implemented: MON-HW, MON-COMMS, MON-RF
-3. ~~Passthrough mode~~ ✅ Implemented: PIO-based GPIO3→GPIO0 with flash mode persistence
-4. ~~ECDSA signing~~ ✅ Implemented: Pure Rust using p192 primitives with RFC6979 deterministic k
-5. ~~CFG-PRT baudrate change~~ ✅ Implemented via direct PAC register access
-6. ~~Release build~~ ✅ No C dependencies, pure Rust build
+All core features complete:
+
+1. ✅ NAV messages - All 17 NAV message types implemented
+2. ✅ MON messages - MON-HW, MON-COMMS, MON-RF, MON-VER (poll)
+3. ✅ Passthrough mode - PIO-based GPIO3→GPIO0 with flash persistence
+4. ✅ ECDSA signing - Pure Rust p192 with RFC6979 deterministic k
+5. ✅ CFG-PRT baudrate - Direct PAC register access
+6. ✅ CFG-VALSET - Full M10 configuration support
+7. ✅ ACK-ACK/ACK-NAK - Command acknowledgement
+8. ✅ SEC-UNIQID - Unique ID poll response
+9. ✅ Release build - 0 warnings, pure Rust
 
 ## Implemented UBX Messages
 
@@ -223,6 +229,7 @@ Uses direct UART0 register access via `rp-pac` crate (embassy-rp doesn't expose 
 | Class | ID | Name | Payload | Description |
 |-------|-----|------|---------|-------------|
 | 0x02 | 0x15 | RXM-RAWX | 16+ | Raw measurements |
+| 0x05 | 0x00 | ACK-NAK | 2 | Negative acknowledgement |
 | 0x05 | 0x01 | ACK-ACK | 2 | Acknowledgement |
 | 0x0D | 0x01 | TIM-TP | 16 | Timepulse |
 | 0x27 | 0x01 | SEC-SIGN | 108 | Signature |
