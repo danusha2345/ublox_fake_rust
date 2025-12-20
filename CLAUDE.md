@@ -56,21 +56,27 @@ cargo rp2350    # build for RP2350
 
 ## Architecture
 
-### Task-based async design (Embassy)
-- **Core0**: Embassy executor runs all async tasks
-- All tasks communicate via `Signal` and `Channel` from `embassy-sync`
-- Mode state shared via `AtomicU8` (not Signal, due to embassy 0.9 API)
+### Dual-core async design (Embassy)
+- **Core0**: Embassy executor - UART TX/RX, NAV/MON message generation, button handling
+- **Core1**: Embassy executor - LED control (PIO), SEC-SIGN ECDSA computation
+- Inter-core communication via `Signal` and `Channel` from `embassy-sync`
+- Mode state shared via `AtomicU8` with `Acquire/Release` ordering
 
-### Main Tasks (src/main.rs)
+### Core0 Tasks (src/main.rs)
+| Task | Rate | Purpose |
+|------|------|---------|
+| `uart_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates for SEC-SIGN |
+| `uart_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
+| `nav_message_task` | 200ms (5Hz) | Sends NAV-PVT, NAV-STATUS, NAV-DOP, NAV-EOE |
+| `mon_message_task` | 1s | Sends MON-* messages (TODO: implement message structs) |
+| `sec_sign_timer_task` | 4s | Requests SEC-SIGN from Core1 |
+| `button_task` | async | Mode toggle on GPIO button press |
+
+### Core1 Tasks
 | Task | Rate | Purpose |
 |------|------|---------|
 | `led_task` | 500ms | WS2812 LED blinking (green=emulation, blue=passthrough) |
-| `uart_tx_task` | 10ms | Sends UBX messages from SEC_SIGN_READY signal |
-| `uart_rx_task` | async | Parses incoming UBX commands |
-| `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages |
-| `mon_message_task` | 1s | Sends MON-* messages |
-| `sec_sign_timer_task` | 4s | Triggers SEC-SIGN computation |
-| `button_task` | async | Mode toggle on GPIO button press |
+| `sec_sign_compute_task` | async | ECDSA signature computation (CPU intensive) |
 
 ### Module Structure
 - `src/ubx/` - UBX protocol implementation
@@ -86,7 +92,7 @@ cargo rp2350    # build for RP2350
 - **Passthrough**: Forwards data from real GNSS module (not yet implemented)
 
 ## Hardware Pins (RP2040)
-- UART0: TX=GPIO0, RX=GPIO1 (38400 baud default)
+- UART0: TX=GPIO0, RX=GPIO1 (921600 baud default)
 - WS2812 LED: GPIO16 (PIO0)
 - Mode button: GPIO6 (input), GPIO5 (power)
 
@@ -122,11 +128,12 @@ Embassy async uses stackless coroutines - no separate stack per task. FreeRTOS a
 
 ## Known TODOs
 
-1. `nav_message_task` / `mon_message_task` - message sending not implemented (just timers)
-2. Passthrough mode - not implemented
-3. Actual ECDSA signing in `sec_sign.rs` - placeholder only, needs `p192::ecdsa::SigningKey`
-4. CFG-PRT baudrate change - parsed but not applied
-5. Release build needs `cc` in PATH for build scripts
+1. ~~`nav_message_task` - message sending~~ ✅ Implemented: NAV-PVT, NAV-STATUS, NAV-DOP, NAV-EOE
+2. `mon_message_task` - MON-HW, MON-COMMS, MON-RF message structs not implemented
+3. Passthrough mode - not implemented
+4. ECDSA signing - placeholder only (p192 v0.13 lacks SignPrimitive trait), generates deterministic but not cryptographically valid signatures
+5. CFG-PRT baudrate change - parsed but not applied
+6. Release build needs `cc` in PATH for build scripts
 
 ## Embassy 0.9 API Notes
 

@@ -14,10 +14,32 @@ pub enum UbxCommand {
     /// CFG-RATE: Navigation rate
     CfgRate { meas_rate: u16, nav_rate: u16, time_ref: u16 },
 
-    /// CFG-VALSET: Value set (M10)
-    CfgValset { layer: u8, keys: heapless::Vec<(u32, u32), 16> },
+    /// CFG-CFG: Configuration save/load/clear
+    CfgCfg,
 
-    /// Poll request
+    /// CFG-NAV5: Navigation engine settings
+    CfgNav5,
+
+    /// CFG-NAVX5: Navigation engine expert settings
+    CfgNavx5,
+
+    /// CFG-GNSS: GNSS system configuration
+    CfgGnss,
+
+    /// CFG-PMS: Power management settings
+    CfgPms,
+
+    /// CFG-VALSET: Value set (M10)
+    /// keys: Vec of (key_id, value) pairs
+    CfgValset { layer: u8, keys: heapless::Vec<(u32, u8), 32> },
+
+    /// MON-VER poll: Version request
+    MonVerPoll,
+
+    /// SEC-UNIQID poll: Unique ID request
+    SecUniqidPoll,
+
+    /// Generic poll request (for unhandled polls)
     Poll { class: u8, id: u8 },
 
     /// Unknown command
@@ -150,7 +172,7 @@ impl UbxParser {
     /// Decode parsed message into command
     fn decode_command(&self) -> UbxCommand {
         match (self.class, self.id) {
-            // CFG-PRT
+            // CFG-PRT (0x06, 0x00)
             (0x06, 0x00) if self.len >= 20 => {
                 let baudrate = u32::from_le_bytes([
                     self.payload[8],
@@ -161,7 +183,7 @@ impl UbxParser {
                 UbxCommand::CfgPrt { baudrate }
             }
 
-            // CFG-MSG (short form: 3 bytes)
+            // CFG-MSG (0x06, 0x01) - short form: 3 bytes
             (0x06, 0x01) if self.len == 3 => {
                 UbxCommand::CfgMsg {
                     class: self.payload[0],
@@ -170,7 +192,7 @@ impl UbxParser {
                 }
             }
 
-            // CFG-MSG (long form: 8 bytes)
+            // CFG-MSG (0x06, 0x01) - long form: 8 bytes
             (0x06, 0x01) if self.len == 8 => {
                 UbxCommand::CfgMsg {
                     class: self.payload[0],
@@ -179,7 +201,7 @@ impl UbxParser {
                 }
             }
 
-            // CFG-RATE
+            // CFG-RATE (0x06, 0x08)
             (0x06, 0x08) if self.len == 6 => {
                 let meas_rate = u16::from_le_bytes([self.payload[0], self.payload[1]]);
                 let nav_rate = u16::from_le_bytes([self.payload[2], self.payload[3]]);
@@ -187,18 +209,71 @@ impl UbxParser {
                 UbxCommand::CfgRate { meas_rate, nav_rate, time_ref }
             }
 
-            // CFG-VALSET (M10)
+            // CFG-CFG (0x06, 0x09)
+            (0x06, 0x09) => UbxCommand::CfgCfg,
+
+            // CFG-NAVX5 (0x06, 0x23)
+            (0x06, 0x23) => UbxCommand::CfgNavx5,
+
+            // CFG-NAV5 (0x06, 0x24)
+            (0x06, 0x24) => UbxCommand::CfgNav5,
+
+            // CFG-GNSS (0x06, 0x3E)
+            (0x06, 0x3E) => UbxCommand::CfgGnss,
+
+            // CFG-PMS (0x06, 0x86)
+            (0x06, 0x86) => UbxCommand::CfgPms,
+
+            // CFG-VALSET (0x06, 0x8A) - M10
             (0x06, 0x8A) if self.len >= 4 => {
                 let layer = self.payload[1];
-                // Parse key-value pairs (simplified)
-                let keys = heapless::Vec::new();
+                let mut keys: heapless::Vec<(u32, u8), 32> = heapless::Vec::new();
+
+                // Parse key-value pairs starting at offset 4 (after version, layers, reserved, reserved)
+                let mut i = 4usize;
+                let end = self.len as usize;
+
+                while i + 4 <= end {
+                    // Read 32-bit key (little-endian)
+                    let key = u32::from_le_bytes([
+                        self.payload[i],
+                        self.payload[i + 1],
+                        self.payload[i + 2],
+                        self.payload[i + 3],
+                    ]);
+                    i += 4;
+
+                    // Determine value size from key bits 28-30
+                    let key_size = (key >> 28) & 0x07;
+                    let val_size = match key_size {
+                        1 | 2 => 1,  // 1-bit or 1-byte
+                        3 => 2,      // 2-byte
+                        4 => 4,      // 4-byte
+                        5 => 8,      // 8-byte
+                        _ => 1,      // default to 1 byte
+                    };
+
+                    if i + val_size <= end {
+                        // For MSGOUT keys (most common), store just the first byte
+                        let val = self.payload[i];
+                        let _ = keys.push((key, val));
+                        i += val_size;
+                    } else {
+                        break;
+                    }
+                }
+
                 UbxCommand::CfgValset { layer, keys }
             }
 
-            // Poll requests (zero length)
-            (class, id) if self.len == 0 => {
-                UbxCommand::Poll { class, id }
-            }
+            // MON-VER poll (0x0A, 0x04)
+            (0x0A, 0x04) if self.len == 0 => UbxCommand::MonVerPoll,
+
+            // SEC-UNIQID poll (0x27, 0x03)
+            (0x27, 0x03) if self.len == 0 => UbxCommand::SecUniqidPoll,
+
+            // Generic poll requests (zero length, unhandled)
+            (class, id) if self.len == 0 => UbxCommand::Poll { class, id },
 
             _ => UbxCommand::Unknown,
         }

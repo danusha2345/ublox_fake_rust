@@ -344,3 +344,106 @@ impl UbxMessage for SecSign {
         108
     }
 }
+
+/// UBX-MON-VER message (160 byte payload)
+/// Response to MON-VER poll request
+#[derive(Clone)]
+pub struct MonVer {
+    /// Software version string (30 bytes, null-terminated)
+    pub sw_version: [u8; 30],
+    /// Hardware version string (10 bytes, null-terminated)
+    pub hw_version: [u8; 10],
+    /// Extended version strings (4 x 30 bytes)
+    pub extensions: [[u8; 30]; 4],
+}
+
+impl Default for MonVer {
+    fn default() -> Self {
+        // M10: "ROM SPG 5.10 (7b202e)"
+        let mut sw_version = [0u8; 30];
+        let sw = b"ROM SPG 5.10 (7b202e)";
+        sw_version[..sw.len()].copy_from_slice(sw);
+
+        let mut hw_version = [0u8; 10];
+        let hw = b"00190000";
+        hw_version[..hw.len()].copy_from_slice(hw);
+
+        // Extension strings
+        let mut ext0 = [0u8; 30];
+        let e0 = b"FWVER=SPG 5.10";
+        ext0[..e0.len()].copy_from_slice(e0);
+
+        let mut ext1 = [0u8; 30];
+        let e1 = b"PROTVER=34.10";
+        ext1[..e1.len()].copy_from_slice(e1);
+
+        let mut ext2 = [0u8; 30];
+        let e2 = b"GPS;GLO;GAL;BDS";
+        ext2[..e2.len()].copy_from_slice(e2);
+
+        let mut ext3 = [0u8; 30];
+        let e3 = b"SBAS;QZSS";
+        ext3[..e3.len()].copy_from_slice(e3);
+
+        Self {
+            sw_version,
+            hw_version,
+            extensions: [ext0, ext1, ext2, ext3],
+        }
+    }
+}
+
+impl UbxMessage for MonVer {
+    fn class(&self) -> u8 { 0x0A }
+    fn id(&self) -> u8 { 0x04 }
+    fn payload_len(&self) -> u16 { 160 }  // 30 + 10 + 4*30 = 160
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..30].copy_from_slice(&self.sw_version);
+        buf[30..40].copy_from_slice(&self.hw_version);
+        buf[40..70].copy_from_slice(&self.extensions[0]);
+        buf[70..100].copy_from_slice(&self.extensions[1]);
+        buf[100..130].copy_from_slice(&self.extensions[2]);
+        buf[130..160].copy_from_slice(&self.extensions[3]);
+        160
+    }
+}
+
+/// UBX-SEC-UNIQID message (10 byte payload)
+/// Response to SEC-UNIQID poll request
+#[derive(Clone)]
+pub struct SecUniqid {
+    /// Version (0x02 for M10)
+    pub version: u8,
+    /// Reserved bytes
+    pub reserved: [u8; 3],
+    /// Chip unique ID (5 bytes)
+    pub unique_id: [u8; 5],
+    /// Reserved byte
+    pub reserved2: u8,
+}
+
+impl Default for SecUniqid {
+    fn default() -> Self {
+        Self {
+            version: 0x02,
+            reserved: [0x00, 0x00, 0x00],
+            unique_id: [0xE0, 0x95, 0x65, 0x0F, 0x2A],  // Example chip ID
+            reserved2: 0x54,
+        }
+    }
+}
+
+impl UbxMessage for SecUniqid {
+    fn class(&self) -> u8 { 0x27 }
+    fn id(&self) -> u8 { 0x03 }
+    fn payload_len(&self) -> u16 { 10 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.version;
+        buf[1..4].copy_from_slice(&self.reserved);
+        buf[4..9].copy_from_slice(&self.unique_id);
+        buf[9] = self.reserved2;
+        10
+    }
+}

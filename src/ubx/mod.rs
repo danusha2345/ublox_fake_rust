@@ -152,36 +152,72 @@ pub struct MessageFlags {
 }
 
 impl MessageFlags {
-    /// Update flags based on CFG-MSG command
-    pub fn from_cfg_msg(class: u8, id: u8, enabled: bool) -> Self {
-        let mut flags = Self::default();
+    /// Const constructor - all messages disabled by default
+    /// Messages are enabled only after receiving CFG-MSG commands
+    pub const fn new_default() -> Self {
+        Self {
+            nav_pvt: false,
+            nav_posecef: false,
+            nav_posllh: false,
+            nav_status: false,
+            nav_dop: false,
+            nav_velned: false,
+            nav_velecef: false,
+            nav_timeutc: false,
+            nav_timegps: false,
+            nav_timels: false,
+            nav_clock: false,
+            nav_sat: false,
+            nav_svinfo: false,
+            nav_cov: false,
+            nav_hpposecef: false,
+            nav_aopstatus: false,
+            nav_eoe: false,
+            rxm_rawx: false,
+            mon_hw: false,
+            mon_comms: false,
+            mon_rf: false,
+            tim_tp: false,
+        }
+    }
 
+    /// Check if any message is enabled
+    pub const fn any_enabled(&self) -> bool {
+        self.nav_pvt || self.nav_posecef || self.nav_posllh || self.nav_status ||
+        self.nav_dop || self.nav_velned || self.nav_velecef || self.nav_timeutc ||
+        self.nav_timegps || self.nav_timels || self.nav_clock || self.nav_sat ||
+        self.nav_svinfo || self.nav_cov || self.nav_hpposecef || self.nav_aopstatus ||
+        self.nav_eoe || self.rxm_rawx || self.mon_hw || self.mon_comms ||
+        self.mon_rf || self.tim_tp
+    }
+
+    /// Update a single message flag by class/id
+    pub fn set_message(&mut self, class: u8, id: u8, enabled: bool) {
         match (class, id) {
-            (0x01, 0x07) => flags.nav_pvt = enabled,
-            (0x01, 0x01) => flags.nav_posecef = enabled,
-            (0x01, 0x02) => flags.nav_posllh = enabled,
-            (0x01, 0x03) => flags.nav_status = enabled,
-            (0x01, 0x04) => flags.nav_dop = enabled,
-            (0x01, 0x12) => flags.nav_velned = enabled,
-            (0x01, 0x11) => flags.nav_velecef = enabled,
-            (0x01, 0x21) => flags.nav_timeutc = enabled,
-            (0x01, 0x20) => flags.nav_timegps = enabled,
-            (0x01, 0x26) => flags.nav_timels = enabled,
-            (0x01, 0x22) => flags.nav_clock = enabled,
-            (0x01, 0x35) => flags.nav_sat = enabled,
-            (0x01, 0x30) => flags.nav_svinfo = enabled,
-            (0x01, 0x36) => flags.nav_cov = enabled,
-            (0x01, 0x13) => flags.nav_hpposecef = enabled,
-            (0x01, 0x60) => flags.nav_aopstatus = enabled,
-            (0x01, 0x61) => flags.nav_eoe = enabled,
-            (0x02, 0x15) => flags.rxm_rawx = enabled,
-            (0x0A, 0x09) => flags.mon_hw = enabled,
-            (0x0A, 0x36) => flags.mon_comms = enabled,
-            (0x0A, 0x38) => flags.mon_rf = enabled,
-            (0x0D, 0x01) => flags.tim_tp = enabled,
+            (0x01, 0x07) => self.nav_pvt = enabled,
+            (0x01, 0x01) => self.nav_posecef = enabled,
+            (0x01, 0x02) => self.nav_posllh = enabled,
+            (0x01, 0x03) => self.nav_status = enabled,
+            (0x01, 0x04) => self.nav_dop = enabled,
+            (0x01, 0x12) => self.nav_velned = enabled,
+            (0x01, 0x11) => self.nav_velecef = enabled,
+            (0x01, 0x21) => self.nav_timeutc = enabled,
+            (0x01, 0x20) => self.nav_timegps = enabled,
+            (0x01, 0x26) => self.nav_timels = enabled,
+            (0x01, 0x22) => self.nav_clock = enabled,
+            (0x01, 0x35) => self.nav_sat = enabled,
+            (0x01, 0x30) => self.nav_svinfo = enabled,
+            (0x01, 0x36) => self.nav_cov = enabled,
+            (0x01, 0x13) => self.nav_hpposecef = enabled,
+            (0x01, 0x60) => self.nav_aopstatus = enabled,
+            (0x01, 0x61) => self.nav_eoe = enabled,
+            (0x02, 0x15) => self.rxm_rawx = enabled,
+            (0x0A, 0x09) => self.mon_hw = enabled,
+            (0x0A, 0x36) => self.mon_comms = enabled,
+            (0x0A, 0x38) => self.mon_rf = enabled,
+            (0x0D, 0x01) => self.tim_tp = enabled,
             _ => {}
         }
-
-        flags
     }
 }
+
