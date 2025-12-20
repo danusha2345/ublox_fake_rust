@@ -1,0 +1,14 @@
+; WS2812 PIO program for RP2040/RP2350
+; Based on the official Raspberry Pi Pico SDK example
+
+.program ws2812
+.side_set 1
+
+.wrap_target
+bitloop:
+    out x, 1       side 0 [2]
+    jmp !x do_zero side 1 [1]
+    jmp bitloop    side 1 [4]
+do_zero:
+    nop            side 0 [4]
+.wrap

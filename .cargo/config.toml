@@ -1,0 +1,21 @@
+[target.thumbv6m-none-eabi]
+runner = "probe-rs run --chip RP2040"
+
+[target.thumbv8m.main-none-eabihf]
+runner = "probe-rs run --chip RP2350"
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tdefmt.x",
+]
+
+[build]
+target = "thumbv6m-none-eabi"  # RP2040 default
+
+[env]
+DEFMT_LOG = "debug"
+
+[alias]
+rb = "run --bin ublox_fake --release"
+rp2350 = "build --release --features rp2350 --target thumbv8m.main-none-eabihf"
