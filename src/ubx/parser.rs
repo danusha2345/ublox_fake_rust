@@ -30,8 +30,8 @@ pub enum UbxCommand {
     CfgPms,
 
     /// CFG-VALSET: Value set (M10)
-    /// keys: Vec of (key_id, value) pairs
-    CfgValset { layer: u8, keys: heapless::Vec<(u32, u8), 32> },
+    /// keys: Vec of (key_id, value) pairs - value stored as u32 for all sizes
+    CfgValset { layer: u8, keys: heapless::Vec<(u32, u32), 32> },
 
     /// MON-VER poll: Version request
     MonVerPoll,
@@ -227,7 +227,7 @@ impl UbxParser {
             // CFG-VALSET (0x06, 0x8A) - M10
             (0x06, 0x8A) if self.len >= 4 => {
                 let layer = self.payload[1];
-                let mut keys: heapless::Vec<(u32, u8), 32> = heapless::Vec::new();
+                let mut keys: heapless::Vec<(u32, u32), 32> = heapless::Vec::new();
 
                 // Parse key-value pairs starting at offset 4 (after version, layers, reserved, reserved)
                 let mut i = 4usize;
@@ -249,13 +249,23 @@ impl UbxParser {
                         1 | 2 => 1,  // 1-bit or 1-byte
                         3 => 2,      // 2-byte
                         4 => 4,      // 4-byte
-                        5 => 8,      // 8-byte
+                        5 => 8,      // 8-byte (only store low 32 bits)
                         _ => 1,      // default to 1 byte
                     };
 
                     if i + val_size <= end {
-                        // For MSGOUT keys (most common), store just the first byte
-                        let val = self.payload[i];
+                        // Read value as u32 (handles 1, 2, 4 byte values)
+                        let val = match val_size {
+                            1 => self.payload[i] as u32,
+                            2 => u16::from_le_bytes([self.payload[i], self.payload[i + 1]]) as u32,
+                            4 | 8 => u32::from_le_bytes([
+                                self.payload[i],
+                                self.payload[i + 1],
+                                self.payload[i + 2],
+                                self.payload[i + 3],
+                            ]),
+                            _ => self.payload[i] as u32,
+                        };
                         let _ = keys.push((key, val));
                         i += val_size;
                     } else {

@@ -14,7 +14,7 @@ mod led;
 mod sec_sign;
 mod ubx;
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -67,6 +67,12 @@ static SEC_SIGN_RESULT: Signal<CriticalSectionRawMutex, SecSignResult> = Signal:
 
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(0);
+
+/// NAV message period in milliseconds (default 200ms = 5Hz)
+static NAV_PERIOD_MS: AtomicU32 = AtomicU32::new(200);
+
+/// Signal for baudrate change (value = new baudrate)
+static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
 /// Core1 stack
 static mut CORE1_STACK: Stack<4096> = Stack::new();
@@ -298,6 +304,44 @@ async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
     }
 }
 
+/// Set UART0 baudrate using direct register access
+fn set_uart0_baudrate(baudrate: u32) {
+    let clk_peri = embassy_rp::clocks::clk_peri_freq();
+    let baud_rate_div = (8 * clk_peri) / baudrate;
+    let mut baud_ibrd = baud_rate_div >> 7;
+    let mut baud_fbrd = ((baud_rate_div & 0x7f) + 1) / 2;
+
+    if baud_ibrd == 0 {
+        baud_ibrd = 1;
+        baud_fbrd = 0;
+    } else if baud_ibrd >= 65535 {
+        baud_ibrd = 65535;
+        baud_fbrd = 0;
+    }
+
+    let r = rp_pac::UART0;
+
+    // Wait for UART to finish transmitting
+    while r.uartfr().read().busy() {}
+
+    // Disable UART
+    r.uartcr().write(|w| w.set_uarten(false));
+
+    // Set baud rate
+    r.uartibrd().write(|w| w.set_baud_divint(baud_ibrd as u16));
+    r.uartfbrd().write(|w| w.set_baud_divfrac(baud_fbrd as u8));
+
+    // Dummy write to latch new baud rate
+    r.uartlcr_h().modify(|_| {});
+
+    // Re-enable UART
+    r.uartcr().write(|w| {
+        w.set_uarten(true);
+        w.set_rxe(true);
+        w.set_txe(true);
+    });
+}
+
 /// UART RX task - receives and processes UBX commands
 #[embassy_executor::task]
 async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
@@ -305,12 +349,24 @@ async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     let mut parser = ubx::UbxParser::new();
 
     loop {
+        // Check for pending baudrate change
+        if let Some(new_baudrate) = BAUDRATE_CHANGE.try_take() {
+            info!("Applying baudrate change to {}", new_baudrate);
+            set_uart0_baudrate(new_baudrate);
+        }
+
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
                 for &byte in &buf[..n] {
                     if let Some(cmd) = parser.parse_byte(byte) {
                         handle_ubx_command(&cmd).await;
                     }
+                }
+
+                // Apply baudrate change after processing commands
+                if let Some(new_baudrate) = BAUDRATE_CHANGE.try_take() {
+                    info!("Applying baudrate change to {}", new_baudrate);
+                    set_uart0_baudrate(new_baudrate);
                 }
             }
             Ok(_) => {}
@@ -344,8 +400,9 @@ fn send_ubx_message<M: UbxMessage>(msg: &M) {
     }
 }
 
-/// CFG-VALSET MSGOUT key IDs for UART1
-mod msgout_keys {
+/// CFG-VALSET key IDs
+mod valset_keys {
+    // MSGOUT keys for UART1
     pub const NAV_PVT: u32 = 0x20910007;
     pub const NAV_SVINFO: u32 = 0x2091000C;
     pub const NAV_SAT: u32 = 0x20910016;
@@ -368,34 +425,60 @@ mod msgout_keys {
     pub const RXM_RAWX: u32 = 0x209102A5;
     pub const MON_COMMS: u32 = 0x20910350;
     pub const MON_RF: u32 = 0x2091035A;
+
+    // Rate configuration keys
+    pub const RATE_MEAS: u32 = 0x30210001;  // Measurement period in ms (u16)
+
+    // UART baudrate keys
+    pub const UART1_BAUDRATE: u32 = 0x40520001;  // UART1 baudrate (u32)
 }
 
 /// Update message flags from CFG-VALSET key
-fn update_flag_from_valset_key(flags: &mut MessageFlags, key: u32, val: u8) {
+fn update_flag_from_valset_key(flags: &mut MessageFlags, key: u32, val: u32) {
     let enabled = val > 0;
     match key {
-        msgout_keys::NAV_PVT => flags.nav_pvt = enabled,
-        msgout_keys::NAV_SVINFO => flags.nav_svinfo = enabled,
-        msgout_keys::NAV_SAT => flags.nav_sat = enabled,
-        msgout_keys::NAV_STATUS => flags.nav_status = enabled,
-        msgout_keys::NAV_POSECEF => flags.nav_posecef = enabled,
-        msgout_keys::NAV_POSLLH => flags.nav_posllh = enabled,
-        msgout_keys::NAV_HPPOSECEF => flags.nav_hpposecef = enabled,
-        msgout_keys::NAV_DOP => flags.nav_dop = enabled,
-        msgout_keys::NAV_VELECEF => flags.nav_velecef = enabled,
-        msgout_keys::NAV_VELNED => flags.nav_velned = enabled,
-        msgout_keys::NAV_TIMEGPS => flags.nav_timegps = enabled,
-        msgout_keys::NAV_TIMEUTC => flags.nav_timeutc = enabled,
-        msgout_keys::NAV_TIMELS => flags.nav_timels = enabled,
-        msgout_keys::NAV_CLOCK => flags.nav_clock = enabled,
-        msgout_keys::NAV_AOPSTATUS => flags.nav_aopstatus = enabled,
-        msgout_keys::NAV_COV => flags.nav_cov = enabled,
-        msgout_keys::NAV_EOE => flags.nav_eoe = enabled,
-        msgout_keys::TIM_TP => flags.tim_tp = enabled,
-        msgout_keys::MON_HW => flags.mon_hw = enabled,
-        msgout_keys::RXM_RAWX => flags.rxm_rawx = enabled,
-        msgout_keys::MON_COMMS => flags.mon_comms = enabled,
-        msgout_keys::MON_RF => flags.mon_rf = enabled,
+        valset_keys::NAV_PVT => flags.nav_pvt = enabled,
+        valset_keys::NAV_SVINFO => flags.nav_svinfo = enabled,
+        valset_keys::NAV_SAT => flags.nav_sat = enabled,
+        valset_keys::NAV_STATUS => flags.nav_status = enabled,
+        valset_keys::NAV_POSECEF => flags.nav_posecef = enabled,
+        valset_keys::NAV_POSLLH => flags.nav_posllh = enabled,
+        valset_keys::NAV_HPPOSECEF => flags.nav_hpposecef = enabled,
+        valset_keys::NAV_DOP => flags.nav_dop = enabled,
+        valset_keys::NAV_VELECEF => flags.nav_velecef = enabled,
+        valset_keys::NAV_VELNED => flags.nav_velned = enabled,
+        valset_keys::NAV_TIMEGPS => flags.nav_timegps = enabled,
+        valset_keys::NAV_TIMEUTC => flags.nav_timeutc = enabled,
+        valset_keys::NAV_TIMELS => flags.nav_timels = enabled,
+        valset_keys::NAV_CLOCK => flags.nav_clock = enabled,
+        valset_keys::NAV_AOPSTATUS => flags.nav_aopstatus = enabled,
+        valset_keys::NAV_COV => flags.nav_cov = enabled,
+        valset_keys::NAV_EOE => flags.nav_eoe = enabled,
+        valset_keys::TIM_TP => flags.tim_tp = enabled,
+        valset_keys::MON_HW => flags.mon_hw = enabled,
+        valset_keys::RXM_RAWX => flags.rxm_rawx = enabled,
+        valset_keys::MON_COMMS => flags.mon_comms = enabled,
+        valset_keys::MON_RF => flags.mon_rf = enabled,
+        _ => {}
+    }
+}
+
+/// Process CFG-VALSET rate and configuration keys
+fn process_valset_config_key(key: u32, val: u32) {
+    match key {
+        valset_keys::RATE_MEAS => {
+            // Measurement period in ms (clamp to 50-10000ms)
+            let period = (val as u16).clamp(50, 10000) as u32;
+            NAV_PERIOD_MS.store(period, Ordering::Release);
+            info!("VALSET: NAV period changed to {}ms", period);
+        }
+        valset_keys::UART1_BAUDRATE => {
+            // UART baudrate
+            if val > 0 {
+                BAUDRATE_CHANGE.signal(val);
+                info!("VALSET: Baudrate change to {}", val);
+            }
+        }
         _ => {}
     }
 }
@@ -406,7 +489,11 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         ubx::UbxCommand::CfgPrt { baudrate } => {
             info!("CFG-PRT: baudrate={}", baudrate);
             send_ack(0x06, 0x00); // ACK for CFG-PRT
-            // TODO: Change baudrate dynamically
+
+            // Apply baudrate change (signal to uart_rx_task)
+            if *baudrate > 0 {
+                BAUDRATE_CHANGE.signal(*baudrate);
+            }
         }
         ubx::UbxCommand::CfgMsg { class, id, rate } => {
             info!("CFG-MSG: class=0x{:02X} id=0x{:02X} rate={}", class, id, rate);
@@ -429,6 +516,11 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         ubx::UbxCommand::CfgRate { meas_rate, .. } => {
             info!("CFG-RATE: meas_rate={}", meas_rate);
             send_ack(0x06, 0x08); // ACK for CFG-RATE
+
+            // Update NAV message period (clamp to reasonable range: 50-10000ms)
+            let period = (*meas_rate).clamp(50, 10000) as u32;
+            NAV_PERIOD_MS.store(period, Ordering::Release);
+            info!("NAV period changed to {}ms", period);
         }
         ubx::UbxCommand::CfgCfg => {
             info!("CFG-CFG received");
@@ -453,13 +545,16 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         ubx::UbxCommand::CfgValset { layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
 
-            // Update message flags from MSGOUT keys
+            // Process all keys
             let should_start = {
                 let mut flags = MSG_FLAGS_STATE.lock().await;
                 let was_empty = !flags.any_enabled();
 
                 for &(key, val) in keys.iter() {
+                    // Update message flags for MSGOUT keys
                     update_flag_from_valset_key(&mut flags, key, val);
+                    // Process rate and config keys (baudrate, measurement period)
+                    process_valset_config_key(key, val);
                 }
 
                 // Start message output if this is the first enabled message
@@ -493,7 +588,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
     }
 }
 
-/// NAV message task - sends navigation messages at 5Hz
+/// NAV message task - sends navigation messages at configurable rate
 /// Only starts after receiving first CFG-MSG command + 1 second delay
 #[embassy_executor::task]
 async fn nav_message_task() {
@@ -506,18 +601,19 @@ async fn nav_message_task() {
     Timer::after(Duration::from_secs(1)).await;
     info!("NAV message output started");
 
-    let mut ticker = Ticker::every(Duration::from_millis(200)); // 5Hz
     let mut itow: u32 = 0;
 
     loop {
-        ticker.next().await;
+        // Read current period (can be changed via CFG-RATE)
+        let period_ms = NAV_PERIOD_MS.load(Ordering::Acquire);
+        Timer::after(Duration::from_millis(period_ms as u64)).await;
 
         let mode = OperatingMode::load();
         if mode != OperatingMode::Emulation {
             continue;
         }
 
-        itow = itow.wrapping_add(200);
+        itow = itow.wrapping_add(period_ms);
 
         // Get current message flags
         let flags = {

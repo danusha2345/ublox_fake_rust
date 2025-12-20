@@ -44,6 +44,9 @@ fixed-macro = "1.2"
 # Async IO traits (must match embassy-rp version)
 embedded-io-async = "0.6"
 
+# Direct register access for baudrate change
+rp-pac = { version = "7", features = ["rp2040"] }
+
 [features]
 default = ["rp2040"]
 rp2040 = ["embassy-rp/rp2040"]

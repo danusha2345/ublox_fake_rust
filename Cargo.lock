@@ -1467,6 +1467,7 @@ dependencies = [
  "panic-probe",
  "pio",
  "portable-atomic",
+ "rp-pac",
  "sha2",
  "static_cell",
 ]
