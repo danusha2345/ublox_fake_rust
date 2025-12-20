@@ -16,7 +16,7 @@ mod passthrough;
 mod sec_sign;
 mod ubx;
 
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -78,6 +78,10 @@ static SEC_SIGN_REQUEST: Signal<CriticalSectionRawMutex, SecSignRequest> = Signa
 
 /// SEC-SIGN result ready (Core1 -> Core0)
 static SEC_SIGN_RESULT: Signal<CriticalSectionRawMutex, SecSignResult> = Signal::new();
+
+/// SEC-SIGN computation in progress - pause TX to avoid race condition
+/// When true: NAV/MON tasks skip sending, uart_tx_task waits for result
+static SEC_SIGN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -323,6 +327,7 @@ async fn sec_sign_compute_task() {
 // ============================================================================
 
 /// UART TX task - sends UBX messages from TX_CHANNEL
+/// Handles SEC-SIGN synchronization: pauses regular TX when signature is being computed
 #[embassy_executor::task]
 async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
     // Wait for initial delay
@@ -337,26 +342,13 @@ async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
     info!("UART TX task ready");
 
     loop {
-        // Wait for message from channel
-        let msg = TX_CHANNEL.receive().await;
+        // CRITICAL: When SEC-SIGN is being computed, wait for result instead of
+        // processing regular messages. This prevents sending packets that would
+        // not be included in the SEC-SIGN hash.
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            // Wait for SEC-SIGN result from Core1
+            let result = SEC_SIGN_RESULT.wait().await;
 
-        // Send via UART
-        if let Err(e) = tx.write_all(&msg).await {
-            error!("UART TX error: {:?}", e);
-            continue;
-        }
-
-        // Accumulate for SEC-SIGN (except SEC-SIGN messages themselves)
-        // SEC-SIGN class = 0x27
-        if msg.len() >= 3 && msg[2] != 0x27 {
-            let mut acc = SEC_SIGN_ACC.lock().await;
-            if let Some(ref mut accumulator) = *acc {
-                accumulator.accumulate(&msg);
-            }
-        }
-
-        // Check if SEC-SIGN result is ready
-        if let Some(result) = SEC_SIGN_RESULT.try_take() {
             // Build and send SEC-SIGN message
             let sec_sign_msg = SecSign {
                 version: 0x01,
@@ -374,7 +366,38 @@ async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                 if let Err(e) = tx.write_all(&buf[..len]).await {
                     error!("UART TX SEC-SIGN error: {:?}", e);
                 }
-                info!("SEC-SIGN message sent ({} packets)", result.packet_count);
+                info!("SEC-SIGN sent ({} packets), resuming TX", result.packet_count);
+            }
+
+            // Clear pause flag - resume normal TX
+            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+            continue;
+        }
+
+        // Normal operation: wait for message from channel
+        let msg = TX_CHANNEL.receive().await;
+
+        // Double-check pause flag before sending (could have been set while waiting)
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            // Re-queue the message and handle SEC-SIGN first
+            let _ = TX_CHANNEL.try_send(msg);
+            continue;
+        }
+
+        // Send via UART
+        if let Err(e) = tx.write_all(&msg).await {
+            error!("UART TX error: {:?}", e);
+            continue;
+        }
+
+        // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
+        // SEC-SIGN = class 0x27, id 0x04
+        // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
+        let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
+        if !is_sec_sign {
+            let mut acc = SEC_SIGN_ACC.lock().await;
+            if let Some(ref mut accumulator) = *acc {
+                accumulator.accumulate(&msg);
             }
         }
     }
@@ -722,6 +745,11 @@ async fn nav_message_task() {
             continue;
         }
 
+        // Skip while SEC-SIGN is being computed to prevent race condition
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            continue;
+        }
+
         // Get current message flags
         let flags = {
             let flags = MSG_FLAGS_STATE.lock().await;
@@ -1011,6 +1039,11 @@ async fn mon_message_task() {
             continue;
         }
 
+        // Skip while SEC-SIGN is being computed to prevent race condition
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            continue;
+        }
+
         // Get current message flags
         let flags = {
             let flags = MSG_FLAGS_STATE.lock().await;
@@ -1076,7 +1109,13 @@ async fn sec_sign_timer_task() {
             continue;
         }
 
+        // CRITICAL: Pause TX before capturing hash to prevent race condition
+        // Any packets sent after hash capture but before SEC-SIGN TX would not
+        // be included in the hash -> verification fails on receiver side
+        SEC_SIGN_IN_PROGRESS.store(true, Ordering::Release);
+
         // Get hash and count from global accumulator, reset it
+        // Must capture BOTH atomically - packet count at same moment as hash
         let (hash, count) = {
             let mut acc = SEC_SIGN_ACC.lock().await;
             if let Some(ref mut accumulator) = *acc {
@@ -1094,7 +1133,7 @@ async fn sec_sign_timer_task() {
         };
 
         SEC_SIGN_REQUEST.signal(request);
-        info!("SEC-SIGN requested for {} packets", count);
+        info!("SEC-SIGN requested for {} packets (TX paused)", count);
     }
 }
 
