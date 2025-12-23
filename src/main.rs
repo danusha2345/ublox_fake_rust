@@ -745,9 +745,10 @@ async fn nav_message_task() {
             continue;
         }
 
-        // Skip while SEC-SIGN is being computed to prevent race condition
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            continue;
+        // Wait for SEC-SIGN computation to complete (like C version's busy-wait)
+        // This prevents packet drops while ensuring SEC-SIGN is sent first
+        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            embassy_futures::yield_now().await;
         }
 
         // Get current message flags
@@ -1039,9 +1040,10 @@ async fn mon_message_task() {
             continue;
         }
 
-        // Skip while SEC-SIGN is being computed to prevent race condition
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            continue;
+        // Wait for SEC-SIGN computation to complete (like C version's busy-wait)
+        // This prevents packet drops while ensuring SEC-SIGN is sent first
+        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            embassy_futures::yield_now().await;
         }
 
         // Get current message flags

@@ -56,7 +56,7 @@ impl Default for NavPvt {
             fix_type: 3,  // 3D fix
             flags: 0x01,  // gnssFixOK
             flags2: 0x20,
-            num_sv: 12,
+            num_sv: 18,   // 9 GPS + 3 SBAS + 6 Galileo
             lon: 376184230,   // 37.618423 * 1e7
             lat: 557611990,   // 55.761199 * 1e7
             height: 156000,
@@ -862,38 +862,48 @@ pub struct SatInfo {
 }
 
 /// UBX-NAV-SAT (0x01 0x35) - Satellite Information (M10)
+/// 18 satellites: 9 GPS + 3 SBAS + 6 Galileo (from real GNSS log)
 #[derive(Clone)]
 pub struct NavSat {
     pub itow: u32,
     pub version: u8,
     pub num_svs: u8,
     pub reserved1: [u8; 2],
-    pub sats: [SatInfo; 12],  // Max 12 satellites
+    pub sats: [SatInfo; 18],  // 18 satellites
 }
 
 impl Default for NavSat {
     fn default() -> Self {
-        // Default satellite constellation (like C version)
-        let mut sats = [SatInfo::default(); 12];
-        let flags = 0x0000191F_u32; // qualityInd=7, svUsed=1, health=1, etc.
+        // Satellite constellation from real GNSS log (18 satellites)
+        let mut sats = [SatInfo::default(); 18];
+        let flags = 0x0000191F_u32; // qualityInd=7, svUsed=1, health=1, ephAvail=1
 
-        sats[0] = SatInfo { gnss_id: 0, sv_id: 2, cno: 46, elev: 52, azim: 154, pr_res: 0, flags };
-        sats[1] = SatInfo { gnss_id: 0, sv_id: 7, cno: 46, elev: 59, azim: 206, pr_res: 0, flags };
-        sats[2] = SatInfo { gnss_id: 0, sv_id: 8, cno: 46, elev: 51, azim: 56, pr_res: 0, flags };
-        sats[3] = SatInfo { gnss_id: 0, sv_id: 13, cno: 46, elev: 30, azim: 314, pr_res: 0, flags };
-        sats[4] = SatInfo { gnss_id: 0, sv_id: 14, cno: 46, elev: 32, azim: 295, pr_res: 0, flags };
-        sats[5] = SatInfo { gnss_id: 0, sv_id: 17, cno: 46, elev: 28, azim: 240, pr_res: 0, flags };
-        sats[6] = SatInfo { gnss_id: 0, sv_id: 21, cno: 46, elev: 59, azim: 119, pr_res: 0, flags };
-        sats[7] = SatInfo { gnss_id: 0, sv_id: 22, cno: 46, elev: 13, azim: 290, pr_res: 0, flags };
-        sats[8] = SatInfo { gnss_id: 0, sv_id: 27, cno: 46, elev: 29, azim: 18, pr_res: 0, flags };
-        sats[9] = SatInfo { gnss_id: 0, sv_id: 30, cno: 46, elev: 17, azim: 59, pr_res: 0, flags };
-        sats[10] = SatInfo { gnss_id: 1, sv_id: 133, cno: 46, elev: 56, azim: 276, pr_res: 0, flags };
-        sats[11] = SatInfo { gnss_id: 1, sv_id: 138, cno: 46, elev: 53, azim: 1, pr_res: 0, flags };
+        // GPS satellites (gnss_id=0)
+        sats[0] = SatInfo { gnss_id: 0, sv_id: 1, cno: 35, elev: 44, azim: 242, pr_res: 0, flags };
+        sats[1] = SatInfo { gnss_id: 0, sv_id: 2, cno: 35, elev: 26, azim: 214, pr_res: 0, flags };
+        sats[2] = SatInfo { gnss_id: 0, sv_id: 3, cno: 35, elev: 57, azim: 303, pr_res: 0, flags };
+        sats[3] = SatInfo { gnss_id: 0, sv_id: 10, cno: 30, elev: 2, azim: 131, pr_res: 0, flags };
+        sats[4] = SatInfo { gnss_id: 0, sv_id: 12, cno: 30, elev: 3, azim: 20, pr_res: 0, flags };
+        sats[5] = SatInfo { gnss_id: 0, sv_id: 26, cno: 35, elev: 16, azim: 146, pr_res: 0, flags };
+        sats[6] = SatInfo { gnss_id: 0, sv_id: 28, cno: 35, elev: 59, azim: 70, pr_res: 0, flags };
+        sats[7] = SatInfo { gnss_id: 0, sv_id: 31, cno: 35, elev: 70, azim: 144, pr_res: 0, flags };
+        sats[8] = SatInfo { gnss_id: 0, sv_id: 32, cno: 35, elev: 27, azim: 77, pr_res: 0, flags };
+        // SBAS satellites (gnss_id=1) - boosted signal
+        sats[9] = SatInfo { gnss_id: 1, sv_id: 131, cno: 35, elev: 34, azim: 184, pr_res: 0, flags };
+        sats[10] = SatInfo { gnss_id: 1, sv_id: 133, cno: 35, elev: 33, azim: 199, pr_res: 0, flags };
+        sats[11] = SatInfo { gnss_id: 1, sv_id: 138, cno: 35, elev: 34, azim: 171, pr_res: 0, flags };
+        // Galileo satellites (gnss_id=2)
+        sats[12] = SatInfo { gnss_id: 2, sv_id: 5, cno: 35, elev: 45, azim: 69, pr_res: 0, flags };
+        sats[13] = SatInfo { gnss_id: 2, sv_id: 8, cno: 35, elev: 25, azim: 261, pr_res: 0, flags };
+        sats[14] = SatInfo { gnss_id: 2, sv_id: 13, cno: 35, elev: 29, azim: 314, pr_res: 0, flags };
+        sats[15] = SatInfo { gnss_id: 2, sv_id: 15, cno: 35, elev: 50, azim: 246, pr_res: 0, flags };
+        sats[16] = SatInfo { gnss_id: 2, sv_id: 16, cno: 35, elev: 45, azim: 180, pr_res: 0, flags };
+        sats[17] = SatInfo { gnss_id: 2, sv_id: 31, cno: 35, elev: 10, azim: 30, pr_res: 0, flags };
 
         Self {
             itow: 0,
             version: 0x01,
-            num_svs: 12,
+            num_svs: 18,
             reserved1: [0; 2],
             sats,
         }
@@ -940,38 +950,49 @@ pub struct SvInfo {
     pub pr_res: i32,    // cm
 }
 
-/// UBX-NAV-SVINFO (0x01 0x30) - Satellite Information (legacy)
+/// UBX-NAV-SVINFO (0x01 0x30) - Satellite Information (legacy M8 format)
+/// 18 satellites: 9 GPS + 3 SBAS + 6 Galileo (from real GNSS log)
+/// Note: Galileo svid encoding = 211 + sv_id - 1 (E01=211, E31=241)
 #[derive(Clone)]
 pub struct NavSvinfo {
     pub itow: u32,
     pub num_ch: u8,
     pub global_flags: u8,
     pub reserved1: [u8; 2],
-    pub svs: [SvInfo; 12],
+    pub svs: [SvInfo; 18],
 }
 
 impl Default for NavSvinfo {
     fn default() -> Self {
-        let mut svs = [SvInfo::default(); 12];
-        let flags = 0x0D;
-        let quality = 0x07;
+        let mut svs = [SvInfo::default(); 18];
+        let flags = 0x0D;   // svUsed + orbitAvail + orbitEph
+        let quality = 0x07; // best quality
 
-        svs[0] = SvInfo { chn: 4, svid: 2, flags, quality, cno: 46, elev: 52, azim: 154, pr_res: -1511 };
-        svs[1] = SvInfo { chn: 0, svid: 7, flags, quality, cno: 46, elev: 59, azim: 206, pr_res: -1455 };
-        svs[2] = SvInfo { chn: 7, svid: 8, flags, quality, cno: 46, elev: 51, azim: 56, pr_res: -1411 };
-        svs[3] = SvInfo { chn: 10, svid: 13, flags, quality, cno: 46, elev: 30, azim: 314, pr_res: -1387 };
-        svs[4] = SvInfo { chn: 5, svid: 14, flags, quality, cno: 46, elev: 32, azim: 295, pr_res: -1366 };
-        svs[5] = SvInfo { chn: 1, svid: 17, flags, quality, cno: 46, elev: 28, azim: 240, pr_res: -1439 };
-        svs[6] = SvInfo { chn: 3, svid: 21, flags, quality, cno: 46, elev: 59, azim: 119, pr_res: -1373 };
-        svs[7] = SvInfo { chn: 9, svid: 22, flags, quality, cno: 46, elev: 13, azim: 290, pr_res: -1409 };
-        svs[8] = SvInfo { chn: 6, svid: 27, flags, quality, cno: 46, elev: 29, azim: 18, pr_res: -1359 };
-        svs[9] = SvInfo { chn: 8, svid: 30, flags, quality, cno: 46, elev: 17, azim: 59, pr_res: -1484 };
-        svs[10] = SvInfo { chn: 2, svid: 133, flags, quality, cno: 46, elev: 56, azim: 276, pr_res: -1431 };
-        svs[11] = SvInfo { chn: 11, svid: 138, flags, quality, cno: 46, elev: 53, azim: 1, pr_res: -1431 };
+        // GPS satellites (svid = PRN)
+        svs[0] = SvInfo { chn: 0, svid: 1, flags, quality, cno: 35, elev: 44, azim: 242, pr_res: -1536 };
+        svs[1] = SvInfo { chn: 1, svid: 2, flags, quality, cno: 35, elev: 26, azim: 214, pr_res: -1536 };
+        svs[2] = SvInfo { chn: 2, svid: 3, flags, quality, cno: 35, elev: 57, azim: 303, pr_res: -1536 };
+        svs[3] = SvInfo { chn: 3, svid: 10, flags, quality, cno: 30, elev: 2, azim: 131, pr_res: -1536 };
+        svs[4] = SvInfo { chn: 4, svid: 12, flags, quality, cno: 30, elev: 3, azim: 20, pr_res: -1536 };
+        svs[5] = SvInfo { chn: 5, svid: 26, flags, quality, cno: 35, elev: 16, azim: 146, pr_res: -1536 };
+        svs[6] = SvInfo { chn: 6, svid: 28, flags, quality, cno: 35, elev: 59, azim: 70, pr_res: -1536 };
+        svs[7] = SvInfo { chn: 7, svid: 31, flags, quality, cno: 35, elev: 70, azim: 144, pr_res: -1536 };
+        svs[8] = SvInfo { chn: 8, svid: 32, flags, quality, cno: 35, elev: 27, azim: 77, pr_res: -1536 };
+        // SBAS satellites (svid = PRN, 120-158)
+        svs[9] = SvInfo { chn: 9, svid: 131, flags, quality, cno: 35, elev: 34, azim: 184, pr_res: -1536 };
+        svs[10] = SvInfo { chn: 10, svid: 133, flags, quality, cno: 35, elev: 33, azim: 199, pr_res: -1536 };
+        svs[11] = SvInfo { chn: 11, svid: 138, flags, quality, cno: 35, elev: 34, azim: 171, pr_res: -1536 };
+        // Galileo satellites (svid = 211 + E_num - 1: E05=215, E08=218, E13=223, E15=225, E16=226, E31=241)
+        svs[12] = SvInfo { chn: 12, svid: 215, flags, quality, cno: 35, elev: 45, azim: 69, pr_res: -1536 };   // E05
+        svs[13] = SvInfo { chn: 13, svid: 218, flags, quality, cno: 35, elev: 25, azim: 261, pr_res: -1536 };  // E08
+        svs[14] = SvInfo { chn: 14, svid: 223, flags, quality, cno: 35, elev: 29, azim: 314, pr_res: -1536 };  // E13
+        svs[15] = SvInfo { chn: 15, svid: 225, flags, quality, cno: 35, elev: 50, azim: 246, pr_res: -1536 };  // E15
+        svs[16] = SvInfo { chn: 16, svid: 226, flags, quality, cno: 35, elev: 45, azim: 180, pr_res: -1536 };  // E16
+        svs[17] = SvInfo { chn: 17, svid: 241, flags, quality, cno: 35, elev: 10, azim: 30, pr_res: -1536 };   // E31
 
         Self {
             itow: 0,
-            num_ch: 12,
+            num_ch: 18,
             global_flags: 0x04,
             reserved1: [0; 2],
             svs,

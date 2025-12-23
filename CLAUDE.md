@@ -147,18 +147,19 @@ Key crates: `p192` (elliptic curve), `sha2` (hashing), `hmac` (deterministic k)
 
 **Problem**: Race condition where packets sent AFTER hash capture but BEFORE SEC-SIGN TX are not included in the signature hash → verification fails on receiver side.
 
-**Solution**: `SEC_SIGN_IN_PROGRESS` atomic flag pauses all TX while SEC-SIGN is being computed:
+**Solution**: `SEC_SIGN_IN_PROGRESS` atomic flag coordinates TX while SEC-SIGN is being computed:
 
 ```
 sec_sign_timer_task: set SEC_SIGN_IN_PROGRESS=true → capture hash → signal Core1
-nav_message_task:    check flag → skip if true
-mon_message_task:    check flag → skip if true
+nav_message_task:    check flag → wait with yield_now() until false
+mon_message_task:    check flag → wait with yield_now() until false
 uart_tx_task:        check flag → wait for SEC-SIGN result → send → clear flag
 Core1:               compute ECDSA → signal result
 ```
 
 Critical synchronization points:
 - `sec_sign_timer_task` sets `SEC_SIGN_IN_PROGRESS = true` BEFORE capturing hash
+- `nav_message_task` and `mon_message_task` use cooperative `yield_now()` loop to wait (like C version's busy-wait, prevents packet drops)
 - `uart_tx_task` waits for `SEC_SIGN_RESULT` signal when flag is set
 - Flag is cleared by `uart_tx_task` AFTER sending SEC-SIGN message
 
