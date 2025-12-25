@@ -14,6 +14,7 @@ mod flash_storage;
 mod led;
 mod passthrough;
 mod sec_sign;
+mod spoof_detector;
 mod ubx;
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};

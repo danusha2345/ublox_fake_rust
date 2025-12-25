@@ -36,6 +36,9 @@ subtle = { version = "2.5", default-features = false }
 # Heapless collections (no_std)
 heapless = "0.9"
 
+# Math functions for no_std (sqrt, fabs, etc.)
+libm = "0.2"
+
 # Static cell for multicore
 static_cell = "2"
 portable-atomic = { version = "1", features = ["critical-section"] }
