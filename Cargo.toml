@@ -44,6 +44,7 @@ portable-atomic = { version = "1", features = ["critical-section"] }
 pio = "0.3"
 fixed = "1.29"
 fixed-macro = "1.2"
+smart-leds = "0.4"
 
 # Async IO traits (must match embassy-rp version)
 embedded-io-async = "0.6"

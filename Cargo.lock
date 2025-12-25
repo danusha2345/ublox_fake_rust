@@ -1433,6 +1433,7 @@ dependencies = [
  "portable-atomic",
  "rp-pac",
  "sha2",
+ "smart-leds",
  "static_cell",
  "subtle",
 ]

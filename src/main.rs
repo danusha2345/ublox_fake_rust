@@ -149,7 +149,7 @@ type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 
 static FLASH_PTR: AtomicPtr<FlashMutex> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Core1 stack
-static mut CORE1_STACK: Stack<4096> = Stack::new();
+static mut CORE1_STACK: Stack<8192> = Stack::new();
 
 // ============================================================================
 // Operating Mode
@@ -225,6 +225,8 @@ async fn main(spawner: Spawner) {
 
     // Spawn Core1 for LED and SEC-SIGN computation
     info!("Spawning Core1...");
+    let dma_ch1 = p.DMA_CH1;
+    let pin_16 = p.PIN_16;
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -232,7 +234,7 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, p.PIN_16));
+                spawner.must_spawn(led_task(pio0, dma_ch1, pin_16));
                 spawner.must_spawn(sec_sign_compute_task());
             });
         },
@@ -305,12 +307,13 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
+    dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
     pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
 ) {
     use led::Ws2812;
 
     info!("LED task starting on Core1");
-    let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, pin);
+    let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, dma, pin);
     let mut ticker = Ticker::every(Duration::from_millis(config::timers::LED_BLINK_MS));
     let mut led_on = false;
 
