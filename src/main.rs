@@ -63,6 +63,7 @@ bind_interrupts!(struct Irqs {
 
 /// Macro to send a UBX message if the corresponding flag is enabled.
 /// Reduces boilerplate for building and sending messages.
+/// Logs warning on TX channel overflow.
 ///
 /// Usage:
 /// - `send_msg!(buf, flag, MsgType)` - sends default message
@@ -76,7 +77,9 @@ macro_rules! send_msg {
             if len > 0 {
                 let mut vec = heapless::Vec::<u8, 256>::new();
                 let _ = vec.extend_from_slice(&$buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
+                if TX_CHANNEL.try_send(vec).is_err() {
+                    warn!("TX channel full, dropped {} message", stringify!($msg_type));
+                }
             }
         }
     };
@@ -89,7 +92,9 @@ macro_rules! send_msg {
             if len > 0 {
                 let mut vec = heapless::Vec::<u8, 256>::new();
                 let _ = vec.extend_from_slice(&$buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
+                if TX_CHANNEL.try_send(vec).is_err() {
+                    warn!("TX channel full, dropped {} message", stringify!($msg_type));
+                }
             }
         }
     };
@@ -418,7 +423,9 @@ async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
         // Double-check pause flag before sending (could have been set while waiting)
         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
             // Re-queue the message and handle SEC-SIGN first
-            let _ = TX_CHANNEL.try_send(msg);
+            if TX_CHANNEL.try_send(msg).is_err() {
+                error!("Failed to re-queue message during SEC-SIGN, message lost!");
+            }
             continue;
         }
 
@@ -522,7 +529,9 @@ fn send_ack(cls_id: u8, msg_id: u8) {
     if len > 0 {
         let mut vec = heapless::Vec::new();
         let _ = vec.extend_from_slice(&buf[..len]);
-        let _ = TX_CHANNEL.try_send(vec);
+        if TX_CHANNEL.try_send(vec).is_err() {
+            warn!("TX channel full, dropped ACK for {:02X}:{:02X}", cls_id, msg_id);
+        }
     }
 }
 
@@ -535,18 +544,22 @@ fn send_nak(cls_id: u8, msg_id: u8) {
     if len > 0 {
         let mut vec = heapless::Vec::new();
         let _ = vec.extend_from_slice(&buf[..len]);
-        let _ = TX_CHANNEL.try_send(vec);
+        if TX_CHANNEL.try_send(vec).is_err() {
+            warn!("TX channel full, dropped NAK for {:02X}:{:02X}", cls_id, msg_id);
+        }
     }
 }
 
-/// Send a UBX message
+/// Send a UBX message (for poll responses)
 fn send_ubx_message<M: UbxMessage>(msg: &M) {
     let mut buf = [0u8; 256];
     let len = msg.build(&mut buf);
     if len > 0 {
         let mut vec = heapless::Vec::new();
         let _ = vec.extend_from_slice(&buf[..len]);
-        let _ = TX_CHANNEL.try_send(vec);
+        if TX_CHANNEL.try_send(vec).is_err() {
+            warn!("TX channel full, dropped UBX {:02X}:{:02X}", msg.class(), msg.id());
+        }
     }
 }
 
@@ -982,20 +995,26 @@ async fn button_task(mut btn: Input<'static>) {
             info!("Switching to {:?}, saving to flash...", new_mode);
 
             // Save new mode to flash
-            {
+            let save_ok = {
                 let flash_mutex = unsafe { &*FLASH_PTR.load(Ordering::Acquire) };
                 let mut flash = flash_mutex.lock().await;
-                flash_storage::save_mode(&mut flash, new_mode as u8).await;
+                flash_storage::save_mode(&mut flash, new_mode as u8).await
+            };
+
+            if save_ok {
+                info!("Mode saved, rebooting...");
+
+                // Wait for button release before reboot
+                btn.wait_for_low().await;
+                Timer::after(Duration::from_millis(100)).await;
+
+                // Reboot to apply new mode
+                SCB::sys_reset();
+            } else {
+                error!("Failed to save mode, not rebooting");
+                // Wait for button release before continuing
+                btn.wait_for_low().await;
             }
-
-            info!("Mode saved, rebooting...");
-
-            // Wait for button release before reboot
-            btn.wait_for_low().await;
-            Timer::after(Duration::from_millis(100)).await;
-
-            // Reboot to apply new mode
-            SCB::sys_reset();
         }
     }
 }

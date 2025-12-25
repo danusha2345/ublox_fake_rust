@@ -1,5 +1,6 @@
 //! Flash storage for persistent mode
 
+use defmt::*;
 use embassy_rp::flash::{Async, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
 
@@ -29,8 +30,8 @@ impl Default for ModeData {
     }
 }
 
-/// Save mode to flash
-pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>, mode: u8) {
+/// Save mode to flash. Returns true on success, false on error.
+pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>, mode: u8) -> bool {
     let mut data = [0u8; ERASE_SIZE];
 
     // Prepare data
@@ -47,10 +48,19 @@ pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>,
     }
 
     // Erase sector
-    let _ = flash.blocking_erase(FLASH_OFFSET, FLASH_OFFSET + ERASE_SIZE as u32);
+    if let Err(e) = flash.blocking_erase(FLASH_OFFSET, FLASH_OFFSET + ERASE_SIZE as u32) {
+        error!("Flash erase failed: {:?}", e);
+        return false;
+    }
 
     // Write data
-    let _ = flash.blocking_write(FLASH_OFFSET, &data[..256]); // Write one page
+    if let Err(e) = flash.blocking_write(FLASH_OFFSET, &data[..256]) {
+        error!("Flash write failed: {:?}", e);
+        return false;
+    }
+
+    info!("Mode {} saved to flash successfully", mode);
+    true
 }
 
 /// Load mode from flash, returns None if no valid data

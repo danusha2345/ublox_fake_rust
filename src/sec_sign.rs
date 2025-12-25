@@ -110,15 +110,15 @@ pub struct Signature {
 
 /// Generate deterministic k using RFC6979 (simplified)
 /// k = HMAC-SHA256(private_key || z) mod n
-fn generate_k(private_key: &[u8; 24], z: &[u8; 24]) -> Scalar {
+/// Returns None if no valid k found after 255 attempts (astronomically unlikely)
+fn generate_k(private_key: &[u8; 24], z: &[u8; 24]) -> Option<Scalar> {
     // Simplified RFC6979: k = HMAC(key=d, data=z)
     let mut mac = HmacSha256::new_from_slice(private_key)
         .expect("HMAC key length is valid");
     mac.update(z);
 
-    // Add counter for retry mechanism
-    let mut counter = 0u8;
-    loop {
+    // Add counter for retry mechanism (RFC6979 style)
+    for counter in 0u8..=255 {
         let mut mac_clone = mac.clone();
         mac_clone.update(&[counter]);
         let result = mac_clone.finalize().into_bytes();
@@ -133,16 +133,14 @@ fn generate_k(private_key: &[u8; 24], z: &[u8; 24]) -> Scalar {
             let k = k_opt.unwrap();
             // Check k != 0
             if bool::from(!k.is_zero()) {
-                return k;
+                return Some(k);
             }
         }
-
-        counter += 1;
-        if counter > 100 {
-            // Fallback - shouldn't happen
-            return Scalar::ONE;
-        }
     }
+
+    // All 256 attempts failed - astronomically unlikely, but return None
+    // instead of using predictable fallback value
+    None
 }
 
 impl Signature {
@@ -156,7 +154,7 @@ impl Signature {
         let z_scalar = ct_option_to_option(Scalar::from_bytes(&(*z).into()))?;
 
         // Generate deterministic k (RFC6979 simplified)
-        let k = generate_k(private_key, z);
+        let k = generate_k(private_key, z)?;
 
         // Compute R = k * G
         let r_point = ProjectivePoint::GENERATOR * k;
