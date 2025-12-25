@@ -58,6 +58,44 @@ bind_interrupts!(struct Irqs {
 });
 
 // ============================================================================
+// UBX message sending macro
+// ============================================================================
+
+/// Macro to send a UBX message if the corresponding flag is enabled.
+/// Reduces boilerplate for building and sending messages.
+///
+/// Usage:
+/// - `send_msg!(buf, flag, MsgType)` - sends default message
+/// - `send_msg!(buf, flag, MsgType, { field1: val1, field2: val2 })` - with field overrides
+macro_rules! send_msg {
+    // Simple form: just default message
+    ($buf:expr, $flag:expr, $msg_type:ty) => {
+        if $flag {
+            let msg = <$msg_type>::default();
+            let len = msg.build(&mut $buf);
+            if len > 0 {
+                let mut vec = heapless::Vec::<u8, 256>::new();
+                let _ = vec.extend_from_slice(&$buf[..len]);
+                let _ = TX_CHANNEL.try_send(vec);
+            }
+        }
+    };
+    // With field overrides
+    ($buf:expr, $flag:expr, $msg_type:ty, { $($field:ident : $value:expr),* $(,)? }) => {
+        if $flag {
+            let mut msg = <$msg_type>::default();
+            $( msg.$field = $value; )*
+            let len = msg.build(&mut $buf);
+            if len > 0 {
+                let mut vec = heapless::Vec::<u8, 256>::new();
+                let _ = vec.extend_from_slice(&$buf[..len]);
+                let _ = TX_CHANNEL.try_send(vec);
+            }
+        }
+    };
+}
+
+// ============================================================================
 // Inter-core communication
 // ============================================================================
 
@@ -765,259 +803,71 @@ async fn nav_message_task() {
         let min = ((total_secs / 60) % 60) as u8;
         let hour = ((total_secs / 3600) % 24) as u8;
 
-        // Build and send enabled NAV messages
-        // Use 256-byte buffer for larger messages like NAV-SAT
+        // Build and send enabled NAV messages using send_msg! macro
         let mut buf = [0u8; 256];
 
         // NAV-PVT (0x01 0x07)
-        if flags.nav_pvt {
-            let mut msg = NavPvt::default();
-            msg.itow = itow;
-            msg.hour = hour;
-            msg.min = min;
-            msg.sec = sec;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
 
-        // NAV-POSECEF (0x01 0x01)
-        if flags.nav_posecef {
-            let mut msg = NavPosecef::default();
-            msg.itow = itow;
-            // ECEF coordinates for Moscow (approximately)
-            msg.ecef_x = 278394700;  // cm
-            msg.ecef_y = 182089200;
-            msg.ecef_z = 523478500;
-            msg.p_acc = 5000;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        // NAV-POSECEF (0x01 0x01) - ECEF coordinates for Moscow
+        send_msg!(buf, flags.nav_posecef, NavPosecef, {
+            itow: itow, ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500, p_acc: 5000
+        });
 
         // NAV-POSLLH (0x01 0x02)
-        if flags.nav_posllh {
-            let mut msg = NavPosllh::default();
-            msg.itow = itow;
-            msg.lon = 376184230;   // 37.618423 * 1e7
-            msg.lat = 557611990;   // 55.761199 * 1e7
-            msg.height = 156000;   // mm
-            msg.h_msl = 156000;
-            msg.h_acc = 5000;
-            msg.v_acc = 8000;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_posllh, NavPosllh, {
+            itow: itow, lon: 376184230, lat: 557611990, height: 156000, h_msl: 156000, h_acc: 5000, v_acc: 8000
+        });
 
         // NAV-STATUS (0x01 0x03)
-        if flags.nav_status {
-            let mut msg = NavStatus::default();
-            msg.itow = itow;
-            msg.msss = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
 
         // NAV-DOP (0x01 0x04)
-        if flags.nav_dop {
-            let mut msg = NavDop::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_dop, NavDop, { itow: itow });
 
         // NAV-VELECEF (0x01 0x11)
-        if flags.nav_velecef {
-            let mut msg = NavVelecef::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_velecef, NavVelecef, { itow: itow });
 
         // NAV-VELNED (0x01 0x12)
-        if flags.nav_velned {
-            let mut msg = NavVelned::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_velned, NavVelned, { itow: itow });
 
         // NAV-HPPOSECEF (0x01 0x13)
-        if flags.nav_hpposecef {
-            let mut msg = NavHpposecef::default();
-            msg.itow = itow;
-            msg.ecef_x = 278394700;
-            msg.ecef_y = 182089200;
-            msg.ecef_z = 523478500;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_hpposecef, NavHpposecef, {
+            itow: itow, ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500
+        });
 
         // NAV-TIMEGPS (0x01 0x20)
-        if flags.nav_timegps {
-            let mut msg = NavTimegps::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_timegps, NavTimegps, { itow: itow });
 
         // NAV-TIMEUTC (0x01 0x21)
-        if flags.nav_timeutc {
-            let mut msg = NavTimeutc::default();
-            msg.itow = itow;
-            msg.hour = hour;
-            msg.min = min;
-            msg.sec = sec;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_timeutc, NavTimeutc, { itow: itow, hour: hour, min: min, sec: sec });
 
         // NAV-CLOCK (0x01 0x22)
-        if flags.nav_clock {
-            let mut msg = NavClock::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_clock, NavClock, { itow: itow });
 
         // NAV-TIMELS (0x01 0x26)
-        if flags.nav_timels {
-            let mut msg = NavTimels::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_timels, NavTimels, { itow: itow });
 
         // NAV-SVINFO (0x01 0x30) - legacy format
-        if flags.nav_svinfo {
-            let mut msg = NavSvinfo::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_svinfo, NavSvinfo, { itow: itow });
 
         // NAV-SAT (0x01 0x35) - M10 format
-        if flags.nav_sat {
-            let mut msg = NavSat::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_sat, NavSat, { itow: itow });
 
         // NAV-COV (0x01 0x36)
-        if flags.nav_cov {
-            let mut msg = NavCov::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_cov, NavCov, { itow: itow });
 
         // NAV-AOPSTATUS (0x01 0x60)
-        if flags.nav_aopstatus {
-            let mut msg = NavAopstatus::default();
-            msg.itow = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_aopstatus, NavAopstatus, { itow: itow });
 
         // TIM-TP (0x0D 0x01)
-        if flags.tim_tp {
-            let mut msg = TimTp::default();
-            msg.tow_ms = itow;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.tim_tp, TimTp, { tow_ms: itow });
 
         // RXM-RAWX (0x02 0x15)
-        if flags.rxm_rawx {
-            let mut msg = RxmRawx::default();
-            msg.rcv_tow = itow as f64 / 1000.0;
-            msg.week = 2349;
-            msg.leap_s = 18;
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.rxm_rawx, RxmRawx, { rcv_tow: itow as f64 / 1000.0, week: 2349, leap_s: 18 });
 
         // NAV-EOE (0x01 0x61) - End of Epoch - always last
-        if flags.nav_eoe {
-            let msg = NavEoe { itow };
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.nav_eoe, NavEoe, { itow: itow });
     }
 }
 
@@ -1053,37 +903,13 @@ async fn mon_message_task() {
         };
 
         // MON-HW (0x0A 0x09)
-        if flags.mon_hw {
-            let msg = MonHw::default();
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.mon_hw, MonHw);
 
         // MON-COMMS (0x0A 0x36)
-        if flags.mon_comms {
-            let msg = MonComms::default();
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.mon_comms, MonComms);
 
         // MON-RF (0x0A 0x38)
-        if flags.mon_rf {
-            let msg = MonRf::default();
-            let len = msg.build(&mut buf);
-            if len > 0 {
-                let mut vec = heapless::Vec::new();
-                let _ = vec.extend_from_slice(&buf[..len]);
-                let _ = TX_CHANNEL.try_send(vec);
-            }
-        }
+        send_msg!(buf, flags.mon_rf, MonRf);
     }
 }
 
