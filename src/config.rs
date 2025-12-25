@@ -17,10 +17,20 @@ pub mod pins {
 
 /// Timer periods in milliseconds
 pub mod timers {
-    pub const NAV_PERIOD_MS: u64 = 200;   // 5Hz
-    pub const MON_PERIOD_MS: u64 = 1000;  // 1Hz
+    /// Default NAV measurement period (5Hz = 200ms)
+    pub const NAV_MEAS_PERIOD_MS: u32 = 200;
+    /// Default NAV rate (cycles per navigation solution)
+    pub const NAV_RATE: u32 = 1;
+    /// MON message period (1Hz)
+    pub const MON_PERIOD_MS: u64 = 1000;
+    /// LED blink period
+    pub const LED_BLINK_MS: u64 = 500;
+    /// First SEC-SIGN delay after start
     pub const SEC_SIGN_FIRST_MS: u64 = 3000;
+    /// SEC-SIGN interval
     pub const SEC_SIGN_PERIOD_MS: u64 = 4000;
+    /// Initial delay before UART TX starts
+    pub const UART_TX_INIT_DELAY_MS: u64 = 1000;
 }
 
 /// Default coordinates (Moscow, Red Square)

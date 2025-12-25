@@ -86,11 +86,11 @@ static SEC_SIGN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(0);
 
-/// NAV message measurement period in milliseconds (default 200ms)
-static NAV_MEAS_PERIOD_MS: AtomicU32 = AtomicU32::new(200);
+/// NAV message measurement period in milliseconds (default from config)
+static NAV_MEAS_PERIOD_MS: AtomicU32 = AtomicU32::new(config::timers::NAV_MEAS_PERIOD_MS);
 
-/// NAV message rate (cycles per navigation solution, default 1)
-static NAV_RATE: AtomicU32 = AtomicU32::new(1);
+/// NAV message rate (cycles per navigation solution, default from config)
+static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 
 /// Time reference (0=UTC, 1=GPS, 2=GLONASS, etc.) - stored but not used
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
@@ -268,7 +268,7 @@ async fn led_task(
 
     info!("LED task starting on Core1");
     let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, pin);
-    let mut ticker = Ticker::every(Duration::from_millis(500));
+    let mut ticker = Ticker::every(Duration::from_millis(config::timers::LED_BLINK_MS));
     let mut led_on = false;
 
     loop {
@@ -331,7 +331,7 @@ async fn sec_sign_compute_task() {
 #[embassy_executor::task]
 async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
     // Wait for initial delay
-    Timer::after(Duration::from_secs(1)).await;
+    Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
 
     // Initialize global accumulator
     {
@@ -729,8 +729,8 @@ async fn nav_message_task() {
     // Wait for first CFG-MSG to enable messages
     MSG_OUTPUT_STARTED.wait().await;
 
-    // 1 second delay after first CFG-MSG (like C version)
-    Timer::after(Duration::from_secs(1)).await;
+    // Delay after first CFG-MSG (like C version)
+    Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
     info!("NAV message output started");
 
     loop {
@@ -1021,15 +1021,15 @@ async fn nav_message_task() {
     }
 }
 
-/// MON message task - sends monitoring messages at 1Hz when enabled
+/// MON message task - sends monitoring messages at configured rate when enabled
 #[embassy_executor::task]
 async fn mon_message_task() {
     // Wait for message output to start
     MSG_OUTPUT_STARTED.wait().await;
-    Timer::after(Duration::from_secs(1)).await;
+    Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
     info!("MON message task started");
 
-    let mut ticker = Ticker::every(Duration::from_secs(1));
+    let mut ticker = Ticker::every(Duration::from_millis(config::timers::MON_PERIOD_MS));
     let mut buf = [0u8; 128];
 
     loop {
@@ -1087,7 +1087,7 @@ async fn mon_message_task() {
     }
 }
 
-/// SEC-SIGN timer task - requests signature every 4 seconds
+/// SEC-SIGN timer task - requests signature at configured interval
 /// Only starts after message output begins (like C version)
 #[embassy_executor::task]
 async fn sec_sign_timer_task() {
@@ -1096,13 +1096,13 @@ async fn sec_sign_timer_task() {
     // Wait for message output to start
     MSG_OUTPUT_STARTED.wait().await;
 
-    // First signature at 3 seconds after start
-    Timer::after(Duration::from_secs(3)).await;
+    // First signature after initial delay
+    Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
 
     info!("SEC-SIGN timer task started");
 
-    // Then every 4 seconds
-    let mut ticker = Ticker::every(Duration::from_secs(4));
+    // Then at configured interval
+    let mut ticker = Ticker::every(Duration::from_millis(config::timers::SEC_SIGN_PERIOD_MS));
     loop {
         ticker.next().await;
 
