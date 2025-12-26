@@ -237,13 +237,13 @@ impl Default for NavDop {
     fn default() -> Self {
         Self {
             itow: 0,
-            g_dop: 150,
-            p_dop: 120,
-            t_dop: 80,
+            g_dop: 100,  // 1.00 (same as C)
+            p_dop: 100,
+            t_dop: 100,
             v_dop: 100,
-            h_dop: 80,
-            n_dop: 70,
-            e_dop: 60,
+            h_dop: 100,
+            n_dop: 100,
+            e_dop: 100,
         }
     }
 }
@@ -473,7 +473,7 @@ impl UbxMessage for SecUniqid {
 // ============================================================================
 
 /// UBX-NAV-VELNED (0x01 0x12) - Velocity in NED frame
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NavVelned {
     pub itow: u32,
     pub vel_n: i32,     // cm/s
@@ -484,6 +484,22 @@ pub struct NavVelned {
     pub heading: i32,   // deg * 1e-5
     pub s_acc: u32,     // cm/s
     pub c_acc: u32,     // deg * 1e-5
+}
+
+impl Default for NavVelned {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            vel_n: 0,
+            vel_e: 0,
+            vel_d: 0,
+            speed: 0,
+            g_speed: 0,
+            heading: 0,
+            s_acc: 100,  // Same as C version (0x64)
+            c_acc: 0,
+        }
+    }
 }
 
 impl UbxMessage for NavVelned {
@@ -506,13 +522,25 @@ impl UbxMessage for NavVelned {
 }
 
 /// UBX-NAV-VELECEF (0x01 0x11) - Velocity in ECEF coordinates
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NavVelecef {
     pub itow: u32,
     pub ecef_vx: i32,   // cm/s
     pub ecef_vy: i32,   // cm/s
     pub ecef_vz: i32,   // cm/s
     pub s_acc: u32,     // cm/s
+}
+
+impl Default for NavVelecef {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            ecef_vx: 0,
+            ecef_vy: 0,
+            ecef_vz: 0,
+            s_acc: 100,  // Same as C version (0x64)
+        }
+    }
 }
 
 impl UbxMessage for NavVelecef {
@@ -1180,13 +1208,25 @@ impl UbxMessage for MonRf {
 }
 
 /// UBX-MON-COMMS (0x0A 0x36) - Communication Port Information (minimal)
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MonComms {
     pub version: u8,
     pub n_ports: u8,
     pub tx_errors: u8,
     pub reserved1: u8,
     pub reserved2: [u8; 4],
+}
+
+impl Default for MonComms {
+    fn default() -> Self {
+        Self {
+            version: 1,   // Same as C version
+            n_ports: 1,   // Same as C version
+            tx_errors: 0,
+            reserved1: 0,
+            reserved2: [0; 4],
+        }
+    }
 }
 
 impl UbxMessage for MonComms {
@@ -1249,7 +1289,7 @@ impl UbxMessage for TimTp {
 }
 
 /// UBX-RXM-RAWX (0x02 0x15) - Raw Measurement Data (minimal, no measurements)
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RxmRawx {
     pub rcv_tow: f64,
     pub week: u16,
@@ -1258,6 +1298,20 @@ pub struct RxmRawx {
     pub rec_stat: u8,
     pub version: u8,
     pub reserved1: [u8; 2],
+}
+
+impl Default for RxmRawx {
+    fn default() -> Self {
+        Self {
+            rcv_tow: 0.0,
+            week: 0,
+            leap_s: 0,
+            num_meas: 0,
+            rec_stat: 1,   // Same as C version
+            version: 0,
+            reserved1: [0; 2],
+        }
+    }
 }
 
 impl UbxMessage for RxmRawx {
