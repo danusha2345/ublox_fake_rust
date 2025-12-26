@@ -435,9 +435,9 @@ async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                 }
 
                 // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
-                // SEC-SIGN = class 0x27, id 0x01 (not 0x04!)
+                // SEC-SIGN = class 0x27, id 0x04
                 // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
-                let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x01;
+                let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                 if !is_sec_sign {
                     let mut acc = SEC_SIGN_ACC.lock().await;
                     if let Some(ref mut accumulator) = *acc {

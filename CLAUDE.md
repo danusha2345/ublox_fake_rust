@@ -259,7 +259,7 @@ All core features complete:
 | 0x05 | 0x00 | ACK-NAK | 2 | Negative acknowledgement |
 | 0x05 | 0x01 | ACK-ACK | 2 | Acknowledgement |
 | 0x0D | 0x01 | TIM-TP | 16 | Timepulse |
-| 0x27 | 0x01 | SEC-SIGN | 108 | Signature |
+| 0x27 | 0x04 | SEC-SIGN | 108 | Signature |
 | 0x27 | 0x03 | SEC-UNIQID | 10 | Unique ID (poll) |
 
 ## Embassy 0.9 API Notes

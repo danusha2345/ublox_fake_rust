@@ -350,7 +350,7 @@ impl Default for SecSign {
 
 impl UbxMessage for SecSign {
     fn class(&self) -> u8 { 0x27 }
-    fn id(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x04 }
     fn payload_len(&self) -> u16 { 108 }
 
     fn write_payload(&self, buf: &mut [u8]) -> usize {
