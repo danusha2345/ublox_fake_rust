@@ -459,7 +459,7 @@ impl Default for MonVer {
         sw_version[..sw.len()].copy_from_slice(sw);
 
         let mut hw_version = [0u8; 10];
-        let hw = b"00190000";
+        let hw = b"000A0000";  // M10 hardware version (must match C version)
         hw_version[..hw.len()].copy_from_slice(hw);
 
         // Extension strings
