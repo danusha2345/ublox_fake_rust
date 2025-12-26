@@ -194,7 +194,7 @@ impl Default for NavStatus {
         Self {
             itow: 0,
             gps_fix: 3,  // 3D fix
-            flags: 0x0D,
+            flags: 0x0F,  // gpsFixOk + diffSoln + wknSet + towSet (same as C)
             fix_stat: 0x00,
             flags2: 0x08,
             ttff: 25000,
