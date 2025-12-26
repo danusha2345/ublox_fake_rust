@@ -17,6 +17,9 @@ pub enum UbxCommand {
     /// CFG-CFG: Configuration save/load/clear
     CfgCfg,
 
+    /// CFG-RST: Reset command (used as trigger to start message output)
+    CfgRst,
+
     /// CFG-NAV5: Navigation engine settings
     CfgNav5,
 
@@ -210,6 +213,9 @@ impl UbxParser {
                 let time_ref = u16::from_le_bytes([self.payload[4], self.payload[5]]);
                 UbxCommand::CfgRate { meas_rate, nav_rate, time_ref }
             }
+
+            // CFG-RST (0x06, 0x04) - Reset command, used as trigger to start output
+            (0x06, 0x04) => UbxCommand::CfgRst,
 
             // CFG-CFG (0x06, 0x09)
             (0x06, 0x09) => UbxCommand::CfgCfg,

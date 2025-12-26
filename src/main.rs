@@ -678,18 +678,10 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-MSG: class=0x{:02X} id=0x{:02X} rate={}", class, id, rate);
             send_ack(0x06, 0x01); // ACK for CFG-MSG
 
-            // Update global message flags
-            let should_start = {
+            // Update global message flags (message output starts on CFG-RST)
+            {
                 let mut flags = MSG_FLAGS_STATE.lock().await;
-                let was_empty = !flags.any_enabled();
                 flags.set_message(*class, *id, *rate > 0);
-                // Start message output if this is the first enabled message
-                was_empty && flags.any_enabled()
-            };
-
-            if should_start {
-                info!("First message enabled, starting output in 1 second...");
-                MSG_OUTPUT_STARTED.signal(());
             }
         }
         ubx::UbxCommand::CfgRate { meas_rate, nav_rate, time_ref } => {
@@ -713,6 +705,13 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-CFG received");
             send_ack(0x06, 0x09); // ACK for CFG-CFG
         }
+        ubx::UbxCommand::CfgRst => {
+            info!("CFG-RST received - starting message output");
+            // CFG-RST is used as trigger to start message output
+            // No actual reset is performed - we just start sending configured messages
+            MSG_OUTPUT_STARTED.signal(());
+            // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
+        }
         ubx::UbxCommand::CfgNav5 => {
             info!("CFG-NAV5 received");
             send_ack(0x06, 0x24); // ACK for CFG-NAV5
@@ -732,25 +731,15 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
 
-            // Process all keys
-            let should_start = {
+            // Process all keys (message output starts on CFG-RST)
+            {
                 let mut flags = MSG_FLAGS_STATE.lock().await;
-                let was_empty = !flags.any_enabled();
-
                 for &(key, val) in keys.iter() {
                     // Update message flags for MSGOUT keys
                     update_flag_from_valset_key(&mut flags, key, val);
                     // Process rate and config keys (baudrate, measurement period)
                     process_valset_config_key(key, val);
                 }
-
-                // Start message output if this is the first enabled message
-                was_empty && flags.any_enabled()
-            };
-
-            if should_start {
-                info!("First message enabled via VALSET, starting output in 1 second...");
-                MSG_OUTPUT_STARTED.signal(());
             }
 
             send_ack(0x06, 0x8A); // ACK for CFG-VALSET
