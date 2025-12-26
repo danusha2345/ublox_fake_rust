@@ -380,72 +380,70 @@ async fn sec_sign_compute_task() {
 // ============================================================================
 
 /// UART TX task - sends UBX messages from TX_CHANNEL
-/// Handles SEC-SIGN synchronization: pauses regular TX when signature is being computed
+/// Handles SEC-SIGN synchronization: uses select! to handle both regular TX and SEC-SIGN
 #[embassy_executor::task]
 async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
+    use embassy_futures::select::{select, Either};
+
     // Short delay to let UART settle (accumulator already initialized in main)
     Timer::after(Duration::from_millis(50)).await;
     info!("UART TX task ready");
 
     loop {
-        // CRITICAL: When SEC-SIGN is being computed, wait for result instead of
-        // processing regular messages. This prevents sending packets that would
-        // not be included in the SEC-SIGN hash.
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            // Wait for SEC-SIGN result from Core1
-            let result = SEC_SIGN_RESULT.wait().await;
+        // Use select! to wait for either:
+        // 1. SEC-SIGN result from Core1 (priority)
+        // 2. Regular message from TX_CHANNEL
+        match select(SEC_SIGN_RESULT.wait(), TX_CHANNEL.receive()).await {
+            Either::First(result) => {
+                // SEC-SIGN result received - send signature
+                let sec_sign_msg = SecSign {
+                    version: 0x01,
+                    reserved1: 0,
+                    msg_cnt: result.packet_count,
+                    sha256_hash: result.sha256_hash,
+                    session_id: result.session_id,
+                    signature_r: result.signature.r,
+                    signature_s: result.signature.s,
+                };
 
-            // Build and send SEC-SIGN message
-            let sec_sign_msg = SecSign {
-                version: 0x01,
-                reserved1: 0,
-                msg_cnt: result.packet_count,
-                sha256_hash: result.sha256_hash,
-                session_id: result.session_id,
-                signature_r: result.signature.r,
-                signature_s: result.signature.s,
-            };
-
-            let mut buf = [0u8; 128];
-            let len = sec_sign_msg.build(&mut buf);
-            if len > 0 {
-                if let Err(e) = tx.write_all(&buf[..len]).await {
-                    error!("UART TX SEC-SIGN error: {:?}", e);
+                let mut buf = [0u8; 128];
+                let len = sec_sign_msg.build(&mut buf);
+                if len > 0 {
+                    if let Err(e) = tx.write_all(&buf[..len]).await {
+                        error!("UART TX SEC-SIGN error: {:?}", e);
+                    }
+                    info!("SEC-SIGN sent ({} packets)", result.packet_count);
                 }
-                info!("SEC-SIGN sent ({} packets), resuming TX", result.packet_count);
+
+                // Clear pause flag - resume normal TX
+                SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
             }
+            Either::Second(msg) => {
+                // Regular message - check if SEC-SIGN is in progress
+                if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                    // Re-queue the message and wait for SEC-SIGN first
+                    if TX_CHANNEL.try_send(msg).is_err() {
+                        error!("Failed to re-queue message during SEC-SIGN!");
+                    }
+                    continue;
+                }
 
-            // Clear pause flag - resume normal TX
-            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-            continue;
-        }
+                // Send via UART
+                if let Err(e) = tx.write_all(&msg).await {
+                    error!("UART TX error: {:?}", e);
+                    continue;
+                }
 
-        // Normal operation: wait for message from channel
-        let msg = TX_CHANNEL.receive().await;
-
-        // Double-check pause flag before sending (could have been set while waiting)
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            // Re-queue the message and handle SEC-SIGN first
-            if TX_CHANNEL.try_send(msg).is_err() {
-                error!("Failed to re-queue message during SEC-SIGN, message lost!");
-            }
-            continue;
-        }
-
-        // Send via UART
-        if let Err(e) = tx.write_all(&msg).await {
-            error!("UART TX error: {:?}", e);
-            continue;
-        }
-
-        // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
-        // SEC-SIGN = class 0x27, id 0x04
-        // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
-        let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-        if !is_sec_sign {
-            let mut acc = SEC_SIGN_ACC.lock().await;
-            if let Some(ref mut accumulator) = *acc {
-                accumulator.accumulate(&msg);
+                // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
+                // SEC-SIGN = class 0x27, id 0x01 (not 0x04!)
+                // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
+                let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x01;
+                if !is_sec_sign {
+                    let mut acc = SEC_SIGN_ACC.lock().await;
+                    if let Some(ref mut accumulator) = *acc {
+                        accumulator.accumulate(&msg);
+                    }
+                }
             }
         }
     }
