@@ -706,10 +706,15 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ack(0x06, 0x09); // ACK for CFG-CFG
         }
         ubx::UbxCommand::CfgRst => {
-            info!("CFG-RST received - starting message output");
-            // CFG-RST is used as trigger to start message output
-            // No actual reset is performed - we just start sending configured messages
-            MSG_OUTPUT_STARTED.signal(());
+            // CFG-RST triggers message output only after minimum uptime
+            // Early CFG-RST (during host initialization) is ignored
+            let uptime_ms = embassy_time::Instant::now().as_millis();
+            if uptime_ms >= config::timers::CFG_RST_MIN_UPTIME_MS {
+                info!("CFG-RST at {}ms - starting message output", uptime_ms);
+                MSG_OUTPUT_STARTED.signal(());
+            } else {
+                info!("CFG-RST ignored (uptime {}ms < {}ms)", uptime_ms, config::timers::CFG_RST_MIN_UPTIME_MS);
+            }
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
         ubx::UbxCommand::CfgNav5 => {
