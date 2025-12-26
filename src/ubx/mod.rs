@@ -129,6 +129,7 @@ pub struct MessageFlags {
     pub nav_posllh: bool,
     pub nav_status: bool,
     pub nav_dop: bool,
+    pub nav_sol: bool,       // NAV-SOL (0x01 0x06) - legacy M8, important for many FCs
     pub nav_velned: bool,
     pub nav_velecef: bool,
     pub nav_timeutc: bool,
@@ -164,6 +165,7 @@ impl MessageFlags {
             nav_posllh: false,
             nav_status: false,
             nav_dop: false,
+            nav_sol: false,
             nav_velned: false,
             nav_velecef: false,
             nav_timeutc: false,
@@ -187,7 +189,7 @@ impl MessageFlags {
     /// Check if any message is enabled
     pub const fn any_enabled(&self) -> bool {
         self.nav_pvt || self.nav_posecef || self.nav_posllh || self.nav_status ||
-        self.nav_dop || self.nav_velned || self.nav_velecef || self.nav_timeutc ||
+        self.nav_dop || self.nav_sol || self.nav_velned || self.nav_velecef || self.nav_timeutc ||
         self.nav_timegps || self.nav_timels || self.nav_clock || self.nav_sat ||
         self.nav_svinfo || self.nav_cov || self.nav_hpposecef || self.nav_aopstatus ||
         self.nav_eoe || self.rxm_rawx || self.mon_hw || self.mon_comms ||
@@ -202,6 +204,7 @@ impl MessageFlags {
             (0x01, 0x02) => self.nav_posllh = enabled,
             (0x01, 0x03) => self.nav_status = enabled,
             (0x01, 0x04) => self.nav_dop = enabled,
+            (0x01, 0x06) => self.nav_sol = enabled,
             (0x01, 0x12) => self.nav_velned = enabled,
             (0x01, 0x11) => self.nav_velecef = enabled,
             (0x01, 0x21) => self.nav_timeutc = enabled,

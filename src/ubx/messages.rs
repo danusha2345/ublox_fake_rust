@@ -266,6 +266,80 @@ impl UbxMessage for NavDop {
     }
 }
 
+/// UBX-NAV-SOL (0x01 0x06) - Navigation Solution Information (legacy M8)
+/// This message is deprecated in M10 but many flight controllers still use it
+#[derive(Clone)]
+pub struct NavSol {
+    pub itow: u32,
+    pub f_tow: i32,      // ns (fractional TOW)
+    pub week: i16,
+    pub gps_fix: u8,     // 0=no, 1=DR, 2=2D, 3=3D, 4=GPS+DR, 5=time only
+    pub flags: u8,       // bit0=GPSfixOK, bit1=DiffSoln, bit2=WKNSET, bit3=TOWSET
+    pub ecef_x: i32,     // cm
+    pub ecef_y: i32,     // cm
+    pub ecef_z: i32,     // cm
+    pub p_acc: u32,      // cm
+    pub ecef_vx: i32,    // cm/s
+    pub ecef_vy: i32,    // cm/s
+    pub ecef_vz: i32,    // cm/s
+    pub s_acc: u32,      // cm/s
+    pub p_dop: u16,      // *0.01
+    pub reserved1: u8,
+    pub num_sv: u8,
+    pub reserved2: u32,
+}
+
+impl Default for NavSol {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            f_tow: 0,
+            week: 2349,      // GPS week
+            gps_fix: 3,      // 3D fix
+            flags: 0x0F,     // GPSfixOK + DiffSoln + WKNSET + TOWSET
+            ecef_x: 0,       // Will be set dynamically
+            ecef_y: 0,
+            ecef_z: 0,
+            p_acc: 252,      // ~2.5m
+            ecef_vx: 0,
+            ecef_vy: 0,
+            ecef_vz: 0,
+            s_acc: 100,      // 1 m/s
+            p_dop: 110,      // 1.10
+            reserved1: 0,
+            num_sv: 18,
+            reserved2: 0,
+        }
+    }
+}
+
+impl UbxMessage for NavSol {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x06 }
+    fn payload_len(&self) -> u16 { 52 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.f_tow.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.week.to_le_bytes());
+        buf[10] = self.gps_fix;
+        buf[11] = self.flags;
+        buf[12..16].copy_from_slice(&self.ecef_x.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.ecef_y.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.ecef_z.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.p_acc.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.ecef_vx.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.ecef_vy.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.ecef_vz.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.s_acc.to_le_bytes());
+        buf[44..46].copy_from_slice(&self.p_dop.to_le_bytes());
+        buf[46] = self.reserved1;
+        buf[47] = self.num_sv;
+        buf[48..52].copy_from_slice(&self.reserved2.to_le_bytes());
+        52
+    }
+}
+
 /// UBX-NAV-EOE message (End of Epoch)
 #[derive(Clone, Default)]
 pub struct NavEoe {

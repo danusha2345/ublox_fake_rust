@@ -40,7 +40,7 @@ use static_cell::StaticCell;
 use config::*;
 use sec_sign::{SecSignAccumulator, SecSignRequest, SecSignResult, Signature, DEFAULT_SESSION_ID, PRIVATE_KEY};
 use ubx::{
-    AckAck, AckNak, MessageFlags, MonVer, NavDop, NavEoe, NavPvt, NavStatus, SecSign, SecUniqid, UbxMessage,
+    AckAck, AckNak, MessageFlags, MonVer, NavDop, NavEoe, NavPvt, NavSol, NavStatus, SecSign, SecUniqid, UbxMessage,
     // Additional NAV messages
     NavPosecef, NavPosllh, NavVelned, NavVelecef, NavTimeutc, NavTimegps, NavClock, NavTimels,
     NavAopstatus, NavCov, NavHpposecef, NavSat, NavSvinfo,
@@ -842,6 +842,12 @@ async fn nav_message_task() {
 
         // NAV-DOP (0x01 0x04)
         send_msg!(buf, flags.nav_dop, NavDop, { itow: itow });
+
+        // NAV-SOL (0x01 0x06) - legacy but important for many FCs
+        send_msg!(buf, flags.nav_sol, NavSol, {
+            itow: itow,
+            ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500
+        });
 
         // NAV-VELECEF (0x01 0x11)
         send_msg!(buf, flags.nav_velecef, NavVelecef, { itow: itow });
