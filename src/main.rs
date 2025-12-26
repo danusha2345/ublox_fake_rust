@@ -110,7 +110,7 @@ static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 16> 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
 
-/// Message output started flag (set by CFG-RST with reset_mode=0x09)
+/// Message output started flag (set by CFG-RST with any reset_mode except 0x08)
 /// Using AtomicBool instead of Signal because multiple tasks need to check this
 static MSG_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -706,11 +706,15 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         }
         ubx::UbxCommand::CfgRst { reset_mode } => {
             // CFG-RST with reset_mode:
-            // 0x08 = GNSS stop (first reset, ignore)
-            // 0x09 = GNSS start (second reset, start message output)
+            // 0x00 = Hardware reset (watchdog)
+            // 0x01 = Controlled software reset (GNSS only)
+            // 0x02 = Software reset (GNSS + peripherals)
+            // 0x08 = GNSS stop
+            // 0x09 = GNSS start
             info!("CFG-RST received, reset_mode=0x{:02X}", reset_mode);
-            if *reset_mode == 0x09 {
-                info!("CFG-RST GNSS start - starting message output");
+            // Start message output on any reset except GNSS stop (0x08)
+            if *reset_mode != 0x08 {
+                info!("CFG-RST - starting message output");
                 MSG_OUTPUT_STARTED.store(true, Ordering::Release);
             }
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
