@@ -64,7 +64,8 @@ opt-level = 1
 [profile.release]
 debug = 2
 lto = true
-opt-level = "s"
+opt-level = "z"       # Maximum size optimization (was "s")
+codegen-units = 1     # Better optimization, slower build
 
 [[bin]]
 name = "ublox_fake"

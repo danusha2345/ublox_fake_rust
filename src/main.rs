@@ -16,7 +16,7 @@ mod passthrough;
 mod sec_sign;
 mod ubx;
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -142,12 +142,11 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
-/// Flash for mode persistence
-static FLASH_CELL: StaticCell<Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>> = StaticCell::new();
-
-/// Pointer to flash mutex (set after FLASH_CELL.init())
+/// Flash mutex type for mode persistence
 type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>;
-static FLASH_PTR: AtomicPtr<FlashMutex> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Flash for mode persistence (initialized once in main)
+static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
 
 /// Core1 stack
 static mut CORE1_STACK: Stack<8192> = Stack::new();
@@ -194,8 +193,6 @@ async fn main(spawner: Spawner) {
     // Initialize flash for mode persistence
     let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
-    // Store pointer for global access in button_task
-    FLASH_PTR.store(flash_mutex as *const _ as *mut _, Ordering::Release);
 
     // Load saved mode from flash
     let is_passthrough = {
@@ -258,7 +255,7 @@ async fn main(spawner: Spawner) {
         core::mem::forget(passthrough);
 
         // Only button task in passthrough mode
-        spawner.must_spawn(button_task(btn_input));
+        spawner.must_spawn(button_task(btn_input, flash_mutex));
 
         info!("Passthrough active, press button to switch to emulation");
     } else {
@@ -296,7 +293,7 @@ async fn main(spawner: Spawner) {
         spawner.must_spawn(nav_message_task());
         spawner.must_spawn(mon_message_task());
         spawner.must_spawn(sec_sign_timer_task());
-        spawner.must_spawn(button_task(btn_input));
+        spawner.must_spawn(button_task(btn_input, flash_mutex));
     }
 
     info!("All tasks spawned, running");
@@ -990,7 +987,7 @@ async fn sec_sign_timer_task() {
 
 /// Mode button task - switches mode, saves to flash, and reboots
 #[embassy_executor::task]
-async fn button_task(mut btn: Input<'static>) {
+async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
     loop {
         btn.wait_for_high().await;
         Timer::after(Duration::from_millis(50)).await; // Debounce
@@ -1006,7 +1003,6 @@ async fn button_task(mut btn: Input<'static>) {
 
             // Save new mode to flash
             let save_ok = {
-                let flash_mutex = unsafe { &*FLASH_PTR.load(Ordering::Acquire) };
                 let mut flash = flash_mutex.lock().await;
                 flash_storage::save_mode(&mut flash, new_mode as u8).await
             };

@@ -186,16 +186,6 @@ impl MessageFlags {
         }
     }
 
-    /// Check if any message is enabled
-    pub const fn any_enabled(&self) -> bool {
-        self.nav_pvt || self.nav_posecef || self.nav_posllh || self.nav_status ||
-        self.nav_dop || self.nav_sol || self.nav_velned || self.nav_velecef || self.nav_timeutc ||
-        self.nav_timegps || self.nav_timels || self.nav_clock || self.nav_sat ||
-        self.nav_svinfo || self.nav_cov || self.nav_hpposecef || self.nav_aopstatus ||
-        self.nav_eoe || self.rxm_rawx || self.mon_hw || self.mon_comms ||
-        self.mon_rf || self.tim_tp
-    }
-
     /// Update a single message flag by class/id
     pub fn set_message(&mut self, class: u8, id: u8, enabled: bool) {
         match (class, id) {
