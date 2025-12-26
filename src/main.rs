@@ -110,8 +110,9 @@ static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 16> 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
 
-/// Message output started flag (set after first CFG-MSG + 1 sec delay)
-static MSG_OUTPUT_STARTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Message output started flag (set by CFG-RST with reset_mode=0x09)
+/// Using AtomicBool instead of Signal because multiple tasks need to check this
+static MSG_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Global SEC-SIGN accumulator (accumulates sent messages)
 static SEC_SIGN_ACC: Mutex<CriticalSectionRawMutex, Option<SecSignAccumulator>> = Mutex::new(None);
@@ -710,7 +711,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-RST received, reset_mode=0x{:02X}", reset_mode);
             if *reset_mode == 0x09 {
                 info!("CFG-RST GNSS start - starting message output");
-                MSG_OUTPUT_STARTED.signal(());
+                MSG_OUTPUT_STARTED.store(true, Ordering::Release);
             }
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
@@ -777,10 +778,12 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
 /// Only starts after receiving first CFG-MSG command + 1 second delay
 #[embassy_executor::task]
 async fn nav_message_task() {
-    info!("NAV message task waiting for CFG-MSG...");
+    info!("NAV message task waiting for CFG-RST...");
 
-    // Wait for first CFG-MSG to enable messages
-    MSG_OUTPUT_STARTED.wait().await;
+    // Wait for CFG-RST with reset_mode=0x09
+    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+        Timer::after(Duration::from_millis(10)).await;
+    }
 
     // Delay after first CFG-MSG (like C version)
     Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
@@ -889,8 +892,10 @@ async fn nav_message_task() {
 /// MON message task - sends monitoring messages at configured rate when enabled
 #[embassy_executor::task]
 async fn mon_message_task() {
-    // Wait for message output to start
-    MSG_OUTPUT_STARTED.wait().await;
+    // Wait for CFG-RST with reset_mode=0x09
+    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+        Timer::after(Duration::from_millis(10)).await;
+    }
     Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
     info!("MON message task started");
 
@@ -934,8 +939,10 @@ async fn mon_message_task() {
 async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
 
-    // Wait for message output to start
-    MSG_OUTPUT_STARTED.wait().await;
+    // Wait for CFG-RST with reset_mode=0x09
+    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+        Timer::after(Duration::from_millis(10)).await;
+    }
 
     // First signature after initial delay
     Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
