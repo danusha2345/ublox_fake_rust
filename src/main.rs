@@ -17,7 +17,7 @@ mod sec_sign;
 mod spoof_detector;
 mod ubx;
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -41,7 +41,7 @@ use static_cell::StaticCell;
 use config::*;
 use sec_sign::{SecSignAccumulator, SecSignRequest, SecSignResult, Signature, DEFAULT_SESSION_ID, PRIVATE_KEY};
 use ubx::{
-    AckAck, AckNak, MessageFlags, MonVer, NavDop, NavEoe, NavPvt, NavStatus, SecSign, SecUniqid, UbxMessage,
+    AckAck, AckNak, MessageFlags, MonVer, NavDop, NavEoe, NavPvt, NavSol, NavStatus, SecSign, SecUniqid, UbxMessage,
     // Additional NAV messages
     NavPosecef, NavPosllh, NavVelned, NavVelecef, NavTimeutc, NavTimegps, NavClock, NavTimels,
     NavAopstatus, NavCov, NavHpposecef, NavSat, NavSvinfo,
@@ -111,8 +111,9 @@ static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 16> 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
 
-/// Message output started flag (set after first CFG-MSG + 1 sec delay)
-static MSG_OUTPUT_STARTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Message output started flag (set by CFG-RST with any reset_mode except 0x08)
+/// Using AtomicBool instead of Signal because multiple tasks need to check this
+static MSG_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Global SEC-SIGN accumulator (accumulates sent messages)
 static SEC_SIGN_ACC: Mutex<CriticalSectionRawMutex, Option<SecSignAccumulator>> = Mutex::new(None);
@@ -142,15 +143,14 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
-/// Flash for mode persistence
-static FLASH_CELL: StaticCell<Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>> = StaticCell::new();
-
-/// Pointer to flash mutex (set after FLASH_CELL.init())
+/// Flash mutex type for mode persistence
 type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>;
-static FLASH_PTR: AtomicPtr<FlashMutex> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Flash for mode persistence (initialized once in main)
+static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
 
 /// Core1 stack
-static mut CORE1_STACK: Stack<4096> = Stack::new();
+static mut CORE1_STACK: Stack<8192> = Stack::new();
 
 // ============================================================================
 // Operating Mode
@@ -194,8 +194,6 @@ async fn main(spawner: Spawner) {
     // Initialize flash for mode persistence
     let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
-    // Store pointer for global access in button_task
-    FLASH_PTR.store(flash_mutex as *const _ as *mut _, Ordering::Release);
 
     // Load saved mode from flash
     let is_passthrough = {
@@ -226,6 +224,8 @@ async fn main(spawner: Spawner) {
 
     // Spawn Core1 for LED and SEC-SIGN computation
     info!("Spawning Core1...");
+    let dma_ch1 = p.DMA_CH1;
+    let pin_16 = p.PIN_16;
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -233,7 +233,7 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, p.PIN_16));
+                spawner.must_spawn(led_task(pio0, dma_ch1, pin_16));
                 spawner.must_spawn(sec_sign_compute_task());
             });
         },
@@ -256,7 +256,7 @@ async fn main(spawner: Spawner) {
         core::mem::forget(passthrough);
 
         // Only button task in passthrough mode
-        spawner.must_spawn(button_task(btn_input));
+        spawner.must_spawn(button_task(btn_input, flash_mutex));
 
         info!("Passthrough active, press button to switch to emulation");
     } else {
@@ -281,13 +281,20 @@ async fn main(spawner: Spawner) {
         );
         let (tx, rx) = uart.split();
 
+        // Initialize SEC-SIGN accumulator early (avoid delay in uart_tx_task)
+        {
+            // Use try_lock since we're in async context but no contention yet
+            let mut acc = SEC_SIGN_ACC.try_lock().unwrap();
+            *acc = Some(SecSignAccumulator::new());
+        }
+
         // All Core0 tasks for emulation
         spawner.must_spawn(uart_tx_task(tx));
         spawner.must_spawn(uart_rx_task(rx));
         spawner.must_spawn(nav_message_task());
         spawner.must_spawn(mon_message_task());
         spawner.must_spawn(sec_sign_timer_task());
-        spawner.must_spawn(button_task(btn_input));
+        spawner.must_spawn(button_task(btn_input, flash_mutex));
     }
 
     info!("All tasks spawned, running");
@@ -306,12 +313,13 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
+    dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
     pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
 ) {
     use led::Ws2812;
 
     info!("LED task starting on Core1");
-    let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, pin);
+    let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, dma, pin);
     let mut ticker = Ticker::every(Duration::from_millis(config::timers::LED_BLINK_MS));
     let mut led_on = false;
 
@@ -371,79 +379,70 @@ async fn sec_sign_compute_task() {
 // ============================================================================
 
 /// UART TX task - sends UBX messages from TX_CHANNEL
-/// Handles SEC-SIGN synchronization: pauses regular TX when signature is being computed
+/// Handles SEC-SIGN synchronization: uses select! to handle both regular TX and SEC-SIGN
 #[embassy_executor::task]
 async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
-    // Wait for initial delay
-    Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
+    use embassy_futures::select::{select, Either};
 
-    // Initialize global accumulator
-    {
-        let mut acc = SEC_SIGN_ACC.lock().await;
-        *acc = Some(SecSignAccumulator::new());
-    }
-
+    // Short delay to let UART settle (accumulator already initialized in main)
+    Timer::after(Duration::from_millis(50)).await;
     info!("UART TX task ready");
 
     loop {
-        // CRITICAL: When SEC-SIGN is being computed, wait for result instead of
-        // processing regular messages. This prevents sending packets that would
-        // not be included in the SEC-SIGN hash.
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            // Wait for SEC-SIGN result from Core1
-            let result = SEC_SIGN_RESULT.wait().await;
+        // Use select! to wait for either:
+        // 1. SEC-SIGN result from Core1 (priority)
+        // 2. Regular message from TX_CHANNEL
+        match select(SEC_SIGN_RESULT.wait(), TX_CHANNEL.receive()).await {
+            Either::First(result) => {
+                // SEC-SIGN result received - send signature
+                let sec_sign_msg = SecSign {
+                    version: 0x01,
+                    reserved1: 0,
+                    msg_cnt: result.packet_count,
+                    sha256_hash: result.sha256_hash,
+                    session_id: result.session_id,
+                    signature_r: result.signature.r,
+                    signature_s: result.signature.s,
+                };
 
-            // Build and send SEC-SIGN message
-            let sec_sign_msg = SecSign {
-                version: 0x01,
-                reserved1: 0,
-                msg_cnt: result.packet_count,
-                sha256_hash: result.sha256_hash,
-                session_id: result.session_id,
-                signature_r: result.signature.r,
-                signature_s: result.signature.s,
-            };
-
-            let mut buf = [0u8; 128];
-            let len = sec_sign_msg.build(&mut buf);
-            if len > 0 {
-                if let Err(e) = tx.write_all(&buf[..len]).await {
-                    error!("UART TX SEC-SIGN error: {:?}", e);
+                let mut buf = [0u8; 128];
+                let len = sec_sign_msg.build(&mut buf);
+                if len > 0 {
+                    if let Err(e) = tx.write_all(&buf[..len]).await {
+                        error!("UART TX SEC-SIGN error: {:?}", e);
+                    }
+                    info!("SEC-SIGN sent ({} packets)", result.packet_count);
                 }
-                info!("SEC-SIGN sent ({} packets), resuming TX", result.packet_count);
+
+                // Clear pause flag - resume normal TX
+                SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
             }
+            Either::Second(msg) => {
+                // Regular message - check if SEC-SIGN is in progress
+                if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                    // Re-queue the message and wait for SEC-SIGN first
+                    if TX_CHANNEL.try_send(msg).is_err() {
+                        error!("Failed to re-queue message during SEC-SIGN!");
+                    }
+                    continue;
+                }
 
-            // Clear pause flag - resume normal TX
-            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-            continue;
-        }
+                // Send via UART
+                if let Err(e) = tx.write_all(&msg).await {
+                    error!("UART TX error: {:?}", e);
+                    continue;
+                }
 
-        // Normal operation: wait for message from channel
-        let msg = TX_CHANNEL.receive().await;
-
-        // Double-check pause flag before sending (could have been set while waiting)
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            // Re-queue the message and handle SEC-SIGN first
-            if TX_CHANNEL.try_send(msg).is_err() {
-                error!("Failed to re-queue message during SEC-SIGN, message lost!");
-            }
-            continue;
-        }
-
-        // Send via UART
-        if let Err(e) = tx.write_all(&msg).await {
-            error!("UART TX error: {:?}", e);
-            continue;
-        }
-
-        // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
-        // SEC-SIGN = class 0x27, id 0x04
-        // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
-        let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-        if !is_sec_sign {
-            let mut acc = SEC_SIGN_ACC.lock().await;
-            if let Some(ref mut accumulator) = *acc {
-                accumulator.accumulate(&msg);
+                // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
+                // SEC-SIGN = class 0x27, id 0x04
+                // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
+                let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
+                if !is_sec_sign {
+                    let mut acc = SEC_SIGN_ACC.lock().await;
+                    if let Some(ref mut accumulator) = *acc {
+                        accumulator.accumulate(&msg);
+                    }
+                }
             }
         }
     }
@@ -677,17 +676,9 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ack(0x06, 0x01); // ACK for CFG-MSG
 
             // Update global message flags
-            let should_start = {
+            {
                 let mut flags = MSG_FLAGS_STATE.lock().await;
-                let was_empty = !flags.any_enabled();
                 flags.set_message(*class, *id, *rate > 0);
-                // Start message output if this is the first enabled message
-                was_empty && flags.any_enabled()
-            };
-
-            if should_start {
-                info!("First message enabled, starting output in 1 second...");
-                MSG_OUTPUT_STARTED.signal(());
             }
         }
         ubx::UbxCommand::CfgRate { meas_rate, nav_rate, time_ref } => {
@@ -711,6 +702,21 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-CFG received");
             send_ack(0x06, 0x09); // ACK for CFG-CFG
         }
+        ubx::UbxCommand::CfgRst { reset_mode } => {
+            // CFG-RST with reset_mode:
+            // 0x00 = Hardware reset (watchdog)
+            // 0x01 = Controlled software reset (GNSS only)
+            // 0x02 = Software reset (GNSS + peripherals)
+            // 0x08 = GNSS stop
+            // 0x09 = GNSS start
+            info!("CFG-RST received, reset_mode=0x{:02X}", reset_mode);
+            // Start message output on any reset except GNSS stop (0x08)
+            if *reset_mode != 0x08 {
+                info!("CFG-RST - starting message output");
+                MSG_OUTPUT_STARTED.store(true, Ordering::Release);
+            }
+            // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
+        }
         ubx::UbxCommand::CfgNav5 => {
             info!("CFG-NAV5 received");
             send_ack(0x06, 0x24); // ACK for CFG-NAV5
@@ -723,6 +729,14 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-GNSS received");
             send_ack(0x06, 0x3E); // ACK for CFG-GNSS
         }
+        ubx::UbxCommand::CfgSbas => {
+            info!("CFG-SBAS received");
+            send_ack(0x06, 0x16); // ACK for CFG-SBAS
+        }
+        ubx::UbxCommand::CfgItfm => {
+            info!("CFG-ITFM received");
+            send_ack(0x06, 0x39); // ACK for CFG-ITFM
+        }
         ubx::UbxCommand::CfgPms => {
             info!("CFG-PMS received");
             send_ack(0x06, 0x86); // ACK for CFG-PMS
@@ -730,25 +744,15 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
 
-            // Process all keys
-            let should_start = {
+            // Process all keys (message output starts on CFG-RST)
+            {
                 let mut flags = MSG_FLAGS_STATE.lock().await;
-                let was_empty = !flags.any_enabled();
-
                 for &(key, val) in keys.iter() {
                     // Update message flags for MSGOUT keys
                     update_flag_from_valset_key(&mut flags, key, val);
                     // Process rate and config keys (baudrate, measurement period)
                     process_valset_config_key(key, val);
                 }
-
-                // Start message output if this is the first enabled message
-                was_empty && flags.any_enabled()
-            };
-
-            if should_start {
-                info!("First message enabled via VALSET, starting output in 1 second...");
-                MSG_OUTPUT_STARTED.signal(());
             }
 
             send_ack(0x06, 0x8A); // ACK for CFG-VALSET
@@ -776,10 +780,12 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
 /// Only starts after receiving first CFG-MSG command + 1 second delay
 #[embassy_executor::task]
 async fn nav_message_task() {
-    info!("NAV message task waiting for CFG-MSG...");
+    info!("NAV message task waiting for CFG-RST...");
 
-    // Wait for first CFG-MSG to enable messages
-    MSG_OUTPUT_STARTED.wait().await;
+    // Wait for CFG-RST with reset_mode=0x09
+    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+        Timer::after(Duration::from_millis(10)).await;
+    }
 
     // Delay after first CFG-MSG (like C version)
     Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
@@ -823,15 +829,11 @@ async fn nav_message_task() {
         // NAV-PVT (0x01 0x07)
         send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
 
-        // NAV-POSECEF (0x01 0x01) - ECEF coordinates for Moscow
-        send_msg!(buf, flags.nav_posecef, NavPosecef, {
-            itow: itow, ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500, p_acc: 5000
-        });
+        // NAV-POSECEF (0x01 0x01) - uses Default ECEF from C version
+        send_msg!(buf, flags.nav_posecef, NavPosecef, { itow: itow });
 
-        // NAV-POSLLH (0x01 0x02)
-        send_msg!(buf, flags.nav_posllh, NavPosllh, {
-            itow: itow, lon: 376184230, lat: 557611990, height: 156000, h_msl: 156000, h_acc: 5000, v_acc: 8000
-        });
+        // NAV-POSLLH (0x01 0x02) - uses Default LLH from C version
+        send_msg!(buf, flags.nav_posllh, NavPosllh, { itow: itow });
 
         // NAV-STATUS (0x01 0x03)
         send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
@@ -839,16 +841,17 @@ async fn nav_message_task() {
         // NAV-DOP (0x01 0x04)
         send_msg!(buf, flags.nav_dop, NavDop, { itow: itow });
 
+        // NAV-SOL (0x01 0x06) - legacy but important for many FCs
+        send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
+
         // NAV-VELECEF (0x01 0x11)
         send_msg!(buf, flags.nav_velecef, NavVelecef, { itow: itow });
 
         // NAV-VELNED (0x01 0x12)
         send_msg!(buf, flags.nav_velned, NavVelned, { itow: itow });
 
-        // NAV-HPPOSECEF (0x01 0x13)
-        send_msg!(buf, flags.nav_hpposecef, NavHpposecef, {
-            itow: itow, ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500
-        });
+        // NAV-HPPOSECEF (0x01 0x13) - uses Default ECEF from C version
+        send_msg!(buf, flags.nav_hpposecef, NavHpposecef, { itow: itow });
 
         // NAV-TIMEGPS (0x01 0x20)
         send_msg!(buf, flags.nav_timegps, NavTimegps, { itow: itow });
@@ -888,8 +891,10 @@ async fn nav_message_task() {
 /// MON message task - sends monitoring messages at configured rate when enabled
 #[embassy_executor::task]
 async fn mon_message_task() {
-    // Wait for message output to start
-    MSG_OUTPUT_STARTED.wait().await;
+    // Wait for CFG-RST with reset_mode=0x09
+    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+        Timer::after(Duration::from_millis(10)).await;
+    }
     Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
     info!("MON message task started");
 
@@ -933,8 +938,10 @@ async fn mon_message_task() {
 async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
 
-    // Wait for message output to start
-    MSG_OUTPUT_STARTED.wait().await;
+    // Wait for CFG-RST with reset_mode=0x09
+    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+        Timer::after(Duration::from_millis(10)).await;
+    }
 
     // First signature after initial delay
     Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
@@ -981,7 +988,7 @@ async fn sec_sign_timer_task() {
 
 /// Mode button task - switches mode, saves to flash, and reboots
 #[embassy_executor::task]
-async fn button_task(mut btn: Input<'static>) {
+async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
     loop {
         btn.wait_for_high().await;
         Timer::after(Duration::from_millis(50)).await; // Debounce
@@ -997,7 +1004,6 @@ async fn button_task(mut btn: Input<'static>) {
 
             // Save new mode to flash
             let save_ok = {
-                let flash_mutex = unsafe { &*FLASH_PTR.load(Ordering::Acquire) };
                 let mut flash = flash_mutex.lock().await;
                 flash_storage::save_mode(&mut flash, new_mode as u8).await
             };

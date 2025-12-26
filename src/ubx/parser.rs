@@ -17,6 +17,10 @@ pub enum UbxCommand {
     /// CFG-CFG: Configuration save/load/clear
     CfgCfg,
 
+    /// CFG-RST: Reset command
+    /// reset_mode: 0x08 = GNSS stop, 0x09 = GNSS start (triggers message output)
+    CfgRst { reset_mode: u8 },
+
     /// CFG-NAV5: Navigation engine settings
     CfgNav5,
 
@@ -28,6 +32,12 @@ pub enum UbxCommand {
 
     /// CFG-PMS: Power management settings
     CfgPms,
+
+    /// CFG-SBAS: SBAS configuration
+    CfgSbas,
+
+    /// CFG-ITFM: Jamming/Interference Monitor configuration
+    CfgItfm,
 
     /// CFG-VALSET: Value set (M10)
     /// keys: Vec of (key_id, value) pairs - value stored as u32 for all sizes
@@ -193,11 +203,13 @@ impl UbxParser {
             }
 
             // CFG-MSG (0x06, 0x01) - long form: 8 bytes
+            // Payload: class, id, rate[6] where rate[0]=DDC, rate[1]=UART1, rate[2]=UART2, etc.
+            // We use rate[1] for UART1 (our port)
             (0x06, 0x01) if self.len == 8 => {
                 UbxCommand::CfgMsg {
                     class: self.payload[0],
                     id: self.payload[1],
-                    rate: self.payload[2], // Port 0 rate
+                    rate: self.payload[3], // Port 1 (UART1) rate
                 }
             }
 
@@ -209,6 +221,15 @@ impl UbxParser {
                 UbxCommand::CfgRate { meas_rate, nav_rate, time_ref }
             }
 
+            // CFG-RST (0x06, 0x04) - Reset command
+            // Payload: navBbrMask(2), resetMode(1), reserved(1)
+            // resetMode: 0x08 = GNSS stop, 0x09 = GNSS start
+            (0x06, 0x04) if self.len >= 3 => {
+                let reset_mode = self.payload[2];
+                UbxCommand::CfgRst { reset_mode }
+            }
+            (0x06, 0x04) => UbxCommand::CfgRst { reset_mode: 0 },
+
             // CFG-CFG (0x06, 0x09)
             (0x06, 0x09) => UbxCommand::CfgCfg,
 
@@ -217,6 +238,12 @@ impl UbxParser {
 
             // CFG-NAV5 (0x06, 0x24)
             (0x06, 0x24) => UbxCommand::CfgNav5,
+
+            // CFG-SBAS (0x06, 0x16)
+            (0x06, 0x16) => UbxCommand::CfgSbas,
+
+            // CFG-ITFM (0x06, 0x39)
+            (0x06, 0x39) => UbxCommand::CfgItfm,
 
             // CFG-GNSS (0x06, 0x3E)
             (0x06, 0x3E) => UbxCommand::CfgGnss,

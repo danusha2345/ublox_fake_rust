@@ -42,38 +42,39 @@ pub struct NavPvt {
 
 impl Default for NavPvt {
     fn default() -> Self {
+        // Values copied exactly from C version (massivs.h UBX_NAV_PVT)
         Self {
             itow: 0,
             year: 2025,
             month: 1,
-            day: 1,
-            hour: 12,
-            min: 0,
-            sec: 0,
-            valid: 0x37,  // Valid date, time, fully resolved
-            t_acc: 20,
-            nano: 0,
-            fix_type: 3,  // 3D fix
-            flags: 0x01,  // gnssFixOK
-            flags2: 0x20,
-            num_sv: 18,   // 9 GPS + 3 SBAS + 6 Galileo
-            lon: 376184230,   // 37.618423 * 1e7
-            lat: 557611990,   // 55.761199 * 1e7
-            height: 156000,
-            h_msl: 156000,
-            h_acc: 5000,
-            v_acc: 8000,
-            vel_n: 0,
-            vel_e: 0,
-            vel_d: 0,
-            g_speed: 0,
-            head_mot: 0,
-            s_acc: 100,
-            head_acc: 500000,
-            p_dop: 120,
+            day: 12,             // C: 0x0C
+            hour: 12,            // C: 0x0C
+            min: 43,             // C: 0x2B
+            sec: 2,              // C: 0x02
+            valid: 0x37,         // C: 0x37
+            t_acc: 6,            // C: 0x00000006
+            nano: 0x11DE89FD_u32 as i32,  // C: from real GNSS
+            fix_type: 3,         // C: 0x03
+            flags: 0x01,         // C: 0x01
+            flags2: 0x0E,        // C: 0x0E
+            num_sv: 18,          // C: 0x12
+            lon: -801919471,     // C: 0xD03BAA11 (real GNSS coordinates)
+            lat: 257889186,      // C: 0x0F5E13A2
+            height: 73449,       // C: 0x00011EE9
+            h_msl: 100902,       // C: 0x00018626
+            h_acc: 1435,         // C: 0x0000059B
+            v_acc: 2073,         // C: 0x00000819
+            vel_n: -2,           // C: 0xFFFFFFFE
+            vel_e: 1,            // C: 0x00000001
+            vel_d: 1,            // C: 0x00000001
+            g_speed: 0,          // C: 0x00000000
+            head_mot: 0x00C78ADA_u32 as i32,  // C: from real GNSS
+            s_acc: 8,            // C: 0x00000008
+            head_acc: 0x00F0D89E,  // C: from real GNSS
+            p_dop: 110,          // C: 0x006E
             flags3: 0,
             reserved1: [0; 5],
-            head_veh: 0,
+            head_veh: 0x00234AE0_u32 as i32,  // C: from real GNSS
             mag_dec: 0,
             mag_acc: 0,
         }
@@ -124,13 +125,26 @@ impl UbxMessage for NavPvt {
 }
 
 /// UBX-NAV-POSECEF message
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NavPosecef {
     pub itow: u32,
     pub ecef_x: i32,  // cm
     pub ecef_y: i32,
     pub ecef_z: i32,
     pub p_acc: u32,   // cm
+}
+
+impl Default for NavPosecef {
+    fn default() -> Self {
+        // Values from C version (massivs.h UBX_NAV_POSECEF)
+        Self {
+            itow: 0,
+            ecef_x: 0x05DDB07B_u32 as i32,  // 98230395 cm
+            ecef_y: 0xDE407016_u32 as i32,  // -565854186 cm
+            ecef_z: 0x106F7693_u32 as i32,  // 276297363 cm
+            p_acc: 252,                      // C: 0x000000FC
+        }
+    }
 }
 
 impl UbxMessage for NavPosecef {
@@ -149,7 +163,7 @@ impl UbxMessage for NavPosecef {
 }
 
 /// UBX-NAV-POSLLH message
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NavPosllh {
     pub itow: u32,
     pub lon: i32,     // deg * 1e-7
@@ -158,6 +172,21 @@ pub struct NavPosllh {
     pub h_msl: i32,   // mm
     pub h_acc: u32,   // mm
     pub v_acc: u32,   // mm
+}
+
+impl Default for NavPosllh {
+    fn default() -> Self {
+        // Values from C version (massivs.h UBX_NAV_POSLLH)
+        Self {
+            itow: 0,
+            lon: 0xD03BAA11_u32 as i32,   // -801919471 (deg * 1e-7)
+            lat: 0x0F5E13A2_u32 as i32,   // 257889186 (deg * 1e-7)
+            height: 73449,                 // C: 0x00011EE9 mm
+            h_msl: 100902,                 // C: 0x00018626 mm
+            h_acc: 1435,                   // C: 0x0000059B mm
+            v_acc: 2073,                   // C: 0x00000819 mm
+        }
+    }
 }
 
 impl UbxMessage for NavPosllh {
@@ -191,14 +220,15 @@ pub struct NavStatus {
 
 impl Default for NavStatus {
     fn default() -> Self {
+        // Values from C version (massivs.h UBX_NAV_STATUS)
         Self {
             itow: 0,
-            gps_fix: 3,  // 3D fix
-            flags: 0x0D,
+            gps_fix: 3,   // C: 0x03
+            flags: 0x0F,  // C: 0x0F
             fix_stat: 0x00,
-            flags2: 0x08,
-            ttff: 25000,
-            msss: 0,
+            flags2: 0x08, // C: 0x08
+            ttff: 0,      // C: 0x00000000
+            msss: 0,      // C: 0x00000000
         }
     }
 }
@@ -237,13 +267,13 @@ impl Default for NavDop {
     fn default() -> Self {
         Self {
             itow: 0,
-            g_dop: 150,
-            p_dop: 120,
-            t_dop: 80,
+            g_dop: 100,  // 1.00 (same as C)
+            p_dop: 100,
+            t_dop: 100,
             v_dop: 100,
-            h_dop: 80,
-            n_dop: 70,
-            e_dop: 60,
+            h_dop: 100,
+            n_dop: 100,
+            e_dop: 100,
         }
     }
 }
@@ -263,6 +293,81 @@ impl UbxMessage for NavDop {
         buf[14..16].copy_from_slice(&self.n_dop.to_le_bytes());
         buf[16..18].copy_from_slice(&self.e_dop.to_le_bytes());
         18
+    }
+}
+
+/// UBX-NAV-SOL (0x01 0x06) - Navigation Solution Information (legacy M8)
+/// This message is deprecated in M10 but many flight controllers still use it
+#[derive(Clone)]
+pub struct NavSol {
+    pub itow: u32,
+    pub f_tow: i32,      // ns (fractional TOW)
+    pub week: i16,
+    pub gps_fix: u8,     // 0=no, 1=DR, 2=2D, 3=3D, 4=GPS+DR, 5=time only
+    pub flags: u8,       // bit0=GPSfixOK, bit1=DiffSoln, bit2=WKNSET, bit3=TOWSET
+    pub ecef_x: i32,     // cm
+    pub ecef_y: i32,     // cm
+    pub ecef_z: i32,     // cm
+    pub p_acc: u32,      // cm
+    pub ecef_vx: i32,    // cm/s
+    pub ecef_vy: i32,    // cm/s
+    pub ecef_vz: i32,    // cm/s
+    pub s_acc: u32,      // cm/s
+    pub p_dop: u16,      // *0.01
+    pub reserved1: u8,
+    pub num_sv: u8,
+    pub reserved2: u32,
+}
+
+impl Default for NavSol {
+    fn default() -> Self {
+        // ECEF coordinates from C version (same as NAV-POSECEF)
+        Self {
+            itow: 0,
+            f_tow: 0,
+            week: 2349,                          // GPS week (0x092D)
+            gps_fix: 3,                          // 3D fix
+            flags: 0x0F,                         // GPSfixOK + DiffSoln + WKNSET + TOWSET
+            ecef_x: 0x05DDB07B_u32 as i32,       // 98230395 cm
+            ecef_y: 0xDE407016_u32 as i32,       // -565854186 cm
+            ecef_z: 0x106F7693_u32 as i32,       // 276297363 cm
+            p_acc: 252,                          // C: 0x000000FC cm
+            ecef_vx: 0,
+            ecef_vy: 0,
+            ecef_vz: 0,
+            s_acc: 100,                          // 1 m/s (0x64)
+            p_dop: 110,                          // 1.10 (0x6E)
+            reserved1: 0,
+            num_sv: 18,
+            reserved2: 0,
+        }
+    }
+}
+
+impl UbxMessage for NavSol {
+    fn class(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x06 }
+    fn payload_len(&self) -> u16 { 52 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0..4].copy_from_slice(&self.itow.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.f_tow.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.week.to_le_bytes());
+        buf[10] = self.gps_fix;
+        buf[11] = self.flags;
+        buf[12..16].copy_from_slice(&self.ecef_x.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.ecef_y.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.ecef_z.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.p_acc.to_le_bytes());
+        buf[28..32].copy_from_slice(&self.ecef_vx.to_le_bytes());
+        buf[32..36].copy_from_slice(&self.ecef_vy.to_le_bytes());
+        buf[36..40].copy_from_slice(&self.ecef_vz.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.s_acc.to_le_bytes());
+        buf[44..46].copy_from_slice(&self.p_dop.to_le_bytes());
+        buf[46] = self.reserved1;
+        buf[47] = self.num_sv;
+        buf[48..52].copy_from_slice(&self.reserved2.to_le_bytes());
+        52
     }
 }
 
@@ -350,7 +455,7 @@ impl Default for SecSign {
 
 impl UbxMessage for SecSign {
     fn class(&self) -> u8 { 0x27 }
-    fn id(&self) -> u8 { 0x01 }
+    fn id(&self) -> u8 { 0x04 }
     fn payload_len(&self) -> u16 { 108 }
 
     fn write_payload(&self, buf: &mut [u8]) -> usize {
@@ -385,7 +490,7 @@ impl Default for MonVer {
         sw_version[..sw.len()].copy_from_slice(sw);
 
         let mut hw_version = [0u8; 10];
-        let hw = b"00190000";
+        let hw = b"000A0000";  // M10 hardware version (must match C version)
         hw_version[..hw.len()].copy_from_slice(hw);
 
         // Extension strings
@@ -473,7 +578,7 @@ impl UbxMessage for SecUniqid {
 // ============================================================================
 
 /// UBX-NAV-VELNED (0x01 0x12) - Velocity in NED frame
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NavVelned {
     pub itow: u32,
     pub vel_n: i32,     // cm/s
@@ -484,6 +589,22 @@ pub struct NavVelned {
     pub heading: i32,   // deg * 1e-5
     pub s_acc: u32,     // cm/s
     pub c_acc: u32,     // deg * 1e-5
+}
+
+impl Default for NavVelned {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            vel_n: 0,
+            vel_e: 0,
+            vel_d: 0,
+            speed: 0,
+            g_speed: 0,
+            heading: 0,
+            s_acc: 100,  // Same as C version (0x64)
+            c_acc: 0,
+        }
+    }
 }
 
 impl UbxMessage for NavVelned {
@@ -506,13 +627,25 @@ impl UbxMessage for NavVelned {
 }
 
 /// UBX-NAV-VELECEF (0x01 0x11) - Velocity in ECEF coordinates
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NavVelecef {
     pub itow: u32,
     pub ecef_vx: i32,   // cm/s
     pub ecef_vy: i32,   // cm/s
     pub ecef_vz: i32,   // cm/s
     pub s_acc: u32,     // cm/s
+}
+
+impl Default for NavVelecef {
+    fn default() -> Self {
+        Self {
+            itow: 0,
+            ecef_vx: 0,
+            ecef_vy: 0,
+            ecef_vz: 0,
+            s_acc: 100,  // Same as C version (0x64)
+        }
+    }
 }
 
 impl UbxMessage for NavVelecef {
@@ -547,17 +680,18 @@ pub struct NavTimeutc {
 
 impl Default for NavTimeutc {
     fn default() -> Self {
+        // Values from C version (massivs.h UBX_NAV_TIMEUTC)
         Self {
             itow: 0,
-            t_acc: 20,
-            nano: 0,
-            year: 2025,
-            month: 1,
-            day: 1,
-            hour: 12,
-            min: 0,
-            sec: 0,
-            valid: 0xF7,  // UTC valid
+            t_acc: 0,     // C: 0x00000000
+            nano: 0,      // C: 0x00000000
+            year: 2025,   // C: 0x07E9
+            month: 1,     // C: 0x01
+            day: 12,      // C: 0x0C
+            hour: 12,     // C: 0x0C
+            min: 0,       // C: 0x00
+            sec: 0,       // C: 0x00
+            valid: 0xF7,  // C: 0xF7
         }
     }
 }
@@ -595,13 +729,14 @@ pub struct NavTimegps {
 
 impl Default for NavTimegps {
     fn default() -> Self {
+        // Values from C version (massivs.h UBX_NAV_TIMEGPS)
         Self {
             itow: 0,
             f_tow: 0,
-            week: 2349,  // Example GPS week
-            leap_s: 18,
-            valid: 0x07, // towValid|weekValid|leapSValid
-            t_acc: 20,
+            week: 2349,   // C: 0x092D
+            leap_s: 18,   // C: 0x12
+            valid: 0x07,  // C: 0x07
+            t_acc: 5,     // C: 0x00000005
         }
     }
 }
@@ -813,7 +948,7 @@ impl UbxMessage for NavCov {
 }
 
 /// UBX-NAV-HPPOSECEF (0x01 0x13) - High Precision Position ECEF
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NavHpposecef {
     pub version: u8,
     pub reserved1: [u8; 3],
@@ -826,6 +961,25 @@ pub struct NavHpposecef {
     pub ecef_z_hp: i8,   // 0.1mm
     pub flags: u8,
     pub p_acc: u32,      // 0.1mm
+}
+
+impl Default for NavHpposecef {
+    fn default() -> Self {
+        // Values from C version (massivs.h UBX_NAV_HPPOSECEF)
+        Self {
+            version: 0,
+            reserved1: [0; 3],
+            itow: 0,
+            ecef_x: 0x05DDB07B_u32 as i32,  // 98230395 cm
+            ecef_y: 0xDE407016_u32 as i32,  // -565854186 cm
+            ecef_z: 0x106F7693_u32 as i32,  // 276297363 cm
+            ecef_x_hp: 0,
+            ecef_y_hp: 0,
+            ecef_z_hp: 0,
+            flags: 0,
+            p_acc: 252,                      // C: 0x000000FC (0.1mm units)
+        }
+    }
 }
 
 impl UbxMessage for NavHpposecef {
@@ -1180,13 +1334,25 @@ impl UbxMessage for MonRf {
 }
 
 /// UBX-MON-COMMS (0x0A 0x36) - Communication Port Information (minimal)
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MonComms {
     pub version: u8,
     pub n_ports: u8,
     pub tx_errors: u8,
     pub reserved1: u8,
     pub reserved2: [u8; 4],
+}
+
+impl Default for MonComms {
+    fn default() -> Self {
+        Self {
+            version: 1,   // Same as C version
+            n_ports: 1,   // Same as C version
+            tx_errors: 0,
+            reserved1: 0,
+            reserved2: [0; 4],
+        }
+    }
 }
 
 impl UbxMessage for MonComms {
@@ -1249,7 +1415,7 @@ impl UbxMessage for TimTp {
 }
 
 /// UBX-RXM-RAWX (0x02 0x15) - Raw Measurement Data (minimal, no measurements)
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RxmRawx {
     pub rcv_tow: f64,
     pub week: u16,
@@ -1258,6 +1424,20 @@ pub struct RxmRawx {
     pub rec_stat: u8,
     pub version: u8,
     pub reserved1: [u8; 2],
+}
+
+impl Default for RxmRawx {
+    fn default() -> Self {
+        Self {
+            rcv_tow: 0.0,
+            week: 0,
+            leap_s: 0,
+            num_meas: 0,
+            rec_stat: 1,   // Same as C version
+            version: 0,
+            reserved1: [0; 2],
+        }
+    }
 }
 
 impl UbxMessage for RxmRawx {

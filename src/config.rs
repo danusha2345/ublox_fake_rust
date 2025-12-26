@@ -29,8 +29,8 @@ pub mod timers {
     pub const SEC_SIGN_FIRST_MS: u64 = 3000;
     /// SEC-SIGN interval
     pub const SEC_SIGN_PERIOD_MS: u64 = 4000;
-    /// Initial delay before UART TX starts
-    pub const UART_TX_INIT_DELAY_MS: u64 = 1000;
+    /// Delay after CFG-RST before message output starts (0 = immediate)
+    pub const UART_TX_INIT_DELAY_MS: u64 = 0;
 }
 
 /// Default coordinates (Moscow, Red Square)
