@@ -831,15 +831,11 @@ async fn nav_message_task() {
         // NAV-PVT (0x01 0x07)
         send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
 
-        // NAV-POSECEF (0x01 0x01) - ECEF coordinates for Moscow
-        send_msg!(buf, flags.nav_posecef, NavPosecef, {
-            itow: itow, ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500, p_acc: 5000
-        });
+        // NAV-POSECEF (0x01 0x01) - uses Default ECEF from C version
+        send_msg!(buf, flags.nav_posecef, NavPosecef, { itow: itow });
 
-        // NAV-POSLLH (0x01 0x02)
-        send_msg!(buf, flags.nav_posllh, NavPosllh, {
-            itow: itow, lon: 376184230, lat: 557611990, height: 156000, h_msl: 156000, h_acc: 5000, v_acc: 8000
-        });
+        // NAV-POSLLH (0x01 0x02) - uses Default LLH from C version
+        send_msg!(buf, flags.nav_posllh, NavPosllh, { itow: itow });
 
         // NAV-STATUS (0x01 0x03)
         send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
@@ -848,10 +844,7 @@ async fn nav_message_task() {
         send_msg!(buf, flags.nav_dop, NavDop, { itow: itow });
 
         // NAV-SOL (0x01 0x06) - legacy but important for many FCs
-        send_msg!(buf, flags.nav_sol, NavSol, {
-            itow: itow,
-            ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500
-        });
+        send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
 
         // NAV-VELECEF (0x01 0x11)
         send_msg!(buf, flags.nav_velecef, NavVelecef, { itow: itow });
@@ -859,10 +852,8 @@ async fn nav_message_task() {
         // NAV-VELNED (0x01 0x12)
         send_msg!(buf, flags.nav_velned, NavVelned, { itow: itow });
 
-        // NAV-HPPOSECEF (0x01 0x13)
-        send_msg!(buf, flags.nav_hpposecef, NavHpposecef, {
-            itow: itow, ecef_x: 278394700, ecef_y: 182089200, ecef_z: 523478500
-        });
+        // NAV-HPPOSECEF (0x01 0x13) - uses Default ECEF from C version
+        send_msg!(buf, flags.nav_hpposecef, NavHpposecef, { itow: itow });
 
         // NAV-TIMEGPS (0x01 0x20)
         send_msg!(buf, flags.nav_timegps, NavTimegps, { itow: itow });
