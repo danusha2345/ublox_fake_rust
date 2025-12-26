@@ -282,6 +282,13 @@ async fn main(spawner: Spawner) {
         );
         let (tx, rx) = uart.split();
 
+        // Initialize SEC-SIGN accumulator early (avoid delay in uart_tx_task)
+        {
+            // Use try_lock since we're in async context but no contention yet
+            let mut acc = SEC_SIGN_ACC.try_lock().unwrap();
+            *acc = Some(SecSignAccumulator::new());
+        }
+
         // All Core0 tasks for emulation
         spawner.must_spawn(uart_tx_task(tx));
         spawner.must_spawn(uart_rx_task(rx));
@@ -376,15 +383,8 @@ async fn sec_sign_compute_task() {
 /// Handles SEC-SIGN synchronization: pauses regular TX when signature is being computed
 #[embassy_executor::task]
 async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
-    // Wait for initial delay
-    Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
-
-    // Initialize global accumulator
-    {
-        let mut acc = SEC_SIGN_ACC.lock().await;
-        *acc = Some(SecSignAccumulator::new());
-    }
-
+    // Short delay to let UART settle (accumulator already initialized in main)
+    Timer::after(Duration::from_millis(50)).await;
     info!("UART TX task ready");
 
     loop {

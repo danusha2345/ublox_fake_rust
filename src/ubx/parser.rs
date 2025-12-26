@@ -193,11 +193,13 @@ impl UbxParser {
             }
 
             // CFG-MSG (0x06, 0x01) - long form: 8 bytes
+            // Payload: class, id, rate[6] where rate[0]=DDC, rate[1]=UART1, rate[2]=UART2, etc.
+            // We use rate[1] for UART1 (our port)
             (0x06, 0x01) if self.len == 8 => {
                 UbxCommand::CfgMsg {
                     class: self.payload[0],
                     id: self.payload[1],
-                    rate: self.payload[2], // Port 0 rate
+                    rate: self.payload[3], // Port 1 (UART1) rate
                 }
             }
 
