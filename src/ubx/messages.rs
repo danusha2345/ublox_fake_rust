@@ -55,7 +55,7 @@ impl Default for NavPvt {
             nano: 0,
             fix_type: 3,  // 3D fix
             flags: 0x01,  // gnssFixOK
-            flags2: 0x20,
+            flags2: 0x0E,  // Same as C version
             num_sv: 18,   // 9 GPS + 3 SBAS + 6 Galileo
             lon: 376184230,   // 37.618423 * 1e7
             lat: 557611990,   // 55.761199 * 1e7
