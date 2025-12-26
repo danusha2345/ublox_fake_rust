@@ -676,7 +676,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-MSG: class=0x{:02X} id=0x{:02X} rate={}", class, id, rate);
             send_ack(0x06, 0x01); // ACK for CFG-MSG
 
-            // Update global message flags (message output starts on CFG-RST)
+            // Update global message flags
             {
                 let mut flags = MSG_FLAGS_STATE.lock().await;
                 flags.set_message(*class, *id, *rate > 0);
@@ -703,15 +703,14 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-CFG received");
             send_ack(0x06, 0x09); // ACK for CFG-CFG
         }
-        ubx::UbxCommand::CfgRst => {
-            // CFG-RST triggers message output only after minimum uptime
-            // Early CFG-RST (during host initialization) is ignored
-            let uptime_ms = embassy_time::Instant::now().as_millis();
-            if uptime_ms >= config::timers::CFG_RST_MIN_UPTIME_MS {
-                info!("CFG-RST at {}ms - starting message output", uptime_ms);
+        ubx::UbxCommand::CfgRst { reset_mode } => {
+            // CFG-RST with reset_mode:
+            // 0x08 = GNSS stop (first reset, ignore)
+            // 0x09 = GNSS start (second reset, start message output)
+            info!("CFG-RST received, reset_mode=0x{:02X}", reset_mode);
+            if *reset_mode == 0x09 {
+                info!("CFG-RST GNSS start - starting message output");
                 MSG_OUTPUT_STARTED.signal(());
-            } else {
-                info!("CFG-RST ignored (uptime {}ms < {}ms)", uptime_ms, config::timers::CFG_RST_MIN_UPTIME_MS);
             }
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }

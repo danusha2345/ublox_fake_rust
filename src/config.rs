@@ -31,8 +31,6 @@ pub mod timers {
     pub const SEC_SIGN_PERIOD_MS: u64 = 4000;
     /// Delay after CFG-RST before message output starts (0 = immediate)
     pub const UART_TX_INIT_DELAY_MS: u64 = 0;
-    /// Minimum uptime before CFG-RST triggers message output (ignore early resets)
-    pub const CFG_RST_MIN_UPTIME_MS: u64 = 2000;
 }
 
 /// Default coordinates (Moscow, Red Square)

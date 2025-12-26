@@ -17,8 +17,9 @@ pub enum UbxCommand {
     /// CFG-CFG: Configuration save/load/clear
     CfgCfg,
 
-    /// CFG-RST: Reset command (used as trigger to start message output)
-    CfgRst,
+    /// CFG-RST: Reset command
+    /// reset_mode: 0x08 = GNSS stop, 0x09 = GNSS start (triggers message output)
+    CfgRst { reset_mode: u8 },
 
     /// CFG-NAV5: Navigation engine settings
     CfgNav5,
@@ -220,8 +221,14 @@ impl UbxParser {
                 UbxCommand::CfgRate { meas_rate, nav_rate, time_ref }
             }
 
-            // CFG-RST (0x06, 0x04) - Reset command, used as trigger to start output
-            (0x06, 0x04) => UbxCommand::CfgRst,
+            // CFG-RST (0x06, 0x04) - Reset command
+            // Payload: navBbrMask(2), resetMode(1), reserved(1)
+            // resetMode: 0x08 = GNSS stop, 0x09 = GNSS start
+            (0x06, 0x04) if self.len >= 3 => {
+                let reset_mode = self.payload[2];
+                UbxCommand::CfgRst { reset_mode }
+            }
+            (0x06, 0x04) => UbxCommand::CfgRst { reset_mode: 0 },
 
             // CFG-CFG (0x06, 0x09)
             (0x06, 0x09) => UbxCommand::CfgCfg,
