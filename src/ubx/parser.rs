@@ -32,6 +32,12 @@ pub enum UbxCommand {
     /// CFG-PMS: Power management settings
     CfgPms,
 
+    /// CFG-SBAS: SBAS configuration
+    CfgSbas,
+
+    /// CFG-ITFM: Jamming/Interference Monitor configuration
+    CfgItfm,
+
     /// CFG-VALSET: Value set (M10)
     /// keys: Vec of (key_id, value) pairs - value stored as u32 for all sizes
     CfgValset { _layer: u8, keys: heapless::Vec<(u32, u32), 32> },
@@ -225,6 +231,12 @@ impl UbxParser {
 
             // CFG-NAV5 (0x06, 0x24)
             (0x06, 0x24) => UbxCommand::CfgNav5,
+
+            // CFG-SBAS (0x06, 0x16)
+            (0x06, 0x16) => UbxCommand::CfgSbas,
+
+            // CFG-ITFM (0x06, 0x39)
+            (0x06, 0x39) => UbxCommand::CfgItfm,
 
             // CFG-GNSS (0x06, 0x3E)
             (0x06, 0x3E) => UbxCommand::CfgGnss,

@@ -729,6 +729,14 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-GNSS received");
             send_ack(0x06, 0x3E); // ACK for CFG-GNSS
         }
+        ubx::UbxCommand::CfgSbas => {
+            info!("CFG-SBAS received");
+            send_ack(0x06, 0x16); // ACK for CFG-SBAS
+        }
+        ubx::UbxCommand::CfgItfm => {
+            info!("CFG-ITFM received");
+            send_ack(0x06, 0x39); // ACK for CFG-ITFM
+        }
         ubx::UbxCommand::CfgPms => {
             info!("CFG-PMS received");
             send_ack(0x06, 0x86); // ACK for CFG-PMS
