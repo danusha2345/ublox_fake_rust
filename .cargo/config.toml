@@ -11,7 +11,7 @@ rustflags = [
 ]
 
 [build]
-target = "thumbv6m-none-eabi"  # RP2040 default
+target = "thumbv8m.main-none-eabihf"  # RP2350 default
 
 [env]
 DEFMT_LOG = "debug"

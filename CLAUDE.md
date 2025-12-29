@@ -110,11 +110,11 @@ Mode is persisted to flash and survives reboots. Button press toggles mode and r
 .wrap
 ```
 
-## Hardware Pins (RP2040)
-- UART0: TX=GPIO0, RX=GPIO1 (921600 baud default)
-- Passthrough input: GPIO3 (external GNSS TX)
-- WS2812 LED: GPIO16 (PIO0)
-- Mode button: GPIO6 (input), GPIO5 (power)
+## Hardware Pins (RP2350A - Spotpear RP2350-Core-A)
+- UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
+- UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
+- WS2812B LED: GPIO25 (PIO0)
+- Mode button: GPIO7 (input), GPIO6 (power)
 
 ## Key Dependencies
 - `embassy-rp 0.9` - RP2040/RP2350 HAL

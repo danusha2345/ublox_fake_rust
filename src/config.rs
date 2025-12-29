@@ -5,14 +5,26 @@
 /// Default UART baudrate
 pub const DEFAULT_BAUDRATE: u32 = 921600;
 
-/// GPIO pin assignments
+/// GPIO pin assignments for RP2350A (Spotpear RP2350-Core-A)
 pub mod pins {
-    pub const UART_TX: u8 = 0;
-    pub const UART_RX: u8 = 1;
-    pub const PIO_PASSTHROUGH_IN: u8 = 3;
-    pub const MODE_BTN_PWR: u8 = 5;
-    pub const MODE_BTN_INPUT: u8 = 6;
-    pub const WS2812_LED: u8 = 16;
+    // UART0: к дрону/хосту
+    pub const UART0_TX: u8 = 0;
+    pub const UART0_RX: u8 = 1;
+
+    // UART1: от внешнего GNSS модуля (passthrough source)
+    pub const UART1_TX: u8 = 4;   // не используется, но резервируем
+    pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
+
+    // Mode button (перенесено с GPIO5/6)
+    pub const MODE_BTN_PWR: u8 = 6;
+    pub const MODE_BTN_INPUT: u8 = 7;
+
+    // WS2812B LED (RP2350-Core-A: GPIO25)
+    pub const WS2812_LED: u8 = 25;
+
+    // Legacy alias
+    pub const UART_TX: u8 = UART0_TX;
+    pub const UART_RX: u8 = UART0_RX;
 }
 
 /// Timer periods in milliseconds
