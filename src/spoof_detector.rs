@@ -35,6 +35,37 @@ pub mod thresholds {
     pub const MAX_GAP_MS: u32 = 5000;
 }
 
+/// GPS fix type from NAV-PVT
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FixType {
+    #[default]
+    NoFix = 0,
+    DeadReckoning = 1,
+    Fix2D = 2,
+    Fix3D = 3,
+    GnssDr = 4,
+    TimeOnly = 5,
+}
+
+impl FixType {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::DeadReckoning,
+            2 => Self::Fix2D,
+            3 => Self::Fix3D,
+            4 => Self::GnssDr,
+            5 => Self::TimeOnly,
+            _ => Self::NoFix,
+        }
+    }
+
+    /// Returns true if fix has reliable 3D position (altitude valid)
+    pub fn has_3d_fix(&self) -> bool {
+        matches!(self, Self::Fix3D | Self::GnssDr)
+    }
+}
+
 /// Position sample for analysis
 #[derive(Clone, Copy, Default)]
 pub struct Position {
@@ -46,6 +77,8 @@ pub struct Position {
     pub alt_mm: i32,
     /// Timestamp in milliseconds
     pub time_ms: u32,
+    /// GPS fix type (need 3D fix for altitude checks)
+    pub fix_type: FixType,
 }
 
 /// Spoofing detector state
@@ -106,16 +139,31 @@ impl SpoofDetector {
 
     /// Analyze new position and determine if it's spoofed
     pub fn analyze(&mut self, pos: Position) -> AnalysisResult {
-        // First sample - initialize
+        // Skip samples without 3D fix - altitude unreliable during acquisition
+        if !pos.fix_type.has_3d_fix() {
+            debug!("No 3D fix (type={}), skipping", pos.fix_type as u8);
+            return AnalysisResult::Initializing;
+        }
+
+        // First sample with 3D fix - initialize
         let prev = match self.prev {
             Some(p) => p,
             None => {
                 self.prev = Some(pos);
                 self.last_good = Some(pos);
-                info!("Spoof detector initialized: lat={}, lon={}", pos.lat, pos.lon);
+                info!("Spoof detector initialized with 3D fix: lat={}, lon={}, alt={}mm",
+                      pos.lat, pos.lon, pos.alt_mm);
                 return AnalysisResult::Initializing;
             }
         };
+
+        // Previous sample didn't have 3D fix - reinitialize
+        if !prev.fix_type.has_3d_fix() {
+            self.prev = Some(pos);
+            self.last_good = Some(pos);
+            info!("First 3D fix after acquisition: lat={}, lon={}", pos.lat, pos.lon);
+            return AnalysisResult::Initializing;
+        }
 
         // Check for data gap
         let dt_ms = pos.time_ms.wrapping_sub(prev.time_ms);
