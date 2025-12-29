@@ -1583,10 +1583,23 @@ impl Default for CfgValgetResponse {
 
 /// Known CFG-VALGET keys and their default values
 pub mod valget_defaults {
-    /// CFG-UART1-BAUDRATE: 921600
+    /// CFG-UART1-BAUDRATE: 921600 (U4)
     pub const UART1_BAUDRATE: (u32, u32) = (0x40520001, 921600);
-    /// CFG-HW-RF_LNA_MODE (crystal frequency): 192 MHz
+    /// CFG-HW-RF_LNA_MODE (crystal frequency): 192 MHz (U4)
     pub const XTAL_FREQ: (u32, u32) = (0x40A40001, 192_000_000);
+    /// CFG-RINV-DUMP: Dump data at startup (L/1-bit)
+    pub const RINV_DUMP: (u32, u32) = (0x10C70001, 0);
+}
+
+/// Get value size in bytes from key (bits 28-30)
+fn key_value_size(key: u32) -> usize {
+    match (key >> 28) & 0x07 {
+        1 | 2 => 1,  // L (1-bit) or U1 (1-byte)
+        3 => 2,      // U2 (2-byte)
+        4 => 4,      // U4 (4-byte)
+        5 => 8,      // U8 (8-byte)
+        _ => 1,      // default to 1 byte
+    }
 }
 
 impl CfgValgetResponse {
@@ -1597,6 +1610,7 @@ impl CfgValgetResponse {
             let value = match key {
                 0x40520001 => valget_defaults::UART1_BAUDRATE.1,
                 0x40A40001 => valget_defaults::XTAL_FREQ.1,
+                0x10C70001 => valget_defaults::RINV_DUMP.1,
                 _ => 0, // Unknown key - return 0
             };
             let _ = resp.values.push((key, value));
@@ -1610,8 +1624,12 @@ impl UbxMessage for CfgValgetResponse {
     fn id(&self) -> u8 { 0x8B }
     fn payload_len(&self) -> u16 {
         // Header: version(1) + layer(1) + position(2) = 4
-        // Each key-value: key(4) + value(4) = 8
-        4 + (self.values.len() as u16 * 8)
+        // Each key-value: key(4) + value(size depends on key type)
+        let mut len = 4u16;
+        for &(key, _) in self.values.iter() {
+            len += 4 + key_value_size(key) as u16;
+        }
+        len
     }
 
     fn write_payload(&self, buf: &mut [u8]) -> usize {
@@ -1623,8 +1641,21 @@ impl UbxMessage for CfgValgetResponse {
         let mut offset = 4;
         for &(key, value) in self.values.iter() {
             buf[offset..offset + 4].copy_from_slice(&key.to_le_bytes());
-            buf[offset + 4..offset + 8].copy_from_slice(&value.to_le_bytes());
-            offset += 8;
+            offset += 4;
+
+            // Write value with correct size based on key type
+            let val_size = key_value_size(key);
+            match val_size {
+                1 => buf[offset] = value as u8,
+                2 => buf[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes()),
+                4 => buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes()),
+                8 => {
+                    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                    buf[offset + 4..offset + 8].copy_from_slice(&0u32.to_le_bytes());
+                }
+                _ => buf[offset] = value as u8,
+            }
+            offset += val_size;
         }
         offset
     }
