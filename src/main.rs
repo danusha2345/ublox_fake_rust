@@ -39,7 +39,7 @@ use panic_probe as _;
 use static_cell::StaticCell;
 
 use config::*;
-use sec_sign::{SecSignAccumulator, SecSignRequest, SecSignResult, Signature, DEFAULT_SESSION_ID, PRIVATE_KEY};
+use sec_sign::{SecSignAccumulator, SecSignRequest, SecSignResult, Signature, DEFAULT_SESSION_ID, get_private_key};
 use ubx::{
     AckAck, AckNak, MessageFlags, MonVer, NavDop, NavEoe, NavPvt, NavSol, NavStatus, SecSign, SecUniqid, UbxMessage,
     // Additional NAV messages
@@ -139,6 +139,9 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 
 /// Time reference (0=UTC, 1=GPS, 2=GLONASS, etc.) - stored but not used
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
+
+/// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);
 
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
@@ -358,8 +361,12 @@ async fn sec_sign_compute_task() {
         // Compute z = fold(SHA256(hash || session_id))
         let z = sec_sign::compute_z(&request.sha256_hash, &request.session_id);
 
+        // Get private key for current drone model
+        let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+        let private_key = get_private_key(model);
+
         // Sign with ECDSA SECP192R1
-        let signature = Signature::sign(&z, &PRIVATE_KEY).unwrap_or_default();
+        let signature = Signature::sign(&z, private_key).unwrap_or_default();
 
         // Send result back to Core0
         let result = SecSignResult {

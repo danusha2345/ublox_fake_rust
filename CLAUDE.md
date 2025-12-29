@@ -129,7 +129,14 @@ Mode is persisted to flash and survives reboots. Button press toggles mode and r
 
 ## SEC-SIGN Cryptography
 
-Private key location: `src/sec_sign.rs` line 16 (`PRIVATE_KEY` constant)
+**Private keys** location: `src/sec_sign.rs`
+
+| Drone Model | Constant | Value |
+|-------------|----------|-------|
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | `0xeaa5c0111e18dbd1...` |
+| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | `0x9089a21814a62fc3...` |
+
+Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro)
 
 **Implementation**: Pure Rust using `p192` crate primitives (no C dependencies)
 

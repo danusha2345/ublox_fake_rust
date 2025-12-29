@@ -52,3 +52,26 @@ impl Default for UbloxVersion {
         Self::M10
     }
 }
+
+/// Drone model for SEC-SIGN key selection
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum DroneModel {
+    Air3 = 0,
+    Mavic4Pro = 1,
+}
+
+impl DroneModel {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::Mavic4Pro,
+            _ => Self::Air3,
+        }
+    }
+}
+
+impl Default for DroneModel {
+    fn default() -> Self {
+        Self::Air3
+    }
+}
