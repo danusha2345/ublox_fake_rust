@@ -843,8 +843,9 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&ver);
         }
         ubx::UbxCommand::SecUniqidPoll => {
-            info!("SEC-UNIQID poll received, sending unique ID");
-            let uniqid = SecUniqid::default();
+            let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+            info!("SEC-UNIQID poll received, sending unique ID for {:?}", model);
+            let uniqid = SecUniqid::for_model(model);
             send_ubx_message(&uniqid);
         }
         ubx::UbxCommand::Poll { class, id } => {

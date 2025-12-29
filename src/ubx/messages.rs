@@ -548,12 +548,36 @@ pub struct SecUniqid {
     pub reserved2: u8,
 }
 
+/// Unique IDs for different drone models (from real GNSS logs)
+pub mod uniqid {
+    /// DJI Air 3 chip unique ID
+    pub const AIR3: [u8; 5] = [0xE0, 0x95, 0x65, 0x0F, 0x2A];
+    /// DJI Mavic 4 Pro chip unique ID
+    pub const MAVIC4PRO: [u8; 5] = [0xEB, 0xB9, 0x91, 0x0F, 0x2B];
+}
+
+impl SecUniqid {
+    /// Create SEC-UNIQID for specific drone model
+    pub fn for_model(model: crate::config::DroneModel) -> Self {
+        let unique_id = match model {
+            crate::config::DroneModel::Air3 => uniqid::AIR3,
+            crate::config::DroneModel::Mavic4Pro => uniqid::MAVIC4PRO,
+        };
+        Self {
+            version: 0x02,
+            reserved: [0x00, 0x00, 0x00],
+            unique_id,
+            reserved2: 0x54,
+        }
+    }
+}
+
 impl Default for SecUniqid {
     fn default() -> Self {
         Self {
             version: 0x02,
             reserved: [0x00, 0x00, 0x00],
-            unique_id: [0xE0, 0x95, 0x65, 0x0F, 0x2A],  // Example chip ID
+            unique_id: uniqid::AIR3,  // Default to Air 3
             reserved2: 0x54,
         }
     }
