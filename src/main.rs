@@ -12,7 +12,6 @@
 mod config;
 mod flash_storage;
 mod led;
-mod passthrough;
 mod sec_sign;
 mod spoof_detector;
 mod ubx;
@@ -25,7 +24,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Async, Flash};
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
-use embassy_rp::peripherals::{FLASH, PIO0, PIO1, UART0};
+use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -34,7 +33,6 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker, Timer};
 use embedded_io_async::{Read, Write};
-use cortex_m::peripheral::SCB;
 use panic_probe as _;
 use static_cell::StaticCell;
 
@@ -54,8 +52,8 @@ use ubx::{
 // Interrupt bindings
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
+    UART1_IRQ => BufferedInterruptHandler<UART1>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
-    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
 });
 
 // ============================================================================
@@ -108,6 +106,9 @@ macro_rules! send_msg {
 /// Channel for outgoing UBX messages (serialized, ready to send)
 static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 16> = Channel::new();
 
+/// Channel for data from external GNSS (UART1 RX -> passthrough TX)
+static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 8> = Channel::new();
+
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
 
@@ -141,7 +142,7 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
 
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
@@ -190,45 +191,61 @@ impl Default for OperatingMode {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    info!("u-blox GNSS Emulator starting on Core0...");
-
     let p = embassy_rp::init(Default::default());
+
+    // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
+    {
+        use embassy_rp::pio::Pio;
+        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+        use smart_leds::RGB8;
+
+        let mut pio0 = Pio::new(p.PIO0, Irqs);
+        let program = PioWs2812Program::new(&mut pio0.common);
+        let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
+
+        for _ in 0..3 {
+            ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
+            Timer::after(Duration::from_millis(200)).await;
+            ws.write(&[RGB8::new(0, 0, 0)]).await; // Off
+            Timer::after(Duration::from_millis(200)).await;
+        }
+    }
+    // ===== END TEST =====
+
+    // Re-init peripherals (PIO0 was consumed by test)
+    let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
     let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
     // Load saved mode from flash
-    let is_passthrough = {
+    {
         let mut flash = flash_mutex.lock().await;
         if let Some(saved_mode) = flash_storage::load_mode(&mut flash) {
             if saved_mode == 1 {
                 info!("Loaded passthrough mode from flash");
                 OperatingMode::Passthrough.store();
-                true
             } else {
                 info!("Loaded emulation mode from flash");
                 OperatingMode::Emulation.store();
-                false
             }
         } else {
             info!("No saved mode, defaulting to emulation");
             OperatingMode::Emulation.store();
-            false
         }
     };
 
-    // Initialize PIO0 for WS2812 LED
+    // Initialize PIO0 for WS2812 LED (GPIO25 on RP2350-Core-A)
     let pio0 = Pio::new(p.PIO0, Irqs);
+    let dma_ch1 = p.DMA_CH1;
+    let pin_25 = p.PIN_25;  // WS2812B on GPIO25
 
-    // Mode button (GPIO5 = power, GPIO6 = input)
-    let _btn_pwr = Output::new(p.PIN_5, Level::High);
-    let btn_input = Input::new(p.PIN_6, Pull::Down);
+    // Mode button (GPIO6 = power, GPIO7 = input) - updated for RP2350
+    let _btn_pwr = Output::new(p.PIN_6, Level::High);
+    let btn_input = Input::new(p.PIN_7, Pull::Down);
 
     // Spawn Core1 for LED and SEC-SIGN computation
-    info!("Spawning Core1...");
-    let dma_ch1 = p.DMA_CH1;
-    let pin_16 = p.PIN_16;
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -236,71 +253,80 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, dma_ch1, pin_16));
+                spawner.must_spawn(led_task(pio0, dma_ch1, pin_25));
                 spawner.must_spawn(sec_sign_compute_task());
             });
         },
     );
 
-    if is_passthrough {
-        // Passthrough mode: PIO copies GPIO3 -> GPIO0
-        info!("Starting in PASSTHROUGH mode");
+    // ========================================================================
+    // UART0: Communication with drone/host (TX=GPIO0, RX=GPIO1)
+    // ========================================================================
+    static TX_BUF0: StaticCell<[u8; 512]> = StaticCell::new();
+    static RX_BUF0: StaticCell<[u8; 256]> = StaticCell::new();
+    let tx_buf0 = &mut TX_BUF0.init([0; 512])[..];
+    let rx_buf0 = &mut RX_BUF0.init([0; 256])[..];
 
-        let mut pio1 = Pio::new(p.PIO1, Irqs);
-        let mut passthrough = passthrough::Passthrough::new(
-            &mut pio1.common,
-            pio1.sm0,
-            p.PIN_3,  // Input from external GNSS
-            p.PIN_0,  // Output to host
-        );
-        passthrough.enable();
+    let mut uart0_config = UartConfig::default();
+    uart0_config.baudrate = DEFAULT_BAUDRATE;
+    let uart0 = BufferedUart::new(
+        p.UART0,
+        p.PIN_0, // TX
+        p.PIN_1, // RX
+        Irqs,
+        tx_buf0,
+        rx_buf0,
+        uart0_config,
+    );
+    let (uart0_tx, uart0_rx) = uart0.split();
 
-        // Prevent drop - keep PIO running (sm0 is owned by passthrough)
-        core::mem::forget(passthrough);
+    // ========================================================================
+    // UART1: External GNSS module input (RX=GPIO5)
+    // ========================================================================
+    static TX_BUF1: StaticCell<[u8; 64]> = StaticCell::new();
+    static RX_BUF1: StaticCell<[u8; 512]> = StaticCell::new();
+    let tx_buf1 = &mut TX_BUF1.init([0; 64])[..];
+    let rx_buf1 = &mut RX_BUF1.init([0; 512])[..];
 
-        // Only button task in passthrough mode
-        spawner.must_spawn(button_task(btn_input, flash_mutex));
+    let mut uart1_config = UartConfig::default();
+    uart1_config.baudrate = DEFAULT_BAUDRATE;
+    let uart1 = BufferedUart::new(
+        p.UART1,
+        p.PIN_4, // TX (not used, but required)
+        p.PIN_5, // RX from external GNSS
+        Irqs,
+        tx_buf1,
+        rx_buf1,
+        uart1_config,
+    );
+    let (_uart1_tx, uart1_rx) = uart1.split();
 
-        info!("Passthrough active, press button to switch to emulation");
-    } else {
-        // Emulation mode: UART for UBX messages
-        info!("Starting in EMULATION mode");
-
-        static TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
-        static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-        let tx_buf = &mut TX_BUF.init([0; 512])[..];
-        let rx_buf = &mut RX_BUF.init([0; 256])[..];
-
-        let mut uart_config = UartConfig::default();
-        uart_config.baudrate = DEFAULT_BAUDRATE;
-        let uart = BufferedUart::new(
-            p.UART0,
-            p.PIN_0, // TX
-            p.PIN_1, // RX
-            Irqs,
-            tx_buf,
-            rx_buf,
-            uart_config,
-        );
-        let (tx, rx) = uart.split();
-
-        // Initialize SEC-SIGN accumulator early (avoid delay in uart_tx_task)
-        {
-            // Use try_lock since we're in async context but no contention yet
-            let mut acc = SEC_SIGN_ACC.try_lock().unwrap();
-            *acc = Some(SecSignAccumulator::new());
-        }
-
-        // All Core0 tasks for emulation
-        spawner.must_spawn(uart_tx_task(tx));
-        spawner.must_spawn(uart_rx_task(rx));
-        spawner.must_spawn(nav_message_task());
-        spawner.must_spawn(mon_message_task());
-        spawner.must_spawn(sec_sign_timer_task());
-        spawner.must_spawn(button_task(btn_input, flash_mutex));
+    // Initialize SEC-SIGN accumulator
+    {
+        let mut acc = SEC_SIGN_ACC.try_lock().unwrap();
+        *acc = Some(SecSignAccumulator::new());
     }
 
-    info!("All tasks spawned, running");
+    // ========================================================================
+    // Spawn all tasks - they check MODE internally for hot-switching
+    // ========================================================================
+    let mode = OperatingMode::load();
+    info!("Starting in {:?} mode (hot-switchable)", mode);
+
+    // Core communication tasks (always running)
+    spawner.must_spawn(uart0_tx_task(uart0_tx));
+    spawner.must_spawn(uart0_rx_task(uart0_rx));
+    spawner.must_spawn(uart1_rx_task(uart1_rx));
+
+    // Emulation tasks (check MODE internally, skip work in passthrough)
+    spawner.must_spawn(nav_message_task());
+    spawner.must_spawn(mon_message_task());
+    spawner.must_spawn(sec_sign_timer_task());
+
+    // Button task for mode switching (no reboot!)
+    spawner.must_spawn(button_task(btn_input, flash_mutex));
+
+    info!("All tasks spawned, hot-switch enabled");
 
     // Core0 main loop - idle
     loop {
@@ -312,34 +338,36 @@ async fn main(spawner: Spawner) {
 // Core1 Tasks
 // ============================================================================
 
-/// LED control task - WS2812 on PIO (runs on Core1)
+/// LED control task - WS2812B on PIO (runs on Core1)
+/// GPIO25 on RP2350-Core-A
+/// Green = Emulation mode, Blue = Passthrough mode
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
-    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
+    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
 ) {
-    use led::Ws2812;
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+    use smart_leds::RGB8;
 
-    info!("LED task starting on Core1");
-    let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, dma, pin);
-    let mut ticker = Ticker::every(Duration::from_millis(config::timers::LED_BLINK_MS));
-    let mut led_on = false;
+    let program = PioWs2812Program::new(&mut pio.common);
+    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio.common, pio.sm0, dma, pin, &program);
+
+    let mut ticker = Ticker::every(Duration::from_millis(500));
+    let mut on = false;
 
     loop {
+        on = !on;
         let mode = OperatingMode::load();
-        let color = match mode {
-            OperatingMode::Emulation => led::Color::green(),
-            OperatingMode::Passthrough => led::Color::blue(),
-        };
-
-        led_on = !led_on;
-        if led_on {
-            ws2812.write_color(color).await;
+        let color = if on {
+            match mode {
+                OperatingMode::Emulation => RGB8::new(0, 30, 0),   // Green
+                OperatingMode::Passthrough => RGB8::new(0, 0, 30), // Blue
+            }
         } else {
-            ws2812.write_color(led::Color::off()).await;
-        }
-
+            RGB8::new(0, 0, 0) // Off
+        };
+        let _ = ws.write(&[color]).await;
         ticker.next().await;
     }
 }
@@ -385,69 +413,84 @@ async fn sec_sign_compute_task() {
 // Core0 Tasks
 // ============================================================================
 
-/// UART TX task - sends UBX messages from TX_CHANNEL
-/// Handles SEC-SIGN synchronization: uses select! to handle both regular TX and SEC-SIGN
+/// UART0 TX task - sends data to drone/host
+/// In Emulation mode: sends generated UBX from TX_CHANNEL + SEC-SIGN
+/// In Passthrough mode: forwards data from GNSS_RX_CHANNEL (external GNSS)
 #[embassy_executor::task]
-async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
-    use embassy_futures::select::{select, Either};
+async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
+    use embassy_futures::select::{select3, Either3};
 
-    // Short delay to let UART settle (accumulator already initialized in main)
     Timer::after(Duration::from_millis(50)).await;
-    info!("UART TX task ready");
+    info!("UART0 TX task ready (hot-switch enabled)");
 
     loop {
-        // Use select! to wait for either:
-        // 1. SEC-SIGN result from Core1 (priority)
-        // 2. Regular message from TX_CHANNEL
-        match select(SEC_SIGN_RESULT.wait(), TX_CHANNEL.receive()).await {
-            Either::First(result) => {
-                // SEC-SIGN result received - send signature
-                let sec_sign_msg = SecSign {
-                    version: 0x01,
-                    reserved1: 0,
-                    msg_cnt: result.packet_count,
-                    sha256_hash: result.sha256_hash,
-                    session_id: result.session_id,
-                    signature_r: result.signature.r,
-                    signature_s: result.signature.s,
-                };
+        let mode = OperatingMode::load();
 
-                let mut buf = [0u8; 128];
-                let len = sec_sign_msg.build(&mut buf);
-                if len > 0 {
-                    if let Err(e) = tx.write_all(&buf[..len]).await {
-                        error!("UART TX SEC-SIGN error: {:?}", e);
+        match mode {
+            OperatingMode::Emulation => {
+                // Emulation: wait for TX_CHANNEL or SEC-SIGN result
+                match select3(
+                    SEC_SIGN_RESULT.wait(),
+                    TX_CHANNEL.receive(),
+                    GNSS_RX_CHANNEL.receive(), // Drain passthrough channel if any
+                ).await {
+                    Either3::First(result) => {
+                        // SEC-SIGN result received - send signature
+                        let sec_sign_msg = SecSign {
+                            version: 0x01,
+                            reserved1: 0,
+                            msg_cnt: result.packet_count,
+                            sha256_hash: result.sha256_hash,
+                            session_id: result.session_id,
+                            signature_r: result.signature.r,
+                            signature_s: result.signature.s,
+                        };
+
+                        let mut buf = [0u8; 128];
+                        let len = sec_sign_msg.build(&mut buf);
+                        if len > 0 {
+                            if let Err(e) = tx.write_all(&buf[..len]).await {
+                                error!("UART TX SEC-SIGN error: {:?}", e);
+                            }
+                            info!("SEC-SIGN sent ({} packets)", result.packet_count);
+                        }
+                        SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                     }
-                    info!("SEC-SIGN sent ({} packets)", result.packet_count);
-                }
+                    Either3::Second(msg) => {
+                        // Regular emulation message
+                        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                            if TX_CHANNEL.try_send(msg).is_err() {
+                                error!("Failed to re-queue message during SEC-SIGN!");
+                            }
+                            continue;
+                        }
 
-                // Clear pause flag - resume normal TX
-                SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                        if let Err(e) = tx.write_all(&msg).await {
+                            error!("UART TX error: {:?}", e);
+                            continue;
+                        }
+
+                        // Accumulate for SEC-SIGN
+                        let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
+                        if !is_sec_sign {
+                            let mut acc = SEC_SIGN_ACC.lock().await;
+                            if let Some(ref mut accumulator) = *acc {
+                                accumulator.accumulate(&msg);
+                            }
+                        }
+                    }
+                    Either3::Third(_) => {
+                        // Discard passthrough data in emulation mode
+                    }
+                }
             }
-            Either::Second(msg) => {
-                // Regular message - check if SEC-SIGN is in progress
-                if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-                    // Re-queue the message and wait for SEC-SIGN first
-                    if TX_CHANNEL.try_send(msg).is_err() {
-                        error!("Failed to re-queue message during SEC-SIGN!");
-                    }
-                    continue;
-                }
-
-                // Send via UART
-                if let Err(e) = tx.write_all(&msg).await {
-                    error!("UART TX error: {:?}", e);
-                    continue;
-                }
-
-                // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
-                // SEC-SIGN = class 0x27, id 0x04
-                // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
-                let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-                if !is_sec_sign {
-                    let mut acc = SEC_SIGN_ACC.lock().await;
-                    if let Some(ref mut accumulator) = *acc {
-                        accumulator.accumulate(&msg);
+            OperatingMode::Passthrough => {
+                // Passthrough: forward data from external GNSS
+                match GNSS_RX_CHANNEL.receive().await {
+                    msg => {
+                        if let Err(e) = tx.write_all(&msg).await {
+                            error!("Passthrough TX error: {:?}", e);
+                        }
                     }
                 }
             }
@@ -493,9 +536,10 @@ fn set_uart0_baudrate(baudrate: u32) {
     });
 }
 
-/// UART RX task - receives and processes UBX commands
+/// UART0 RX task - receives and processes UBX commands from drone
+/// Runs in BOTH modes to preserve settings during hot-switch
 #[embassy_executor::task]
-async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
+async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     let mut buf = [0u8; 128];
     let mut parser = ubx::UbxParser::new();
 
@@ -510,6 +554,7 @@ async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             Ok(n) if n > 0 => {
                 for &byte in &buf[..n] {
                     if let Some(cmd) = parser.parse_byte(byte) {
+                        // Process commands in BOTH modes - preserves settings
                         handle_ubx_command(&cmd).await;
                     }
                 }
@@ -522,7 +567,36 @@ async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             }
             Ok(_) => {}
             Err(e) => {
-                error!("UART RX error: {:?}", e);
+                error!("UART0 RX error: {:?}", e);
+            }
+        }
+    }
+}
+
+/// UART1 RX task - receives data from external GNSS module
+/// Forwards to GNSS_RX_CHANNEL for passthrough mode
+#[embassy_executor::task]
+async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
+    let mut buf = [0u8; 256];
+
+    info!("UART1 RX task ready (external GNSS input)");
+
+    loop {
+        match rx.read(&mut buf).await {
+            Ok(n) if n > 0 => {
+                // Forward received data to channel
+                let mut vec = heapless::Vec::<u8, 256>::new();
+                if vec.extend_from_slice(&buf[..n]).is_ok() {
+                    if GNSS_RX_CHANNEL.try_send(vec).is_err() {
+                        // Channel full - data will be lost in emulation mode anyway
+                        // In passthrough mode this shouldn't happen often
+                        debug!("GNSS RX channel full, {} bytes dropped", n);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("UART1 RX error: {:?}", e);
             }
         }
     }
@@ -993,7 +1067,8 @@ async fn sec_sign_timer_task() {
     }
 }
 
-/// Mode button task - switches mode, saves to flash, and reboots
+/// Mode button task - hot-switches mode without reboot
+/// Settings are preserved because UART RX runs in both modes
 #[embassy_executor::task]
 async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
     loop {
@@ -1007,28 +1082,23 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
                 OperatingMode::Passthrough => OperatingMode::Emulation,
             };
 
-            info!("Switching to {:?}, saving to flash...", new_mode);
+            // Hot-switch: just change MODE atomically
+            new_mode.store();
+            info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
 
-            // Save new mode to flash
-            let save_ok = {
+            // Save to flash for persistence across power cycles
+            {
                 let mut flash = flash_mutex.lock().await;
-                flash_storage::save_mode(&mut flash, new_mode as u8).await
-            };
-
-            if save_ok {
-                info!("Mode saved, rebooting...");
-
-                // Wait for button release before reboot
-                btn.wait_for_low().await;
-                Timer::after(Duration::from_millis(100)).await;
-
-                // Reboot to apply new mode
-                SCB::sys_reset();
-            } else {
-                error!("Failed to save mode, not rebooting");
-                // Wait for button release before continuing
-                btn.wait_for_low().await;
+                if flash_storage::save_mode(&mut flash, new_mode as u8).await {
+                    info!("Mode saved to flash");
+                } else {
+                    warn!("Failed to save mode to flash");
+                }
             }
+
+            // Wait for button release before allowing next switch
+            btn.wait_for_low().await;
+            Timer::after(Duration::from_millis(100)).await;
         }
     }
 }
