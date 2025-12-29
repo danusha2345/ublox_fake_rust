@@ -1567,8 +1567,8 @@ pub struct CfgValgetResponse {
     pub version: u8,
     /// Layer (0x00=RAM, 0x01=BBR, 0x02=Flash, 0x07=default)
     pub layer: u8,
-    /// Key-value pairs (key_id, value)
-    pub values: heapless::Vec<(u32, u32), 8>,
+    /// Key-value pairs (key_id, value) - value stored as u64 to support all sizes
+    pub values: heapless::Vec<(u32, u64), 8>,
 }
 
 impl Default for CfgValgetResponse {
@@ -1589,6 +1589,15 @@ pub mod valget_defaults {
     pub const XTAL_FREQ: (u32, u32) = (0x40A40001, 192_000_000);
     /// CFG-RINV-DUMP: Dump data at startup (L/1-bit)
     pub const RINV_DUMP: (u32, u32) = (0x10C70001, 0);
+    /// CFG-RINV-SIZE: Size of RINV data (U1) = 30 bytes
+    pub const RINV_SIZE: (u32, u32) = (0x20C70003, 0x1E);
+
+    /// CFG-RINV-DATA0..DATA3: Remote Inventory data (U8 each)
+    /// These contain DJI identification data (from Mavic 4 Pro log)
+    pub const RINV_DATA0: (u32, u64) = (0x50C70004, 0xB3EB2150D2DDFD6A);
+    pub const RINV_DATA1: (u32, u64) = (0x50C70005, 0x4212446047EDEB1D);
+    pub const RINV_DATA2: (u32, u64) = (0x50C70006, 0xFD7A5A067543C46A);
+    pub const RINV_DATA3: (u32, u64) = (0x50C70007, 0x0000F0A1E9D27741);
 }
 
 /// Get value size in bytes from key (bits 28-30)
@@ -1607,10 +1616,18 @@ impl CfgValgetResponse {
     pub fn for_keys(keys: &[u32]) -> Self {
         let mut resp = Self::default();
         for &key in keys {
-            let value = match key {
-                0x40520001 => valget_defaults::UART1_BAUDRATE.1,
-                0x40A40001 => valget_defaults::XTAL_FREQ.1,
-                0x10C70001 => valget_defaults::RINV_DUMP.1,
+            let value: u64 = match key {
+                // 4-byte values (U4)
+                0x40520001 => valget_defaults::UART1_BAUDRATE.1 as u64,
+                0x40A40001 => valget_defaults::XTAL_FREQ.1 as u64,
+                // 1-byte values (L/U1)
+                0x10C70001 => valget_defaults::RINV_DUMP.1 as u64,
+                0x20C70003 => valget_defaults::RINV_SIZE.1 as u64,
+                // 8-byte values (U8) - RINV data
+                0x50C70004 => valget_defaults::RINV_DATA0.1,
+                0x50C70005 => valget_defaults::RINV_DATA1.1,
+                0x50C70006 => valget_defaults::RINV_DATA2.1,
+                0x50C70007 => valget_defaults::RINV_DATA3.1,
                 _ => 0, // Unknown key - return 0
             };
             let _ = resp.values.push((key, value));
@@ -1648,11 +1665,8 @@ impl UbxMessage for CfgValgetResponse {
             match val_size {
                 1 => buf[offset] = value as u8,
                 2 => buf[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes()),
-                4 => buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes()),
-                8 => {
-                    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-                    buf[offset + 4..offset + 8].copy_from_slice(&0u32.to_le_bytes());
-                }
+                4 => buf[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes()),
+                8 => buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes()),
                 _ => buf[offset] = value as u8,
             }
             offset += val_size;
