@@ -15,8 +15,8 @@ pub mod thresholds {
     /// Teleportation threshold in meters (jump > 1 km = spoof)
     pub const TELEPORT_M: f32 = 1000.0;
 
-    /// Altitude jump threshold in meters (> 500 m = spoof)
-    pub const TELEPORT_ALT_M: f32 = 500.0;
+    /// Altitude jump threshold in meters (> 5 m instant jump = spoof)
+    pub const TELEPORT_ALT_M: f32 = 5.0;
 
     /// Maximum realistic speed in m/s (25 m/s = 90 km/h for DJI drones)
     pub const MAX_SPEED_MS: f32 = 25.0;
@@ -24,8 +24,8 @@ pub mod thresholds {
     /// Maximum realistic vertical speed in m/s (10 m/s for consumer drones)
     pub const MAX_VERTICAL_SPEED_MS: f32 = 10.0;
 
-    /// Minimum samples to confirm spoofing (consecutive anomalies)
-    pub const SPOOF_CONFIRM_COUNT: u8 = 2;
+    /// Minimum samples to confirm spoofing (1 = immediate detection)
+    pub const SPOOF_CONFIRM_COUNT: u8 = 1;
 
     /// Minimum normal samples to clear spoofing flag
     pub const NORMAL_CONFIRM_COUNT: u8 = 5;
