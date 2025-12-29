@@ -141,7 +141,7 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
 
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
@@ -190,9 +190,29 @@ impl Default for OperatingMode {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    info!("u-blox GNSS Emulator starting on Core0...");
-
     let p = embassy_rp::init(Default::default());
+
+    // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
+    {
+        use embassy_rp::pio::Pio;
+        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+        use smart_leds::RGB8;
+
+        let mut pio0 = Pio::new(p.PIO0, Irqs);
+        let program = PioWs2812Program::new(&mut pio0.common);
+        let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
+
+        for _ in 0..3 {
+            ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
+            Timer::after(Duration::from_millis(200)).await;
+            ws.write(&[RGB8::new(0, 0, 0)]).await; // Off
+            Timer::after(Duration::from_millis(200)).await;
+        }
+    }
+    // ===== END TEST =====
+
+    // Re-init peripherals (PIO0 was consumed by test)
+    let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
     let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
@@ -217,15 +237,14 @@ async fn main(spawner: Spawner) {
 
     // Initialize PIO0 for WS2812 LED (GPIO25 on RP2350-Core-A)
     let pio0 = Pio::new(p.PIO0, Irqs);
+    let dma_ch1 = p.DMA_CH1;
+    let pin_25 = p.PIN_25;  // WS2812B on GPIO25
 
     // Mode button (GPIO6 = power, GPIO7 = input) - updated for RP2350
     let _btn_pwr = Output::new(p.PIN_6, Level::High);
     let btn_input = Input::new(p.PIN_7, Pull::Down);
 
     // Spawn Core1 for LED and SEC-SIGN computation
-    info!("Spawning Core1...");
-    let dma_ch1 = p.DMA_CH1;
-    let pin_25 = p.PIN_25;  // WS2812B on GPIO25
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -320,33 +339,34 @@ async fn main(spawner: Spawner) {
 
 /// LED control task - WS2812B on PIO (runs on Core1)
 /// GPIO25 on RP2350-Core-A
+/// Green = Emulation mode, Blue = Passthrough mode
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
     pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
 ) {
-    use led::Ws2812;
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+    use smart_leds::RGB8;
 
-    info!("LED task starting on Core1");
-    let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, dma, pin);
-    let mut ticker = Ticker::every(Duration::from_millis(config::timers::LED_BLINK_MS));
-    let mut led_on = false;
+    let program = PioWs2812Program::new(&mut pio.common);
+    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio.common, pio.sm0, dma, pin, &program);
+
+    let mut ticker = Ticker::every(Duration::from_millis(500));
+    let mut on = false;
 
     loop {
+        on = !on;
         let mode = OperatingMode::load();
-        let color = match mode {
-            OperatingMode::Emulation => led::Color::green(),
-            OperatingMode::Passthrough => led::Color::blue(),
-        };
-
-        led_on = !led_on;
-        if led_on {
-            ws2812.write_color(color).await;
+        let color = if on {
+            match mode {
+                OperatingMode::Emulation => RGB8::new(0, 30, 0),   // Green
+                OperatingMode::Passthrough => RGB8::new(0, 0, 30), // Blue
+            }
         } else {
-            ws2812.write_color(led::Color::off()).await;
-        }
-
+            RGB8::new(0, 0, 0) // Off
+        };
+        let _ = ws.write(&[color]).await;
         ticker.next().await;
     }
 }

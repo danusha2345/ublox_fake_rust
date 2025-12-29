@@ -55,7 +55,7 @@ rp-pac = { version = "7", features = ["rp235x"] }
 [features]
 default = ["rp2350"]
 rp2040 = ["embassy-rp/rp2040"]
-rp2350 = ["embassy-rp/rp235xa"]
+rp2350 = ["embassy-rp/rp235xa", "embassy-rp/imagedef-secure-exe"]
 
 [profile.dev]
 debug = 2
