@@ -139,31 +139,26 @@ impl SpoofDetector {
 
     /// Analyze new position and determine if it's spoofed
     pub fn analyze(&mut self, pos: Position) -> AnalysisResult {
-        // Skip samples without 3D fix - altitude unreliable during acquisition
-        if !pos.fix_type.has_3d_fix() {
-            debug!("No 3D fix (type={}), skipping", pos.fix_type as u8);
-            return AnalysisResult::Initializing;
-        }
+        // NOTE: 3D fix filter disabled - during dynamic spoofing fix_type may not
+        // transition properly, causing missed detections. Altitude checks still work
+        // because spoofer sends consistent fix_type with fake coordinates.
+        //
+        // if !pos.fix_type.has_3d_fix() {
+        //     debug!("No 3D fix (type={}), skipping", pos.fix_type as u8);
+        //     return AnalysisResult::Initializing;
+        // }
 
-        // First sample with 3D fix - initialize
+        // First sample - initialize
         let prev = match self.prev {
             Some(p) => p,
             None => {
                 self.prev = Some(pos);
                 self.last_good = Some(pos);
-                info!("Spoof detector initialized with 3D fix: lat={}, lon={}, alt={}mm",
+                info!("Spoof detector initialized: lat={}, lon={}, alt={}mm",
                       pos.lat, pos.lon, pos.alt_mm);
                 return AnalysisResult::Initializing;
             }
         };
-
-        // Previous sample didn't have 3D fix - reinitialize
-        if !prev.fix_type.has_3d_fix() {
-            self.prev = Some(pos);
-            self.last_good = Some(pos);
-            info!("First 3D fix after acquisition: lat={}, lon={}", pos.lat, pos.lon);
-            return AnalysisResult::Initializing;
-        }
 
         // Check for data gap
         let dt_ms = pos.time_ms.wrapping_sub(prev.time_ms);
