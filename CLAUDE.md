@@ -36,22 +36,28 @@ rustup target add thumbv8m.main-none-eabihf  # RP2350
 
 ## Build Commands
 
+**CRITICAL: Always use Makefile to build UF2 files!**
+
 ```bash
-# Build for RP2040 (default)
-cargo build
+# Build UF2 for RP2350 (ALWAYS use this!)
+make rp2350
 
-# Build release for RP2040
-cargo build --release
-
-# Build for RP2350
-cargo build --release --features rp2350 --target thumbv8m.main-none-eabihf
+# Build UF2 for RP2040
+make rp2040
 
 # Flash and run (requires probe-rs)
 cargo run --release
+make flash
+```
 
+**WARNING:** Do NOT use manual uf2conv.py or objcopy commands!
+The Makefile uses `elf2uf2-rs` (takes addresses from ELF sections) + patches Family ID for RP2350.
+Manual conversion with objcopy loses address info and creates broken firmware.
+
+```bash
 # Aliases defined in .cargo/config.toml:
 cargo rb        # run release binary
-cargo rp2350    # build for RP2350
+cargo rp2350    # build for RP2350 (ELF only, no UF2)
 ```
 
 ## Architecture
