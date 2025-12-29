@@ -8,16 +8,37 @@ use p192::{ProjectivePoint, Scalar};
 use p192::elliptic_curve::group::GroupEncoding;
 use subtle::CtOption;
 use hmac::{Hmac, Mac};
+use crate::config::DroneModel;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// SEC-SIGN private key (SECP192R1 - 24 bytes)
+/// SEC-SIGN private key for DJI Air 3 (SECP192R1 - 24 bytes)
 /// WARNING: Hardcoded for development. Production should use secure storage.
-pub const PRIVATE_KEY: [u8; 24] = [
+pub const PRIVATE_KEY_AIR3: [u8; 24] = [
     0xea, 0xa5, 0xc0, 0x11, 0x1e, 0x18, 0xdb, 0xd1,
     0x7a, 0xdb, 0x3d, 0xc9, 0x39, 0x4b, 0xfb, 0x45,
     0x1f, 0x9d, 0x5e, 0x83, 0xf9, 0x38, 0x22, 0xc7,
 ];
+
+/// SEC-SIGN private key for DJI Mavic 4 Pro (SECP192R1 - 24 bytes)
+/// WARNING: Hardcoded for development. Production should use secure storage.
+pub const PRIVATE_KEY_MAVIC4PRO: [u8; 24] = [
+    0x90, 0x89, 0xa2, 0x18, 0x14, 0xa6, 0x2f, 0xc3,
+    0x3a, 0xf5, 0xd6, 0xeb, 0x61, 0x16, 0x1c, 0xe1,
+    0x86, 0x36, 0xf5, 0x48, 0xd0, 0x71, 0xd6, 0x9f,
+];
+
+/// Legacy alias for backwards compatibility (defaults to Air 3)
+#[allow(dead_code)]
+pub const PRIVATE_KEY: [u8; 24] = PRIVATE_KEY_AIR3;
+
+/// Get private key for specified drone model
+pub fn get_private_key(model: DroneModel) -> &'static [u8; 24] {
+    match model {
+        DroneModel::Air3 => &PRIVATE_KEY_AIR3,
+        DroneModel::Mavic4Pro => &PRIVATE_KEY_MAVIC4PRO,
+    }
+}
 
 /// Default session ID (zeros for M10 compatibility, same as C version)
 pub const DEFAULT_SESSION_ID: [u8; 24] = [0u8; 24];
