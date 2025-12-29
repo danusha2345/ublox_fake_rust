@@ -177,6 +177,45 @@ Critical synchronization points:
 - SEC-UNIQID (0x27, 0x03) - IS included in hash
 - TIM-TP, RXM-RAWX
 
+## CFG-0x41 (DJI Proprietary)
+
+Proprietary DJI command to retrieve SEC-SIGN configuration and private key from GNSS module.
+
+**Usage**: Send UBX poll (0x06, 0x41) with zero-length payload to receive 256-byte response.
+
+**Payload structure (256 bytes)**:
+```
+Bytes 0-174:    Configuration data (ARM Thumb-2 code + parameters)
+Bytes 175-198:  Private key ECDSA P-192 (24 bytes, big-endian)
+Bytes 199-255:  Additional parameters and padding
+```
+
+**Implementation** in `src/ubx/messages.rs`:
+```rust
+pub mod cfg41_templates {
+    pub const PRIVATE_KEY_OFFSET: usize = 175;  // Key location in payload
+    pub const TEMPLATE: [u8; 256] = [...];      // Base template from Mavic 4 Pro
+}
+
+impl Cfg41 {
+    pub fn for_model(model: DroneModel) -> Self {
+        // Insert correct private key at offset 175
+    }
+}
+```
+
+**Handler** in `main.rs`:
+```rust
+ubx::UbxCommand::Cfg41Poll => {
+    let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+    let cfg41 = Cfg41::for_model(model);
+    send_ubx_message(&cfg41);
+    send_ack(0x06, 0x41);
+}
+```
+
+**Security note**: This command exposes the private key, allowing key extraction from real DJI GNSS modules.
+
 ## RAM/Flash Usage Comparison (vs C/FreeRTOS)
 
 | Metric | C/FreeRTOS | Rust/Embassy |
@@ -226,7 +265,8 @@ All core features complete:
 6. ✅ CFG-VALSET - Full M10 configuration support
 7. ✅ ACK-ACK/ACK-NAK - Command acknowledgement
 8. ✅ SEC-UNIQID - Unique ID poll response
-9. ✅ Release build - 0 warnings, pure Rust
+9. ✅ CFG-0x41 - DJI proprietary SEC-SIGN config (256-byte response with private key)
+10. ✅ Release build - 0 warnings, pure Rust
 
 ## Implemented UBX Messages
 
@@ -265,6 +305,7 @@ All core features complete:
 | 0x02 | 0x15 | RXM-RAWX | 16+ | Raw measurements |
 | 0x05 | 0x00 | ACK-NAK | 2 | Negative acknowledgement |
 | 0x05 | 0x01 | ACK-ACK | 2 | Acknowledgement |
+| 0x06 | 0x41 | CFG-0x41 | 256 | DJI proprietary (private key at offset 175) |
 | 0x0D | 0x01 | TIM-TP | 16 | Timepulse |
 | 0x27 | 0x04 | SEC-SIGN | 108 | Signature |
 | 0x27 | 0x03 | SEC-UNIQID | 10 | Unique ID (poll) |

@@ -216,6 +216,7 @@ cargo run --release
 | 0x06 | 0x3E | CFG-GNSS | GNSS system config |
 | 0x06 | 0x86 | CFG-PMS | Power management |
 | 0x06 | 0x8A | CFG-VALSET | Value set (M10 style) |
+| 0x06 | 0x41 | CFG-0x41 | DJI proprietary SEC-SIGN config (см. ниже) |
 | 0x0A | 0x04 | MON-VER | Poll версии |
 | 0x27 | 0x03 | SEC-UNIQID | Poll unique ID |
 
@@ -243,6 +244,34 @@ cargo run --release
 | DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды |
 
 Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro)
+
+### CFG-0x41 (DJI Proprietary)
+
+Проприетарная DJI команда для получения конфигурации SEC-SIGN и приватного ключа.
+
+**Формат**: UBX poll запрос (0x06, 0x41) с нулевым payload возвращает 256-байтный ответ.
+
+**Структура ответа (256 байт)**:
+- Байты 0-174: Конфигурационные данные (ARM Thumb-2 код и параметры)
+- **Байты 175-198**: Приватный ключ ECDSA P-192 (24 байта, big-endian)
+- Байты 199-255: Дополнительные параметры и padding
+
+**Практическое применение**: DJI использует эту команду для:
+- Выгрузки приватных ключей из GNSS модулей на производстве
+- Верификации аутентичности модуля
+- Теоретически — получения ключей из других дронов для анализа
+
+**Реализация** в `src/ubx/messages.rs`:
+```rust
+pub mod cfg41_templates {
+    pub const PRIVATE_KEY_OFFSET: usize = 175;
+    pub const TEMPLATE: [u8; 256] = [...];
+}
+
+impl Cfg41 {
+    pub fn for_model(model: DroneModel) -> Self { ... }
+}
+```
 
 ## Конфигурация
 

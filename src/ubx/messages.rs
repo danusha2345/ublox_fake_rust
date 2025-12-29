@@ -1480,3 +1480,152 @@ impl UbxMessage for RxmRawx {
         16
     }
 }
+
+// ============================================================================
+// DJI Proprietary Messages
+// ============================================================================
+
+/// CFG-0x41 (0x06 0x41) - DJI proprietary SEC-SIGN configuration
+/// 256-byte response containing private key and configuration data
+/// Private key is located at offset 175 (0xAF) in payload
+#[derive(Clone)]
+pub struct Cfg41 {
+    /// Full 256-byte payload (template with private key embedded)
+    pub payload: [u8; 256],
+}
+
+/// CFG-0x41 payload templates for different drone models
+/// Captured from real DJI GNSS modules
+pub mod cfg41_templates {
+    /// Private key offset in CFG-0x41 payload
+    pub const PRIVATE_KEY_OFFSET: usize = 175;
+
+    /// Base template from Mavic 4 Pro (private key will be replaced)
+    pub const TEMPLATE: [u8; 256] = [
+        0xC4, 0x90, 0xF3, 0xFF, 0xAE, 0xFF, 0xFE, 0xFF, 0xF7, 0xFF, 0x9F, 0xFF, 0xFF, 0xF7, 0xBF, 0xFF,
+        0xEF, 0xFF, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x82, 0x18, 0xB0, 0x00, 0x00, 0x00,
+        0xF0, 0xA0, 0xF7, 0xF7, 0x00, 0x22, 0x42, 0x60, 0xC0, 0xF8, 0xBC, 0x10, 0x4F, 0xF4, 0x00, 0x31,
+        0xC1, 0x67, 0x70, 0x47, 0x00, 0x00, 0x83, 0x28, 0x8C, 0x16, 0x00, 0x00, 0xF1, 0xA0, 0xF7, 0xF7,
+        0x23, 0xF4, 0x40, 0x03, 0x8E, 0x68, 0x46, 0xF4, 0x40, 0x06, 0xC1, 0xF8, 0xBC, 0x20, 0x8E, 0x60,
+        0xCE, 0x68, 0xC1, 0xF8, 0xBC, 0x20, 0x46, 0xF4, 0xC0, 0x06, 0xCE, 0x60, 0x70, 0x47, 0x00, 0x00,
+        0xA4, 0x0F, 0x0F, 0x00, 0x31, 0x10, 0x00, 0x0D, 0x00, 0x31, 0x10, 0x01, 0x22, 0x00, 0x31, 0x10,
+        0x01, 0xA4, 0x3A, 0x02, 0x00, 0xC7, 0x10, 0x01, 0x03, 0x00, 0xC7, 0x20, 0x1E, 0x04, 0x00, 0xC7,
+        0x50, 0x6A, 0xFD, 0xDD, 0xD2, 0x50, 0x21, 0xEB, 0xB3, 0x05, 0x00, 0xC7, 0x50, 0x1D, 0xEB, 0xED,
+        0x47, 0x60, 0x44, 0x12, 0x42, 0x06, 0x00, 0xC7, 0x50, 0x6A, 0xC4, 0x43, 0x75, 0x06, 0x5A, 0x7A,
+        0xFD, 0x07, 0x00, 0xC7, 0x50, 0x41, 0x77, 0xD2, 0xE9, 0xA1, 0xF0, 0x00, 0x00, 0xA6, 0x18,
+        // Private key starts at offset 175 (next 24 bytes) - placeholder zeros
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Remaining config data
+        0xA4, 0x08, 0x01, 0x00, 0x52, 0x40, 0x00, 0x10, 0x0E, 0x00, 0xA4, 0x20, 0x01, 0x00, 0xA4, 0x40,
+        0x00, 0xB0, 0x71, 0x0B, 0x03, 0x00, 0xA4, 0x40, 0x00, 0xB0, 0x71, 0x0B, 0x05, 0x00, 0xA4, 0x40,
+        0x00, 0xB0, 0x71, 0x0B, 0x0A, 0x00, 0xA4, 0x40, 0x00, 0xD8, 0xB8, 0x05, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+}
+
+impl Cfg41 {
+    /// Create CFG-0x41 response for specific drone model
+    pub fn for_model(model: crate::config::DroneModel) -> Self {
+        use crate::sec_sign::{PRIVATE_KEY_AIR3, PRIVATE_KEY_MAVIC4PRO};
+
+        let mut payload = cfg41_templates::TEMPLATE;
+
+        // Insert private key at offset 175
+        let key = match model {
+            crate::config::DroneModel::Air3 => &PRIVATE_KEY_AIR3,
+            crate::config::DroneModel::Mavic4Pro => &PRIVATE_KEY_MAVIC4PRO,
+        };
+        payload[cfg41_templates::PRIVATE_KEY_OFFSET..cfg41_templates::PRIVATE_KEY_OFFSET + 24]
+            .copy_from_slice(key);
+
+        Self { payload }
+    }
+}
+
+impl Default for Cfg41 {
+    fn default() -> Self {
+        Self::for_model(crate::config::DroneModel::Air3)
+    }
+}
+
+impl UbxMessage for Cfg41 {
+    fn class(&self) -> u8 { 0x06 }
+    fn id(&self) -> u8 { 0x41 }
+    fn payload_len(&self) -> u16 { 256 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[..256].copy_from_slice(&self.payload);
+        256
+    }
+}
+
+/// CFG-VALGET (0x06 0x8B) response - returns requested configuration values
+#[derive(Clone)]
+pub struct CfgValgetResponse {
+    /// Version (0x01)
+    pub version: u8,
+    /// Layer (0x00=RAM, 0x01=BBR, 0x02=Flash, 0x07=default)
+    pub layer: u8,
+    /// Key-value pairs (key_id, value)
+    pub values: heapless::Vec<(u32, u32), 8>,
+}
+
+impl Default for CfgValgetResponse {
+    fn default() -> Self {
+        Self {
+            version: 0x01,
+            layer: 0x04, // Default layer
+            values: heapless::Vec::new(),
+        }
+    }
+}
+
+/// Known CFG-VALGET keys and their default values
+pub mod valget_defaults {
+    /// CFG-UART1-BAUDRATE: 921600
+    pub const UART1_BAUDRATE: (u32, u32) = (0x40520001, 921600);
+    /// CFG-HW-RF_LNA_MODE (crystal frequency): 192 MHz
+    pub const XTAL_FREQ: (u32, u32) = (0x40A40001, 192_000_000);
+}
+
+impl CfgValgetResponse {
+    /// Create response for requested keys
+    pub fn for_keys(keys: &[u32]) -> Self {
+        let mut resp = Self::default();
+        for &key in keys {
+            let value = match key {
+                0x40520001 => valget_defaults::UART1_BAUDRATE.1,
+                0x40A40001 => valget_defaults::XTAL_FREQ.1,
+                _ => 0, // Unknown key - return 0
+            };
+            let _ = resp.values.push((key, value));
+        }
+        resp
+    }
+}
+
+impl UbxMessage for CfgValgetResponse {
+    fn class(&self) -> u8 { 0x06 }
+    fn id(&self) -> u8 { 0x8B }
+    fn payload_len(&self) -> u16 {
+        // Header: version(1) + layer(1) + position(2) = 4
+        // Each key-value: key(4) + value(4) = 8
+        4 + (self.values.len() as u16 * 8)
+    }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.version;
+        buf[1] = self.layer;
+        buf[2] = 0x00; // Position low
+        buf[3] = 0x00; // Position high
+
+        let mut offset = 4;
+        for &(key, value) in self.values.iter() {
+            buf[offset..offset + 4].copy_from_slice(&key.to_le_bytes());
+            buf[offset + 4..offset + 8].copy_from_slice(&value.to_le_bytes());
+            offset += 8;
+        }
+        offset
+    }
+}

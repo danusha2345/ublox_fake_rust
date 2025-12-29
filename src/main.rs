@@ -46,6 +46,10 @@ use ubx::{
     MonHw, MonRf, MonComms,
     // TIM and RXM messages
     TimTp, RxmRawx,
+    // DJI proprietary
+    Cfg41,
+    // CFG-VALGET response
+    CfgValgetResponse,
 };
 
 // Interrupt bindings
@@ -821,6 +825,12 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-PMS received");
             send_ack(0x06, 0x86); // ACK for CFG-PMS
         }
+        ubx::UbxCommand::CfgValget { keys } => {
+            info!("CFG-VALGET received for {} keys", keys.len());
+            let response = CfgValgetResponse::for_keys(&keys);
+            send_ubx_message(&response);
+            send_ack(0x06, 0x8B);
+        }
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
 
@@ -847,6 +857,14 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("SEC-UNIQID poll received, sending unique ID for {:?}", model);
             let uniqid = SecUniqid::for_model(model);
             send_ubx_message(&uniqid);
+        }
+        ubx::UbxCommand::Cfg41Poll => {
+            // DJI proprietary command - returns SEC-SIGN private key and configuration
+            let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+            info!("CFG-0x41 poll received, sending SEC-SIGN config for {:?}", model);
+            let cfg41 = Cfg41::for_model(model);
+            send_ubx_message(&cfg41);
+            send_ack(0x06, 0x41);
         }
         ubx::UbxCommand::Poll { class, id } => {
             info!("Unhandled poll: class=0x{:02X} id=0x{:02X}", class, id);
