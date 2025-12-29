@@ -39,8 +39,10 @@ pub mod timers {
     pub const LED_BLINK_MS: u64 = 500;
     /// First SEC-SIGN delay after start
     pub const SEC_SIGN_FIRST_MS: u64 = 3000;
-    /// SEC-SIGN interval
-    pub const SEC_SIGN_PERIOD_MS: u64 = 4000;
+    /// SEC-SIGN interval for DJI Air 3
+    pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;
+    /// SEC-SIGN interval for DJI Mavic 4 Pro
+    pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000;
     /// Delay after CFG-RST before message output starts (0 = immediate)
     pub const UART_TX_INIT_DELAY_MS: u64 = 0;
 }
@@ -66,7 +68,7 @@ impl Default for UbloxVersion {
 }
 
 /// Drone model for SEC-SIGN key selection
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, defmt::Format)]
 #[repr(u8)]
 pub enum DroneModel {
     Air3 = 0,

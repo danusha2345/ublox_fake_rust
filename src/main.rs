@@ -1014,6 +1014,7 @@ async fn mon_message_task() {
 
 /// SEC-SIGN timer task - requests signature at configured interval
 /// Only starts after message output begins (like C version)
+/// Period depends on drone model: Air3=4s, Mavic4Pro=2s
 #[embassy_executor::task]
 async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
@@ -1026,10 +1027,16 @@ async fn sec_sign_timer_task() {
     // First signature after initial delay
     Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
 
-    info!("SEC-SIGN timer task started");
+    // Select SEC-SIGN period based on drone model
+    let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+    let period_ms = match model {
+        DroneModel::Air3 => config::timers::SEC_SIGN_PERIOD_AIR3_MS,
+        DroneModel::Mavic4Pro => config::timers::SEC_SIGN_PERIOD_MAVIC4_MS,
+    };
+    info!("SEC-SIGN timer task started (period={}ms for {:?})", period_ms, model);
 
     // Then at configured interval
-    let mut ticker = Ticker::every(Duration::from_millis(config::timers::SEC_SIGN_PERIOD_MS));
+    let mut ticker = Ticker::every(Duration::from_millis(period_ms));
     loop {
         ticker.next().await;
 

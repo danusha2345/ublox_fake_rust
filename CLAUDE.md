@@ -131,10 +131,10 @@ Mode is persisted to flash and survives reboots. Button press toggles mode and r
 
 **Private keys** location: `src/sec_sign.rs`
 
-| Drone Model | Constant | Value |
-|-------------|----------|-------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | `0xeaa5c0111e18dbd1...` |
-| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | `0x9089a21814a62fc3...` |
+| Drone Model | Constant | SEC-SIGN Period |
+|-------------|----------|-----------------|
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 seconds |
+| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 seconds |
 
 Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro)
 
