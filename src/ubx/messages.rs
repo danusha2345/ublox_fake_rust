@@ -64,17 +64,17 @@ impl Default for NavPvt {
             h_msl: coordinates::alt_mm(),      // From config (approx)
             h_acc: 1435,
             v_acc: 2073,
-            vel_n: 0,
-            vel_e: 0,
-            vel_d: 0,
+            vel_n: -2,                         // From real GNSS
+            vel_e: 1,
+            vel_d: 1,
             g_speed: 0,
-            head_mot: 0,
+            head_mot: 0x00C78ADA_u32 as i32,   // From real GNSS
             s_acc: 8,
             head_acc: 0x00F0D89E,
             p_dop: 110,
             flags3: 0,
             reserved1: [0; 5],
-            head_veh: 0,
+            head_veh: 0x00234AE0_u32 as i32,   // From real GNSS
             mag_dec: 0,
             mag_acc: 0,
         }
