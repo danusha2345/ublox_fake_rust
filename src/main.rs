@@ -150,6 +150,9 @@ static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
 /// Timestamp when message output started (for 20s invalid satellites timer)
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
 
+/// Flag indicating satellites are invalid (for LED color change)
+static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
+
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
@@ -365,9 +368,16 @@ async fn led_task(
     loop {
         on = !on;
         let mode = OperatingMode::load();
+        let sats_invalid = SATELLITES_INVALID.load(Ordering::Acquire);
         let color = if on {
             match mode {
-                OperatingMode::Emulation => RGB8::new(0, 30, 0),   // Green
+                OperatingMode::Emulation => {
+                    if sats_invalid {
+                        RGB8::new(30, 20, 0)  // Yellow (satellites invalid)
+                    } else {
+                        RGB8::new(0, 30, 0)   // Green (satellites valid)
+                    }
+                }
                 OperatingMode::Passthrough => RGB8::new(0, 0, 30), // Blue
             }
         } else {
@@ -803,6 +813,8 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
                 MSG_OUTPUT_STARTED.store(true, Ordering::Release);
                 // Record start time for 20s invalid satellites timer
                 OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+                // Reset invalid satellites flag (LED goes back to green)
+                SATELLITES_INVALID.store(false, Ordering::Release);
             }
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
@@ -932,6 +944,9 @@ async fn nav_message_task() {
         let start_time = OUTPUT_START_MILLIS.load(Ordering::Acquire);
         let elapsed_ms = (now.as_millis() as u32).wrapping_sub(start_time);
         let satellites_invalid = elapsed_ms >= config::timers::SATELLITES_INVALID_AFTER_MS as u32;
+
+        // Update global flag for LED indication (Core1)
+        SATELLITES_INVALID.store(satellites_invalid, Ordering::Release);
 
         // Build and send enabled NAV messages using send_msg! macro
         let mut buf = [0u8; 256];
@@ -1162,6 +1177,7 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
             // Reset 20s timer when switching TO emulation mode
             if new_mode == OperatingMode::Emulation {
                 OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+                SATELLITES_INVALID.store(false, Ordering::Release);
                 info!("Reset satellite validity timer");
             }
 
