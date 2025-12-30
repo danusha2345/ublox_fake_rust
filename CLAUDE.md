@@ -99,7 +99,25 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 - **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green)
 - **Passthrough**: Forwards data from real GNSS module via PIO (LED blue)
 
-Mode is persisted to flash and survives reboots. Button press toggles mode and reboots.
+Mode is persisted to flash and survives reboots. Button press toggles mode (hot-switch, no reboot).
+
+### 20-Second Invalid Satellites Timer
+
+After 20 seconds from emulation start, satellites become invalid to simulate signal loss:
+
+| Message | Invalid State |
+|---------|---------------|
+| NAV-PVT | fix_type=0, flags=0, num_sv=1 |
+| NAV-STATUS | gps_fix=0, flags=0 |
+| NAV-SOL | gps_fix=0, num_sv=1 |
+| NAV-SAT | 1 satellite, cno=8 dBHz, not used |
+| NAV-SVINFO | 1 satellite, low quality |
+
+Timer resets on:
+- CFG-RST command from drone
+- Mode switch from Passthrough → Emulation
+
+Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow safety.
 
 ### Passthrough Implementation
 - Uses PIO1 state machine 0 for signal copying
