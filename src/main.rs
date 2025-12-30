@@ -1158,6 +1158,12 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
             new_mode.store();
             info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
 
+            // Reset 20s timer when switching TO emulation mode
+            if new_mode == OperatingMode::Emulation {
+                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+                info!("Reset satellite validity timer");
+            }
+
             // Save to flash for persistence across power cycles
             {
                 let mut flash = flash_mutex.lock().await;
