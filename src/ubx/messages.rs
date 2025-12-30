@@ -1,6 +1,7 @@
 //! UBX message definitions
 
 use super::UbxMessage;
+use crate::coordinates;
 
 /// UBX-NAV-PVT message (Position Velocity Time)
 #[derive(Clone)]
@@ -42,39 +43,38 @@ pub struct NavPvt {
 
 impl Default for NavPvt {
     fn default() -> Self {
-        // Values copied exactly from C version (massivs.h UBX_NAV_PVT)
         Self {
             itow: 0,
             year: 2025,
             month: 1,
-            day: 12,             // C: 0x0C
-            hour: 12,            // C: 0x0C
-            min: 43,             // C: 0x2B
-            sec: 2,              // C: 0x02
-            valid: 0x37,         // C: 0x37
-            t_acc: 6,            // C: 0x00000006
-            nano: 0x11DE89FD_u32 as i32,  // C: from real GNSS
-            fix_type: 3,         // C: 0x03
-            flags: 0x01,         // C: 0x01
-            flags2: 0x0E,        // C: 0x0E
-            num_sv: 18,          // C: 0x12
-            lon: -801919471,     // C: 0xD03BAA11 (real GNSS coordinates)
-            lat: 257889186,      // C: 0x0F5E13A2
-            height: 73449,       // C: 0x00011EE9
-            h_msl: 100902,       // C: 0x00018626
-            h_acc: 1435,         // C: 0x0000059B
-            v_acc: 2073,         // C: 0x00000819
-            vel_n: -2,           // C: 0xFFFFFFFE
-            vel_e: 1,            // C: 0x00000001
-            vel_d: 1,            // C: 0x00000001
-            g_speed: 0,          // C: 0x00000000
-            head_mot: 0x00C78ADA_u32 as i32,  // C: from real GNSS
-            s_acc: 8,            // C: 0x00000008
-            head_acc: 0x00F0D89E,  // C: from real GNSS
-            p_dop: 110,          // C: 0x006E
+            day: 12,
+            hour: 12,
+            min: 43,
+            sec: 2,
+            valid: 0x37,
+            t_acc: 6,
+            nano: 0x11DE89FD_u32 as i32,
+            fix_type: 3,
+            flags: 0x01,
+            flags2: 0x0E,
+            num_sv: 18,
+            lon: coordinates::lon_1e7(),       // From config
+            lat: coordinates::lat_1e7(),       // From config
+            height: coordinates::alt_mm(),     // From config
+            h_msl: coordinates::alt_mm(),      // From config (approx)
+            h_acc: 1435,
+            v_acc: 2073,
+            vel_n: 0,
+            vel_e: 0,
+            vel_d: 0,
+            g_speed: 0,
+            head_mot: 0,
+            s_acc: 8,
+            head_acc: 0x00F0D89E,
+            p_dop: 110,
             flags3: 0,
             reserved1: [0; 5],
-            head_veh: 0x00234AE0_u32 as i32,  // C: from real GNSS
+            head_veh: 0,
             mag_dec: 0,
             mag_acc: 0,
         }
@@ -151,13 +151,12 @@ pub struct NavPosecef {
 
 impl Default for NavPosecef {
     fn default() -> Self {
-        // Values from C version (massivs.h UBX_NAV_POSECEF)
         Self {
             itow: 0,
-            ecef_x: 0x05DDB07B_u32 as i32,  // 98230395 cm
-            ecef_y: 0xDE407016_u32 as i32,  // -565854186 cm
-            ecef_z: 0x106F7693_u32 as i32,  // 276297363 cm
-            p_acc: 252,                      // C: 0x000000FC
+            ecef_x: coordinates::ecef_x_cm(),  // From config
+            ecef_y: coordinates::ecef_y_cm(),  // From config
+            ecef_z: coordinates::ecef_z_cm(),  // From config
+            p_acc: 252,
         }
     }
 }
@@ -191,15 +190,14 @@ pub struct NavPosllh {
 
 impl Default for NavPosllh {
     fn default() -> Self {
-        // Values from C version (massivs.h UBX_NAV_POSLLH)
         Self {
             itow: 0,
-            lon: 0xD03BAA11_u32 as i32,   // -801919471 (deg * 1e-7)
-            lat: 0x0F5E13A2_u32 as i32,   // 257889186 (deg * 1e-7)
-            height: 73449,                 // C: 0x00011EE9 mm
-            h_msl: 100902,                 // C: 0x00018626 mm
-            h_acc: 1435,                   // C: 0x0000059B mm
-            v_acc: 2073,                   // C: 0x00000819 mm
+            lon: coordinates::lon_1e7(),    // From config
+            lat: coordinates::lat_1e7(),    // From config
+            height: coordinates::alt_mm(),  // From config
+            h_msl: coordinates::alt_mm(),   // From config (approx)
+            h_acc: 1435,
+            v_acc: 2073,
         }
     }
 }
@@ -351,22 +349,21 @@ pub struct NavSol {
 
 impl Default for NavSol {
     fn default() -> Self {
-        // ECEF coordinates from C version (same as NAV-POSECEF)
         Self {
             itow: 0,
             f_tow: 0,
-            week: 2349,                          // GPS week (0x092D)
-            gps_fix: 3,                          // 3D fix
-            flags: 0x0F,                         // GPSfixOK + DiffSoln + WKNSET + TOWSET
-            ecef_x: 0x05DDB07B_u32 as i32,       // 98230395 cm
-            ecef_y: 0xDE407016_u32 as i32,       // -565854186 cm
-            ecef_z: 0x106F7693_u32 as i32,       // 276297363 cm
-            p_acc: 252,                          // C: 0x000000FC cm
+            week: 2349,
+            gps_fix: 3,
+            flags: 0x0F,
+            ecef_x: coordinates::ecef_x_cm(),  // From config
+            ecef_y: coordinates::ecef_y_cm(),  // From config
+            ecef_z: coordinates::ecef_z_cm(),  // From config
+            p_acc: 252,
             ecef_vx: 0,
             ecef_vy: 0,
             ecef_vz: 0,
-            s_acc: 100,                          // 1 m/s (0x64)
-            p_dop: 110,                          // 1.10 (0x6E)
+            s_acc: 100,
+            p_dop: 110,
             reserved1: 0,
             num_sv: 18,
             reserved2: 0,
@@ -1031,19 +1028,18 @@ pub struct NavHpposecef {
 
 impl Default for NavHpposecef {
     fn default() -> Self {
-        // Values from C version (massivs.h UBX_NAV_HPPOSECEF)
         Self {
             version: 0,
             reserved1: [0; 3],
             itow: 0,
-            ecef_x: 0x05DDB07B_u32 as i32,  // 98230395 cm
-            ecef_y: 0xDE407016_u32 as i32,  // -565854186 cm
-            ecef_z: 0x106F7693_u32 as i32,  // 276297363 cm
+            ecef_x: coordinates::ecef_x_cm(),  // From config
+            ecef_y: coordinates::ecef_y_cm(),  // From config
+            ecef_z: coordinates::ecef_z_cm(),  // From config
             ecef_x_hp: 0,
             ecef_y_hp: 0,
             ecef_z_hp: 0,
             flags: 0,
-            p_acc: 252,                      // C: 0x000000FC (0.1mm units)
+            p_acc: 252,
         }
     }
 }

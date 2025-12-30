@@ -51,9 +51,9 @@ pub mod timers {
 
 /// Default coordinates (configurable)
 pub mod default_position {
-    pub const LATITUDE: f64 = 55.761199;
-    pub const LONGITUDE: f64 = 37.618423;
-    pub const ALTITUDE_M: i32 = 156;
+    pub const LATITUDE: f64 = 25.7889186;
+    pub const LONGITUDE: f64 = -80.1919471;
+    pub const ALTITUDE_M: i32 = 101;
 }
 
 /// UBX protocol version emulation

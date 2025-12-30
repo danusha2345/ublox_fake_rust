@@ -49,6 +49,9 @@ smart-leds = "0.4"
 # Async IO traits (must match embassy-rp version)
 embedded-io-async = "0.6"
 
+# Math functions for coordinate conversion (no_std)
+libm = "0.2"
+
 # Direct register access for baudrate change
 rp-pac = { version = "7", features = ["rp235x"] }
 

@@ -10,7 +10,6 @@
 #![no_main]
 
 mod config;
-mod coordinates;
 mod flash_storage;
 mod led;
 mod sec_sign;
@@ -47,10 +46,6 @@ use ubx::{
     MonHw, MonRf, MonComms,
     // TIM and RXM messages
     TimTp, RxmRawx,
-    // DJI proprietary
-    Cfg41,
-    // CFG-VALGET response
-    CfgValgetResponse,
 };
 
 // Interrupt bindings
@@ -148,12 +143,6 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
 static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
 
-/// Timestamp when message output started (for 20s invalid satellites timer)
-static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
-
-/// Flag indicating satellites are invalid (for LED color change)
-static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
-
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
@@ -202,9 +191,6 @@ impl Default for OperatingMode {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-
-    // Initialize coordinate conversion (LLH -> ECEF) from config
-    coordinates::init();
 
     // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
     {
@@ -258,7 +244,7 @@ async fn main(spawner: Spawner) {
     let _btn_pwr = Output::new(p.PIN_6, Level::High);
     let btn_input = Input::new(p.PIN_7, Pull::Down);
 
-    // Spawn Core1 for LED and SEC-SIGN computation
+    // Spawn Core1 for SEC-SIGN computation only
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -266,11 +252,13 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, dma_ch1, pin_25));
                 spawner.must_spawn(sec_sign_compute_task());
             });
         },
     );
+
+    // LED task on Core0 (test - moved from Core1)
+    spawner.must_spawn(led_task(pio0, dma_ch1, pin_25));
 
     // ========================================================================
     // UART0: Communication with drone/host (TX=GPIO0, RX=GPIO1)
@@ -351,43 +339,20 @@ async fn main(spawner: Spawner) {
 // Core1 Tasks
 // ============================================================================
 
-/// LED control task - WS2812B on PIO (runs on Core1)
+/// LED control task - WS2812B on PIO
 /// GPIO25 on RP2350-Core-A
-/// Green = Emulation mode, Blue = Passthrough mode
 #[embassy_executor::task]
 async fn led_task(
-    mut pio: Pio<'static, PIO0>,
-    dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
+    _pio: Pio<'static, PIO0>,
+    _dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
     pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
 ) {
-    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
-    use smart_leds::RGB8;
-
-    let program = PioWs2812Program::new(&mut pio.common);
-    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio.common, pio.sm0, dma, pin, &program);
-
-    let mut ticker = Ticker::every(Duration::from_millis(500));
-    let mut on = false;
+    // TEST: Simple GPIO blink to verify pin works
+    let mut led_pin = Output::new(pin, Level::Low);
+    let mut ticker = Ticker::every(Duration::from_millis(200));
 
     loop {
-        on = !on;
-        let mode = OperatingMode::load();
-        let sats_invalid = SATELLITES_INVALID.load(Ordering::Acquire);
-        let color = if on {
-            match mode {
-                OperatingMode::Emulation => {
-                    if sats_invalid {
-                        RGB8::new(30, 20, 0)  // Yellow (satellites invalid)
-                    } else {
-                        RGB8::new(0, 30, 0)   // Green (satellites valid)
-                    }
-                }
-                OperatingMode::Passthrough => RGB8::new(0, 0, 30), // Blue
-            }
-        } else {
-            RGB8::new(0, 0, 0) // Off
-        };
-        let _ = ws.write(&[color]).await;
+        led_pin.toggle();
         ticker.next().await;
     }
 }
@@ -815,10 +780,6 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             if *reset_mode != 0x08 {
                 info!("CFG-RST - starting message output");
                 MSG_OUTPUT_STARTED.store(true, Ordering::Release);
-                // Record start time for 20s invalid satellites timer
-                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
-                // Reset invalid satellites flag (LED goes back to green)
-                SATELLITES_INVALID.store(false, Ordering::Release);
             }
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
@@ -846,12 +807,6 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-PMS received");
             send_ack(0x06, 0x86); // ACK for CFG-PMS
         }
-        ubx::UbxCommand::CfgValget { keys } => {
-            info!("CFG-VALGET received for {} keys", keys.len());
-            let response = CfgValgetResponse::for_keys(&keys);
-            send_ubx_message(&response);
-            send_ack(0x06, 0x8B);
-        }
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
 
@@ -874,18 +829,9 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&ver);
         }
         ubx::UbxCommand::SecUniqidPoll => {
-            let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
-            info!("SEC-UNIQID poll received, sending unique ID for {:?}", model);
-            let uniqid = SecUniqid::for_model(model);
+            info!("SEC-UNIQID poll received, sending unique ID");
+            let uniqid = SecUniqid::default();
             send_ubx_message(&uniqid);
-        }
-        ubx::UbxCommand::Cfg41Poll => {
-            // DJI proprietary command - returns SEC-SIGN private key and configuration
-            let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
-            info!("CFG-0x41 poll received, sending SEC-SIGN config for {:?}", model);
-            let cfg41 = Cfg41::for_model(model);
-            send_ubx_message(&cfg41);
-            send_ack(0x06, 0x41);
         }
         ubx::UbxCommand::Poll { class, id } => {
             info!("Unhandled poll: class=0x{:02X} id=0x{:02X}", class, id);
@@ -943,41 +889,11 @@ async fn nav_message_task() {
         let min = ((total_secs / 60) % 60) as u8;
         let hour = ((total_secs / 3600) % 24) as u8;
 
-        // Check if 20 seconds have passed since output started (satellites become invalid)
-        // Using wrapping_sub to handle u32 overflow correctly (~49 days)
-        let start_time = OUTPUT_START_MILLIS.load(Ordering::Acquire);
-        let elapsed_ms = (now.as_millis() as u32).wrapping_sub(start_time);
-        let satellites_invalid = elapsed_ms >= config::timers::SATELLITES_INVALID_AFTER_MS as u32;
-
-        // Update global flag for LED indication (Core1)
-        SATELLITES_INVALID.store(satellites_invalid, Ordering::Release);
-
         // Build and send enabled NAV messages using send_msg! macro
         let mut buf = [0u8; 256];
 
-        // Helper macro for sending message with UbxMessage trait
-        macro_rules! send_ubx {
-            ($flag:expr, $msg:expr) => {
-                if $flag {
-                    let msg = $msg;
-                    let len = msg.build(&mut buf);
-                    if len > 0 {
-                        let mut vec = heapless::Vec::<u8, 256>::new();
-                        let _ = vec.extend_from_slice(&buf[..len]);
-                        if TX_CHANNEL.try_send(vec).is_err() {
-                            warn!("TX channel full");
-                        }
-                    }
-                }
-            };
-        }
-
-        // NAV-PVT (0x01 0x07) - with fix status
-        if satellites_invalid {
-            send_ubx!(flags.nav_pvt, NavPvt::invalid(itow, hour, min, sec));
-        } else {
-            send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
-        }
+        // NAV-PVT (0x01 0x07)
+        send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
 
         // NAV-POSECEF (0x01 0x01) - uses Default ECEF from C version
         send_msg!(buf, flags.nav_posecef, NavPosecef, { itow: itow });
@@ -985,22 +901,14 @@ async fn nav_message_task() {
         // NAV-POSLLH (0x01 0x02) - uses Default LLH from C version
         send_msg!(buf, flags.nav_posllh, NavPosllh, { itow: itow });
 
-        // NAV-STATUS (0x01 0x03) - with fix status
-        if satellites_invalid {
-            send_ubx!(flags.nav_status, NavStatus::invalid(itow, itow));
-        } else {
-            send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
-        }
+        // NAV-STATUS (0x01 0x03)
+        send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
 
         // NAV-DOP (0x01 0x04)
         send_msg!(buf, flags.nav_dop, NavDop, { itow: itow });
 
-        // NAV-SOL (0x01 0x06) - legacy but important for many FCs, with fix status
-        if satellites_invalid {
-            send_ubx!(flags.nav_sol, NavSol::invalid(itow));
-        } else {
-            send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
-        }
+        // NAV-SOL (0x01 0x06) - legacy but important for many FCs
+        send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
 
         // NAV-VELECEF (0x01 0x11)
         send_msg!(buf, flags.nav_velecef, NavVelecef, { itow: itow });
@@ -1023,19 +931,11 @@ async fn nav_message_task() {
         // NAV-TIMELS (0x01 0x26)
         send_msg!(buf, flags.nav_timels, NavTimels, { itow: itow });
 
-        // NAV-SVINFO (0x01 0x30) - legacy format, with satellite info
-        if satellites_invalid {
-            send_ubx!(flags.nav_svinfo, NavSvinfo::invalid(itow));
-        } else {
-            send_msg!(buf, flags.nav_svinfo, NavSvinfo, { itow: itow });
-        }
+        // NAV-SVINFO (0x01 0x30) - legacy format
+        send_msg!(buf, flags.nav_svinfo, NavSvinfo, { itow: itow });
 
-        // NAV-SAT (0x01 0x35) - M10 format, with satellite info
-        if satellites_invalid {
-            send_ubx!(flags.nav_sat, NavSat::invalid(itow));
-        } else {
-            send_msg!(buf, flags.nav_sat, NavSat, { itow: itow });
-        }
+        // NAV-SAT (0x01 0x35) - M10 format
+        send_msg!(buf, flags.nav_sat, NavSat, { itow: itow });
 
         // NAV-COV (0x01 0x36)
         send_msg!(buf, flags.nav_cov, NavCov, { itow: itow });
@@ -1100,7 +1000,6 @@ async fn mon_message_task() {
 
 /// SEC-SIGN timer task - requests signature at configured interval
 /// Only starts after message output begins (like C version)
-/// Period depends on drone model: Air3=4s, Mavic4Pro=2s
 #[embassy_executor::task]
 async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
@@ -1113,16 +1012,10 @@ async fn sec_sign_timer_task() {
     // First signature after initial delay
     Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
 
-    // Select SEC-SIGN period based on drone model
-    let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
-    let period_ms = match model {
-        DroneModel::Air3 => config::timers::SEC_SIGN_PERIOD_AIR3_MS,
-        DroneModel::Mavic4Pro => config::timers::SEC_SIGN_PERIOD_MAVIC4_MS,
-    };
-    info!("SEC-SIGN timer task started (period={}ms for {:?})", period_ms, model);
+    info!("SEC-SIGN timer task started");
 
     // Then at configured interval
-    let mut ticker = Ticker::every(Duration::from_millis(period_ms));
+    let mut ticker = Ticker::every(Duration::from_millis(config::timers::SEC_SIGN_PERIOD_MS));
     loop {
         ticker.next().await;
 
@@ -1177,13 +1070,6 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
             // Hot-switch: just change MODE atomically
             new_mode.store();
             info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
-
-            // Reset 20s timer when switching TO emulation mode
-            if new_mode == OperatingMode::Emulation {
-                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
-                SATELLITES_INVALID.store(false, Ordering::Release);
-                info!("Reset satellite validity timer");
-            }
 
             // Save to flash for persistence across power cycles
             {
