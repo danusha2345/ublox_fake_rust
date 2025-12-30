@@ -245,11 +245,20 @@ cargo run --release
 
 Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro)
 
-### CFG-0x41 (DJI Proprietary)
+### CFG-0x41 (OTP / DJI Proprietary)
 
-Проприетарная DJI команда для получения конфигурации SEC-SIGN и приватного ключа.
+CFG-0x41 — это команда u-blox для **OTP (One-Time Programmable)** конфигурации M10 модулей.
+DJI расширил этот формат для хранения SEC-SIGN ключей и ROM патчей.
 
-**Формат**: UBX poll запрос (0x06, 0x41) с нулевым payload возвращает 256-байтный ответ.
+**Стандартный u-blox OTP формат**:
+```
+B5 62 06 41 [len] 04 01 A4 [size] [hash:4] 28 EF 12 05 [config_data] [checksum]
+```
+- `04 01 A4` — OTP header
+- `28 EF 12 05` — константа во всех OTP сообщениях
+- Источник: https://github.com/cturvey/RandomNinjaChef/tree/main/uBloxM10OTPCodes
+
+**DJI расширение**: Poll запрос (0x06, 0x41) с нулевым payload возвращает 256-байтный ответ.
 
 **Детальная структура ответа (256 байт)**:
 

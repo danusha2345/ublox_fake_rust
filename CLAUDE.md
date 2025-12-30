@@ -183,11 +183,20 @@ Critical synchronization points:
 - SEC-UNIQID (0x27, 0x03) - IS included in hash
 - TIM-TP, RXM-RAWX
 
-## CFG-0x41 (DJI Proprietary)
+## CFG-0x41 (OTP Configuration / DJI Proprietary)
 
-Proprietary DJI command to retrieve SEC-SIGN configuration and private key from GNSS module.
+CFG-0x41 is u-blox's **OTP (One-Time Programmable)** configuration command for M10 modules.
+DJI extended this format for SEC-SIGN private key storage and ROM patches.
 
-**Usage**: Send UBX poll (0x06, 0x41) with zero-length payload to receive 256-byte response.
+**Standard u-blox OTP format**:
+```
+B5 62 06 41 [len] 04 01 A4 [size] [hash:4] 28 EF 12 05 [config_data] [checksum]
+```
+- `04 01 A4` — OTP header
+- `28 EF 12 05` — constant marker in all OTP messages
+- Source: https://github.com/cturvey/RandomNinjaChef/tree/main/uBloxM10OTPCodes
+
+**DJI extension**: Poll (0x06, 0x41) with zero-length payload returns 256-byte response with SEC-SIGN config.
 
 **Payload structure (256 bytes) - detailed breakdown**:
 
