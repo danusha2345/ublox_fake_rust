@@ -928,8 +928,9 @@ async fn nav_message_task() {
         let hour = ((total_secs / 3600) % 24) as u8;
 
         // Check if 20 seconds have passed since output started (satellites become invalid)
+        // Using wrapping_sub to handle u32 overflow correctly (~49 days)
         let start_time = OUTPUT_START_MILLIS.load(Ordering::Acquire);
-        let elapsed_ms = (now.as_millis() as u32).saturating_sub(start_time);
+        let elapsed_ms = (now.as_millis() as u32).wrapping_sub(start_time);
         let satellites_invalid = elapsed_ms >= config::timers::SATELLITES_INVALID_AFTER_MS as u32;
 
         // Build and send enabled NAV messages using send_msg! macro
