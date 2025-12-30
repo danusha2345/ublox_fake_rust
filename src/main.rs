@@ -108,7 +108,8 @@ macro_rules! send_msg {
 // ============================================================================
 
 /// Channel for outgoing UBX messages (serialized, ready to send)
-static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 16> = Channel::new();
+/// Capacity 32 provides buffer for SEC-SIGN computation delays
+static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 32> = Channel::new();
 
 /// Channel for data from external GNSS (UART1 RX -> passthrough TX)
 static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 8> = Channel::new();
@@ -132,6 +133,9 @@ static SEC_SIGN_RESULT: Signal<CriticalSectionRawMutex, SecSignResult> = Signal:
 /// SEC-SIGN computation in progress - pause TX to avoid race condition
 /// When true: NAV/MON tasks skip sending, uart_tx_task waits for result
 static SEC_SIGN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Signal when SEC-SIGN computation completes (replaces busy-wait yield_now loop)
+static SEC_SIGN_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -258,7 +262,8 @@ async fn main(spawner: Spawner) {
     let _btn_pwr = Output::new(p.PIN_6, Level::High);
     let btn_input = Input::new(p.PIN_7, Pull::Down);
 
-    // Spawn Core1 for LED and SEC-SIGN computation
+    // Spawn Core1 for LED, SEC-SIGN computation, and MON messages
+    // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -268,6 +273,7 @@ async fn main(spawner: Spawner) {
             executor1.run(|spawner: embassy_executor::Spawner| {
                 spawner.must_spawn(led_task(pio0, dma_ch1, pin_25));
                 spawner.must_spawn(sec_sign_compute_task());
+                spawner.must_spawn(mon_message_task());
             });
         },
     );
@@ -332,8 +338,8 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(uart1_rx_task(uart1_rx));
 
     // Emulation tasks (check MODE internally, skip work in passthrough)
+    // Note: mon_message_task runs on Core1 for load balancing
     spawner.must_spawn(nav_message_task());
-    spawner.must_spawn(mon_message_task());
     spawner.must_spawn(sec_sign_timer_task());
 
     // Button task for mode switching (no reboot!)
@@ -474,7 +480,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
                             info!("SEC-SIGN sent ({} packets)", result.packet_count);
                         }
+                        // Clear flag and wake waiting tasks (NAV/MON)
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                        SEC_SIGN_DONE.signal(());
                     }
                     Either3::Second(msg) => {
                         // Regular emulation message
@@ -898,8 +906,11 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
 
 /// NAV message task - sends navigation messages at configurable rate
 /// Only starts after receiving first CFG-MSG command + 1 second delay
+/// Uses Timer::at() for precise timing without drift
 #[embassy_executor::task]
 async fn nav_message_task() {
+    use embassy_time::Instant;
+
     info!("NAV message task waiting for CFG-RST...");
 
     // Wait for CFG-RST with reset_mode=0x09
@@ -911,22 +922,29 @@ async fn nav_message_task() {
     Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
     info!("NAV message output started");
 
+    // Use absolute timestamps to prevent timing drift
+    // Timer::after() would cause drift because it waits AFTER processing completes
+    let mut next_tick = Instant::now();
+
     loop {
         // Calculate effective period = meas_period * nav_rate
         let meas_period = NAV_MEAS_PERIOD_MS.load(Ordering::Acquire);
         let nav_rate = NAV_RATE.load(Ordering::Acquire);
         let effective_period = meas_period * nav_rate;
-        Timer::after(Duration::from_millis(effective_period as u64)).await;
+
+        // Schedule next tick at absolute time (no drift accumulation)
+        next_tick += Duration::from_millis(effective_period as u64);
+        Timer::at(next_tick).await;
 
         let mode = OperatingMode::load();
         if mode != OperatingMode::Emulation {
             continue;
         }
 
-        // Wait for SEC-SIGN computation to complete (like C version's busy-wait)
-        // This prevents packet drops while ensuring SEC-SIGN is sent first
-        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            embassy_futures::yield_now().await;
+        // Wait for SEC-SIGN computation to complete using async Signal
+        // This is more efficient than busy-wait yield_now loop
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            SEC_SIGN_DONE.wait().await;
         }
 
         // Get current message flags
@@ -1075,10 +1093,10 @@ async fn mon_message_task() {
             continue;
         }
 
-        // Wait for SEC-SIGN computation to complete (like C version's busy-wait)
-        // This prevents packet drops while ensuring SEC-SIGN is sent first
-        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            embassy_futures::yield_now().await;
+        // Wait for SEC-SIGN computation to complete using async Signal
+        // This is more efficient than busy-wait yield_now loop
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            SEC_SIGN_DONE.wait().await;
         }
 
         // Get current message flags
