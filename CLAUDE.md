@@ -63,19 +63,19 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 ## Architecture
 
 ### Dual-core async design (Embassy)
-- **Core0**: Embassy executor - UART TX/RX, NAV/MON message generation, button handling
-- **Core1**: Embassy executor - LED control (PIO), SEC-SIGN ECDSA computation
+- **Core0**: Embassy executor - UART TX/RX, NAV message generation, button handling
+- **Core1**: Embassy executor - LED control (PIO), SEC-SIGN ECDSA, MON messages
 - Inter-core communication via `Signal` and `Channel` from `embassy-sync`
 - Mode state shared via `AtomicU8` with `Acquire/Release` ordering
+- TX_CHANNEL capacity: 32 messages (buffer for SEC-SIGN computation delays)
 
 ### Core0 Tasks (src/main.rs)
 | Task | Rate | Purpose |
 |------|------|---------|
-| `uart_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates for SEC-SIGN |
+| `uart_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates SHA256 for SEC-SIGN |
 | `uart_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
-| `nav_message_task` | 200ms (5Hz) | Sends NAV-PVT, NAV-STATUS, NAV-DOP, NAV-EOE |
-| `mon_message_task` | 1s | Sends MON-* messages (TODO: implement message structs) |
-| `sec_sign_timer_task` | 4s | Requests SEC-SIGN from Core1 |
+| `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (uses Timer::at for drift-free timing) |
+| `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1, waits via SEC_SIGN_DONE Signal |
 | `button_task` | async | Mode toggle on GPIO button press |
 
 ### Core1 Tasks
@@ -83,6 +83,7 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 |------|------|---------|
 | `led_task` | 500ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough) |
 | `sec_sign_compute_task` | async | ECDSA signature computation (CPU intensive) |
+| `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS |
 
 ### Module Structure
 - `src/ubx/` - UBX protocol implementation

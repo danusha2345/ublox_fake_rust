@@ -79,24 +79,23 @@ cargo run --release
 │           CORE 0              │            CORE 1               │
 │      (Embassy Executor)       │       (Embassy Executor)        │
 ├───────────────────────────────┼─────────────────────────────────┤
-│  uart0_tx_task                │  led_task                       │
+│  uart0_tx_task                │  led_task (500ms)               │
 │    └─ TX_CHANNEL → UART0 TX   │    └─ WS2812B управление        │
-│    └─ SEC_SIGN_RESULT обрабо. │                                 │
-│                               │  sec_sign_compute_task          │
-│  uart0_rx_task                │    └─ ECDSA P-192 подпись       │
-│    └─ UBX парсер              │    └─ SHA256 вычисления         │
-│    └─ CFG команды             │                                 │
+│    └─ SHA256 накопление       │                                 │
+│    └─ SEC_SIGN_RESULT обрабо. │  sec_sign_compute_task          │
+│                               │    └─ ECDSA P-192 подпись       │
+│  uart0_rx_task                │                                 │
+│    └─ UBX парсер              │  mon_message_task (1Hz)         │
+│    └─ CFG команды             │    └─ MON-HW, RF, COMMS         │
 │                               │                                 │
 │  uart1_rx_task                │                                 │
 │    └─ Внешний GNSS вход       │                                 │
 │                               │                                 │
 │  nav_message_task (5Hz)       │                                 │
 │    └─ NAV-PVT, STATUS, DOP... │                                 │
+│    └─ Timer::at (без дрейфа)  │                                 │
 │                               │                                 │
-│  mon_message_task (1Hz)       │                                 │
-│    └─ MON-HW, RF, COMMS       │                                 │
-│                               │                                 │
-│  sec_sign_timer_task (4s)     │                                 │
+│  sec_sign_timer_task (2-4s)   │                                 │
 │    └─ Запрос SEC-SIGN         │                                 │
 │                               │                                 │
 │  button_task                  │                                 │
@@ -108,24 +107,25 @@ cargo run --release
 
 | Канал/Сигнал | Направление | Назначение |
 |--------------|-------------|------------|
-| `TX_CHANNEL` | Tasks → uart0_tx | Очередь UBX сообщений для отправки |
+| `TX_CHANNEL` (32 msg) | Tasks → uart0_tx | Очередь UBX сообщений для отправки |
 | `GNSS_RX_CHANNEL` | uart1_rx → uart0_tx | Данные от внешнего GNSS (passthrough) |
 | `SEC_SIGN_REQUEST` | Core0 → Core1 | Запрос вычисления подписи |
 | `SEC_SIGN_RESULT` | Core1 → Core0 | Результат вычисления (r, s) |
 | `SEC_SIGN_IN_PROGRESS` | Атомик | Пауза TX во время вычисления |
+| `SEC_SIGN_DONE` | Signal | Уведомление о завершении SEC-SIGN |
 | `MODE` | Атомик | Текущий режим работы |
 
 ### Поток данных SEC-SIGN
 
 ```
-1. nav_message_task/mon_message_task
+1. nav_message_task (Core0) / mon_message_task (Core1)
    └─→ TX_CHANNEL (сериализованные UBX)
 
-2. uart0_tx_task
+2. uart0_tx_task (Core0)
    ├─→ UART0 TX (отправка)
    └─→ SecSignAccumulator.accumulate() (SHA256)
 
-3. sec_sign_timer_task (каждые 4 сек)
+3. sec_sign_timer_task (каждые 2-4 сек)
    ├─ SEC_SIGN_IN_PROGRESS = true (пауза TX)
    ├─ Захват SHA256 хэша + msg_count
    └─→ SEC_SIGN_REQUEST (→ Core1)
@@ -137,9 +137,10 @@ cargo run --release
    ├─ s = k^(-1) * (z + r * d) mod n
    └─→ SEC_SIGN_RESULT (→ Core0)
 
-5. uart0_tx_task
+5. uart0_tx_task (Core0)
    ├─ Отправка SEC-SIGN (r, s, hash, msg_cnt)
-   └─ SEC_SIGN_IN_PROGRESS = false (возобновление TX)
+   ├─ SEC_SIGN_IN_PROGRESS = false
+   └─ SEC_SIGN_DONE.signal() (разблокирует NAV/MON)
 ```
 
 ## Режимы работы
