@@ -81,7 +81,7 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 ### Core1 Tasks
 | Task | Rate | Purpose |
 |------|------|---------|
-| `led_task` | 500ms | WS2812 LED blinking (green=emulation, blue=passthrough) |
+| `led_task` | 500ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough) |
 | `sec_sign_compute_task` | async | ECDSA signature computation (CPU intensive) |
 
 ### Module Structure
@@ -96,7 +96,7 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 - `src/flash_storage.rs` - Flash persistence for operating mode
 
 ### Operating Modes
-- **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green)
+- **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green→yellow)
 - **Passthrough**: Forwards data from real GNSS module via PIO (LED blue)
 
 Mode is persisted to flash and survives reboots. Button press toggles mode (hot-switch, no reboot).

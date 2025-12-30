@@ -49,7 +49,7 @@ pub mod timers {
     pub const SATELLITES_INVALID_AFTER_MS: u64 = 20_000;
 }
 
-/// Default coordinates (Moscow, Red Square)
+/// Default coordinates (configurable)
 pub mod default_position {
     pub const LATITUDE: f64 = 55.761199;
     pub const LONGITUDE: f64 = 37.618423;
