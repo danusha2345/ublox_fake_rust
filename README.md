@@ -343,11 +343,15 @@ pub const MON_PERIOD_MS: u64 = 1000;      // 1Hz
 pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;   // Air 3: каждые 4 сек
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
 
-// Координаты по умолчанию (настраиваемые)
-pub const LATITUDE: f64 = 55.761199;
-pub const LONGITUDE: f64 = 37.618423;
-pub const ALTITUDE_M: i32 = 156;
+// Координаты по умолчанию (автоматически конвертируются в ECEF)
+pub const LATITUDE: f64 = 25.7889186;
+pub const LONGITUDE: f64 = -80.1919471;
+pub const ALTITUDE_M: i32 = 101;
 ```
+
+При изменении координат в `config.rs` автоматически обновляются все NAV сообщения:
+- NAV-PVT, NAV-POSLLH — lat, lon, height
+- NAV-POSECEF, NAV-SOL, NAV-HPPOSECEF — ECEF координаты (конвертация WGS84)
 
 ### Динамическая конфигурация (runtime)
 
@@ -368,6 +372,7 @@ ublox_fake_rust/
 └── src/
     ├── main.rs             # Точка входа, tasks, межъядерная связь
     ├── config.rs           # Константы: пины, тайминги, координаты
+    ├── coordinates.rs      # LLH→ECEF конвертация (WGS84)
     ├── ubx/
     │   ├── mod.rs          # UBX протокол: классы, checksum, traits
     │   ├── messages.rs     # Структуры всех UBX сообщений
@@ -393,6 +398,7 @@ ublox_fake_rust/
 | hmac | 0.12 | HMAC для RFC6979 k |
 | pio | 0.3 | PIO макрос (**критично: версия 0.3!**) |
 | heapless | 0.9 | Статические коллекции |
+| libm | 0.2 | Математика для LLH→ECEF (sin, cos, sqrt) |
 | defmt + defmt-rtt | 1.0+ | Отладочный вывод |
 
 ### Критичные версии
@@ -411,7 +417,7 @@ ublox_fake_rust/
 
 ## Известные ограничения
 
-1. **Координаты статичны** — не меняются во времени (нет симуляции движения)
+1. **Координаты статичны** — настраиваются в `config.rs`, но не меняются во время работы (нет симуляции движения)
 2. **Нет GPS week rollover** — week hardcoded (2349)
 3. **Passthrough без фильтрации** — все данные ретранслируются как есть
 4. **Один LED** — нет отдельной индикации ошибок

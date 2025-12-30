@@ -92,8 +92,29 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 - `src/led.rs` - WS2812 driver using PIO (`pio::pio_asm!` macro)
 - `src/sec_sign.rs` - SHA256 accumulator for SEC-SIGN authentication
 - `src/config.rs` - Pin assignments, timing constants, default position
+- `src/coordinates.rs` - LLH→ECEF conversion, cached at startup
 - `src/passthrough.rs` - PIO-based UART passthrough driver
 - `src/flash_storage.rs` - Flash persistence for operating mode
+
+### Coordinate System
+
+Default coordinates are set in `config.rs` and automatically converted to all required formats at startup:
+
+```rust
+// config.rs
+pub mod default_position {
+    pub const LATITUDE: f64 = 25.7889186;   // degrees
+    pub const LONGITUDE: f64 = -80.1919471; // degrees
+    pub const ALTITUDE_M: i32 = 101;        // meters
+}
+```
+
+The `coordinates` module computes once at init:
+- `lat_1e7()`, `lon_1e7()` - for NAV-PVT, NAV-POSLLH (deg × 1e-7)
+- `alt_mm()` - altitude in mm
+- `ecef_x_cm()`, `ecef_y_cm()`, `ecef_z_cm()` - for NAV-POSECEF, NAV-SOL, NAV-HPPOSECEF
+
+Uses WGS84 ellipsoid parameters for LLH→ECEF conversion.
 
 ### Operating Modes
 - **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green→yellow)
