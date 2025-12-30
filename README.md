@@ -43,29 +43,51 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup target add thumbv8m.main-none-eabihf  # RP2350
 rustup target add thumbv6m-none-eabi          # RP2040
 
-# Установка probe-rs для прошивки
+# Установка probe-rs для прошивки через отладчик
 cargo install probe-rs-tools
+
+# Установка elf2uf2-rs для конвертации в UF2
+cargo install elf2uf2-rs
 ```
 
-### Сборка
+### Сборка (через Makefile)
+
+**ВАЖНО:** Всегда используйте Makefile для сборки UF2!
 
 ```bash
-# Release сборка для RP2350 (по умолчанию)
-cargo build --release
+# Сборка UF2 для RP2350 (рекомендуется)
+make rp2350
 
-# Для RP2040
-cargo build --release --features rp2040 --target thumbv6m-none-eabi
+# Сборка UF2 для RP2040
+make rp2040
+
+# Очистка
+make clean
 ```
+
+#### Почему Makefile, а не ручная конвертация?
+
+`elf2uf2-rs` по умолчанию генерирует UF2 с Family ID для RP2040 (`0xe48bff56`).
+Для RP2350 требуется патчинг Family ID на `0xe48bff59`.
+
+Makefile автоматически:
+1. Собирает ELF с правильным target
+2. Конвертирует ELF → UF2 через `elf2uf2-rs`
+3. Патчит Family ID для RP2350 (Python скрипт)
+
+**НЕ используйте** ручную конвертацию через `objcopy` — она теряет информацию об адресах из ELF секций!
 
 ### Прошивка
 
 ```bash
-# Через probe-rs (требуется отладочный адаптер)
-cargo run --release
-
-# Или через UF2 (BOOTSEL режим)
+# Способ 1: UF2 через BOOTSEL (без отладчика)
 # 1. Зажать кнопку BOOT и подключить USB
-# 2. Скопировать ublox_fake_rp2350.uf2 на появившийся диск
+# 2. Скопировать ublox_fake_rp2350.uf2 на появившийся диск RPI-RP2
+
+# Способ 2: Через probe-rs (требуется отладочный адаптер)
+make flash
+# или
+cargo run --release
 ```
 
 ## Архитектура
