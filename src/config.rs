@@ -45,6 +45,8 @@ pub mod timers {
     pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000;
     /// Delay after CFG-RST before message output starts (0 = immediate)
     pub const UART_TX_INIT_DELAY_MS: u64 = 0;
+    /// Time after start when satellites become invalid (ms)
+    pub const SATELLITES_INVALID_AFTER_MS: u64 = 20_000;
 }
 
 /// Default coordinates (Moscow, Red Square)

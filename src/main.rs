@@ -147,6 +147,9 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
 static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
 
+/// Timestamp when message output started (for 20s invalid satellites timer)
+static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
+
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
@@ -798,6 +801,8 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             if *reset_mode != 0x08 {
                 info!("CFG-RST - starting message output");
                 MSG_OUTPUT_STARTED.store(true, Ordering::Release);
+                // Record start time for 20s invalid satellites timer
+                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
             }
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
@@ -922,11 +927,37 @@ async fn nav_message_task() {
         let min = ((total_secs / 60) % 60) as u8;
         let hour = ((total_secs / 3600) % 24) as u8;
 
+        // Check if 20 seconds have passed since output started (satellites become invalid)
+        let start_time = OUTPUT_START_MILLIS.load(Ordering::Acquire);
+        let elapsed_ms = (now.as_millis() as u32).saturating_sub(start_time);
+        let satellites_invalid = elapsed_ms >= config::timers::SATELLITES_INVALID_AFTER_MS as u32;
+
         // Build and send enabled NAV messages using send_msg! macro
         let mut buf = [0u8; 256];
 
-        // NAV-PVT (0x01 0x07)
-        send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
+        // Helper macro for sending message with UbxMessage trait
+        macro_rules! send_ubx {
+            ($flag:expr, $msg:expr) => {
+                if $flag {
+                    let msg = $msg;
+                    let len = msg.build(&mut buf);
+                    if len > 0 {
+                        let mut vec = heapless::Vec::<u8, 256>::new();
+                        let _ = vec.extend_from_slice(&buf[..len]);
+                        if TX_CHANNEL.try_send(vec).is_err() {
+                            warn!("TX channel full");
+                        }
+                    }
+                }
+            };
+        }
+
+        // NAV-PVT (0x01 0x07) - with fix status
+        if satellites_invalid {
+            send_ubx!(flags.nav_pvt, NavPvt::invalid(itow, hour, min, sec));
+        } else {
+            send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
+        }
 
         // NAV-POSECEF (0x01 0x01) - uses Default ECEF from C version
         send_msg!(buf, flags.nav_posecef, NavPosecef, { itow: itow });
@@ -934,14 +965,22 @@ async fn nav_message_task() {
         // NAV-POSLLH (0x01 0x02) - uses Default LLH from C version
         send_msg!(buf, flags.nav_posllh, NavPosllh, { itow: itow });
 
-        // NAV-STATUS (0x01 0x03)
-        send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
+        // NAV-STATUS (0x01 0x03) - with fix status
+        if satellites_invalid {
+            send_ubx!(flags.nav_status, NavStatus::invalid(itow, itow));
+        } else {
+            send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
+        }
 
         // NAV-DOP (0x01 0x04)
         send_msg!(buf, flags.nav_dop, NavDop, { itow: itow });
 
-        // NAV-SOL (0x01 0x06) - legacy but important for many FCs
-        send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
+        // NAV-SOL (0x01 0x06) - legacy but important for many FCs, with fix status
+        if satellites_invalid {
+            send_ubx!(flags.nav_sol, NavSol::invalid(itow));
+        } else {
+            send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
+        }
 
         // NAV-VELECEF (0x01 0x11)
         send_msg!(buf, flags.nav_velecef, NavVelecef, { itow: itow });
@@ -964,11 +1003,19 @@ async fn nav_message_task() {
         // NAV-TIMELS (0x01 0x26)
         send_msg!(buf, flags.nav_timels, NavTimels, { itow: itow });
 
-        // NAV-SVINFO (0x01 0x30) - legacy format
-        send_msg!(buf, flags.nav_svinfo, NavSvinfo, { itow: itow });
+        // NAV-SVINFO (0x01 0x30) - legacy format, with satellite info
+        if satellites_invalid {
+            send_ubx!(flags.nav_svinfo, NavSvinfo::invalid(itow));
+        } else {
+            send_msg!(buf, flags.nav_svinfo, NavSvinfo, { itow: itow });
+        }
 
-        // NAV-SAT (0x01 0x35) - M10 format
-        send_msg!(buf, flags.nav_sat, NavSat, { itow: itow });
+        // NAV-SAT (0x01 0x35) - M10 format, with satellite info
+        if satellites_invalid {
+            send_ubx!(flags.nav_sat, NavSat::invalid(itow));
+        } else {
+            send_msg!(buf, flags.nav_sat, NavSat, { itow: itow });
+        }
 
         // NAV-COV (0x01 0x36)
         send_msg!(buf, flags.nav_cov, NavCov, { itow: itow });

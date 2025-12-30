@@ -81,6 +81,21 @@ impl Default for NavPvt {
     }
 }
 
+impl NavPvt {
+    /// Create NavPvt with no fix and single satellite (invalid state)
+    pub fn invalid(itow: u32, hour: u8, min: u8, sec: u8) -> Self {
+        let mut pvt = Self::default();
+        pvt.itow = itow;
+        pvt.hour = hour;
+        pvt.min = min;
+        pvt.sec = sec;
+        pvt.fix_type = 0;  // No fix
+        pvt.flags = 0x00;  // gnssFixOK=0
+        pvt.num_sv = 1;    // 1 satellite visible but not used
+        pvt
+    }
+}
+
 impl UbxMessage for NavPvt {
     fn class(&self) -> u8 { 0x01 }
     fn id(&self) -> u8 { 0x07 }
@@ -233,6 +248,21 @@ impl Default for NavStatus {
     }
 }
 
+impl NavStatus {
+    /// Create NavStatus with no fix (invalid state)
+    pub fn invalid(itow: u32, msss: u32) -> Self {
+        Self {
+            itow,
+            gps_fix: 0,   // No fix
+            flags: 0x00,  // gpsFixOk=0
+            fix_stat: 0x00,
+            flags2: 0x00,
+            ttff: 0,
+            msss,
+        }
+    }
+}
+
 impl UbxMessage for NavStatus {
     fn class(&self) -> u8 { 0x01 }
     fn id(&self) -> u8 { 0x03 }
@@ -341,6 +371,18 @@ impl Default for NavSol {
             num_sv: 18,
             reserved2: 0,
         }
+    }
+}
+
+impl NavSol {
+    /// Create NavSol with no fix (invalid state)
+    pub fn invalid(itow: u32) -> Self {
+        let mut sol = Self::default();
+        sol.itow = itow;
+        sol.gps_fix = 0;   // No fix
+        sol.flags = 0x00;  // GPSfixOK=0
+        sol.num_sv = 1;    // 1 satellite visible
+        sol
     }
 }
 
@@ -1088,6 +1130,31 @@ impl Default for NavSat {
     }
 }
 
+impl NavSat {
+    /// Create NavSat with single invalid satellite (no fix, low signal)
+    pub fn invalid(itow: u32) -> Self {
+        let mut sats = [SatInfo::default(); 18];
+        // One satellite with low signal, not used for navigation
+        // flags=0x0001: qualityInd=1 (searching), svUsed=0, health=0
+        sats[0] = SatInfo {
+            gnss_id: 0,  // GPS
+            sv_id: 1,
+            cno: 8,      // Very low signal (8 dBHz)
+            elev: 45,
+            azim: 180,
+            pr_res: 0,
+            flags: 0x00000001, // qualityInd=1, NOT used
+        };
+        Self {
+            itow,
+            version: 0x01,
+            num_svs: 1,  // Only 1 satellite
+            reserved1: [0; 2],
+            sats,
+        }
+    }
+}
+
 impl UbxMessage for NavSat {
     fn class(&self) -> u8 { 0x01 }
     fn id(&self) -> u8 { 0x35 }
@@ -1172,6 +1239,31 @@ impl Default for NavSvinfo {
             itow: 0,
             num_ch: 18,
             global_flags: 0x04,
+            reserved1: [0; 2],
+            svs,
+        }
+    }
+}
+
+impl NavSvinfo {
+    /// Create NavSvinfo with single invalid satellite (legacy format)
+    pub fn invalid(itow: u32) -> Self {
+        let mut svs = [SvInfo::default(); 18];
+        // One satellite with low signal, not used
+        svs[0] = SvInfo {
+            chn: 0,
+            svid: 1,
+            flags: 0x00,    // NOT used
+            quality: 0x01,  // low quality
+            cno: 8,         // Very low signal
+            elev: 45,
+            azim: 180,
+            pr_res: 0,
+        };
+        Self {
+            itow,
+            num_ch: 1,      // Only 1 satellite
+            global_flags: 0x00,
             reserved1: [0; 2],
             svs,
         }
