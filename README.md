@@ -251,27 +251,53 @@ cargo run --release
 
 **Формат**: UBX poll запрос (0x06, 0x41) с нулевым payload возвращает 256-байтный ответ.
 
-**Структура ответа (256 байт)**:
-- Байты 0-174: Конфигурационные данные (ARM Thumb-2 код и параметры)
-- **Байты 175-198**: Приватный ключ ECDSA P-192 (24 байта, big-endian)
-- Байты 199-255: Дополнительные параметры и padding
+**Детальная структура ответа (256 байт)**:
+
+| Секция | Смещение | Размер | Описание |
+|--------|----------|--------|----------|
+| 1. Bitmasks | 0 | 26 | Битовые маски включения сигналов |
+| 2. ROM Patch #1 | 26 | 28 | file 0x82, ARM Thumb-2 код |
+| 3. ROM Patch #2 | 54 | 42 | file 0x83, ARM Thumb-2 код |
+| 4. CFG-SIGNAL | 96 | ~20 | group 0x31, конфиг сигналов |
+| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory |
+| 6. SEC/KEY | ~166 | 26 | group 0xA6, **Приватный ключ** |
+| 7. CFG-UART1 | ~192 | 10 | group 0x52, baudrate |
+| 8. CFG-CLOCK | ~202 | 40 | group 0xA4, частоты |
+| 9. Padding | ~242 | 14 | 0xFF заполнение |
+
+**Секция 5 - CFG-RINV (Remote Inventory)**:
+```
+C7 10 01                              ← DUMP = 1
+03 00 C7 20 1E                        ← SIZE = 30 bytes
+04 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA0 (8 bytes)
+05 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA1 (8 bytes)
+06 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA2 (8 bytes)
+07 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA3 (8 bytes)
+```
+
+**Секция 6 - SEC/KEY (Приватный ключ)**:
+```
+A6 18                                 ← Group tag (0xA6) + length (24)
+xx xx xx xx xx xx xx xx xx xx xx xx   ← Private Key P-192
+xx xx xx xx xx xx xx xx xx xx xx xx   ← (24 байта, big-endian)
+```
+
+**Секция 8 - CFG-CLOCK (частоты)**:
+```
+A4 20 01
+00 A4 40 00 B0 71 0B                  ← item 00 = 192 MHz
+03 00 A4 40 00 B0 71 0B               ← item 03 = 192 MHz
+05 00 A4 40 00 B0 71 0B               ← item 05 = 192 MHz
+0A 00 A4 40 00 D8 B8 05               ← item 0A = 96 MHz
+```
 
 **Практическое применение**: DJI использует эту команду для:
 - Выгрузки приватных ключей из GNSS модулей на производстве
 - Верификации аутентичности модуля
-- Теоретически — получения ключей из других дронов для анализа
+- Получения ключей из других дронов для анализа
 
-**Реализация** в `src/ubx/messages.rs`:
-```rust
-pub mod cfg41_templates {
-    pub const PRIVATE_KEY_OFFSET: usize = 175;
-    pub const TEMPLATE: [u8; 256] = [...];
-}
-
-impl Cfg41 {
-    pub fn for_model(model: DroneModel) -> Self { ... }
-}
-```
+**Реализация**: `src/ubx/messages.rs` → `Cfg41`, `cfg41_templates`
+- `PRIVATE_KEY_OFFSET = 175` - смещение для вставки ключа в шаблон
 
 ## Конфигурация
 

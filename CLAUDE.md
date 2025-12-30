@@ -189,36 +189,49 @@ Proprietary DJI command to retrieve SEC-SIGN configuration and private key from 
 
 **Usage**: Send UBX poll (0x06, 0x41) with zero-length payload to receive 256-byte response.
 
-**Payload structure (256 bytes)**:
+**Payload structure (256 bytes) - detailed breakdown**:
+
+| Section | Offset | Size | Description |
+|---------|--------|------|-------------|
+| 1. Bitmasks | 0 | 26 | Signal enable bitmasks |
+| 2. ROM Patch #1 | 26 | 28 | file 0x82, ARM Thumb-2 code |
+| 3. ROM Patch #2 | 54 | 42 | file 0x83, ARM Thumb-2 code |
+| 4. CFG-SIGNAL | 96 | ~20 | group 0x31, signal config |
+| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory |
+| 6. SEC/KEY | ~166 | 26 | group 0xA6, **Private Key** |
+| 7. CFG-UART1 | ~192 | 10 | group 0x52, baudrate |
+| 8. CFG-CLOCK | ~202 | 40 | group 0xA4, clock frequencies |
+| 9. Padding | ~242 | 14 | 0xFF fill |
+
+**Section 5 - CFG-RINV (Remote Inventory)**:
 ```
-Bytes 0-174:    Configuration data (ARM Thumb-2 code + parameters)
-Bytes 175-198:  Private key ECDSA P-192 (24 bytes, big-endian)
-Bytes 199-255:  Additional parameters and padding
+C7 10 01                              ← DUMP = 1
+03 00 C7 20 1E                        ← SIZE = 30 bytes
+04 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA0 (8 bytes)
+05 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA1 (8 bytes)
+06 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA2 (8 bytes)
+07 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA3 (8 bytes)
 ```
 
-**Implementation** in `src/ubx/messages.rs`:
-```rust
-pub mod cfg41_templates {
-    pub const PRIVATE_KEY_OFFSET: usize = 175;  // Key location in payload
-    pub const TEMPLATE: [u8; 256] = [...];      // Base template from Mavic 4 Pro
-}
-
-impl Cfg41 {
-    pub fn for_model(model: DroneModel) -> Self {
-        // Insert correct private key at offset 175
-    }
-}
+**Section 6 - SEC/KEY (Private Key)**:
+```
+A6 18                                 ← Group tag + length
+xx xx xx xx xx xx xx xx xx xx xx xx   ← Private Key P-192
+xx xx xx xx xx xx xx xx xx xx xx xx   ← (24 bytes, big-endian)
 ```
 
-**Handler** in `main.rs`:
-```rust
-ubx::UbxCommand::Cfg41Poll => {
-    let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
-    let cfg41 = Cfg41::for_model(model);
-    send_ubx_message(&cfg41);
-    send_ack(0x06, 0x41);
-}
+**Section 8 - CFG-CLOCK frequencies**:
 ```
+A4 20 01
+00 A4 40 00 B0 71 0B                  ← item 00 = 192 MHz
+03 00 A4 40 00 B0 71 0B               ← item 03 = 192 MHz
+05 00 A4 40 00 B0 71 0B               ← item 05 = 192 MHz
+0A 00 A4 40 00 D8 B8 05               ← item 0A = 96 MHz
+```
+
+**Implementation**: `src/ubx/messages.rs` → `Cfg41`, `cfg41_templates`
+- `PRIVATE_KEY_OFFSET = 175` - where key is inserted in template
+- Template captured from real Mavic 4 Pro GNSS module
 
 **Security note**: This command exposes the private key, allowing key extraction from real DJI GNSS modules.
 
