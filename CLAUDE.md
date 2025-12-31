@@ -197,10 +197,10 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 
 **Private keys** location: `src/sec_sign.rs`
 
-| Drone Model | Constant | SEC-SIGN Period |
-|-------------|----------|-----------------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 seconds |
-| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 seconds |
+| Drone Model | Constant | First Delay | SEC-SIGN Period |
+|-------------|----------|-------------|-----------------|
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 1000ms | 4 seconds |
+| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 650ms | 2 seconds |
 
 Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro)
 

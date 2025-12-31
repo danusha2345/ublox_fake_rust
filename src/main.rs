@@ -1156,16 +1156,22 @@ async fn sec_sign_timer_task() {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // Select SEC-SIGN period based on drone model
+    // Select SEC-SIGN timings based on drone model
     let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
-    let period_ms = match model {
-        DroneModel::Air3 => config::timers::SEC_SIGN_PERIOD_AIR3_MS,
-        DroneModel::Mavic4Pro => config::timers::SEC_SIGN_PERIOD_MAVIC4_MS,
+    let (first_delay_ms, period_ms) = match model {
+        DroneModel::Air3 => (
+            config::timers::SEC_SIGN_FIRST_AIR3_MS,
+            config::timers::SEC_SIGN_PERIOD_AIR3_MS,
+        ),
+        DroneModel::Mavic4Pro => (
+            config::timers::SEC_SIGN_FIRST_MAVIC4_MS,
+            config::timers::SEC_SIGN_PERIOD_MAVIC4_MS,
+        ),
     };
-    info!("SEC-SIGN timer task started (period={}ms for {:?})", period_ms, model);
+    info!("SEC-SIGN timer task started (first={}ms, period={}ms for {:?})", first_delay_ms, period_ms, model);
 
-    // First signature after short delay (~660ms from real Mavic 4 Pro capture)
-    Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
+    // First signature after model-specific delay from NAV start
+    Timer::after(Duration::from_millis(first_delay_ms)).await;
 
     // Then at configured interval
     let mut ticker = Ticker::every(Duration::from_millis(period_ms));
