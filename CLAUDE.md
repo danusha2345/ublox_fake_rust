@@ -123,9 +123,22 @@ Uses WGS84 ellipsoid parameters for LLH→ECEF conversion.
 
 Mode is persisted to flash and survives reboots. Button press toggles mode (hot-switch, no reboot).
 
+### NAV Output Start Timing
+
+NAV messages start **700ms after the first UBX command** from drone (any command: MON-VER poll, CFG-VALSET, etc.):
+
+```
+First UBX command → +700ms → NAV output starts → +650ms → First SEC-SIGN
+```
+
+Implementation:
+- `FIRST_CONFIG_MILLIS` records timestamp of first command
+- `nav_message_task` waits until `FIRST_CONFIG_MILLIS + 700ms`
+- `CONFIG_TO_NAV_DELAY_MS = 700` constant in main.rs
+
 ### 20-Second Invalid Satellites Timer
 
-After 20 seconds from emulation start, satellites become invalid to simulate signal loss:
+After 20 seconds from NAV output start, satellites become invalid to simulate signal loss:
 
 | Message | Invalid State |
 |---------|---------------|
@@ -135,9 +148,11 @@ After 20 seconds from emulation start, satellites become invalid to simulate sig
 | NAV-SAT | 1 satellite, cno=8 dBHz, not used |
 | NAV-SVINFO | 1 satellite, low quality |
 
-Timer resets on:
+Timer resets **only** on:
+- Mode switch from Passthrough → Emulation (button)
+
+Timer does **NOT** reset on:
 - CFG-RST command from drone
-- Mode switch from Passthrough → Emulation
 
 Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow safety.
 
@@ -334,7 +349,8 @@ All core features complete:
 7. ✅ ACK-ACK/ACK-NAK - Command acknowledgement
 8. ✅ SEC-UNIQID - Unique ID poll response
 9. ✅ CFG-0x41 - DJI proprietary SEC-SIGN config (256-byte response with private key)
-10. ✅ Release build - 0 warnings, pure Rust
+10. ✅ MGA-* - AssistNow assistance data (ACK-ACK response)
+11. ✅ Release build - 0 warnings, pure Rust
 
 ## Implemented UBX Messages
 
@@ -375,8 +391,9 @@ All core features complete:
 | 0x05 | 0x01 | ACK-ACK | 2 | Acknowledgement |
 | 0x06 | 0x41 | CFG-0x41 | 256 | DJI proprietary (private key at offset 175) |
 | 0x0D | 0x01 | TIM-TP | 16 | Timepulse |
-| 0x27 | 0x04 | SEC-SIGN | 108 | Signature |
+| 0x13 | * | MGA-* | var | AssistNow data (ACK-ACK response) |
 | 0x27 | 0x03 | SEC-UNIQID | 10 | Unique ID (poll) |
+| 0x27 | 0x04 | SEC-SIGN | 108 | Signature |
 
 ## Embassy 0.9 API Notes
 

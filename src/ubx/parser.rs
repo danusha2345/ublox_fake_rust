@@ -57,6 +57,10 @@ pub enum UbxCommand {
     /// SEC-UNIQID poll: Unique ID request
     SecUniqidPoll,
 
+    /// MGA-* messages (AssistNow): Assistance data upload
+    /// class 0x13, various IDs (0x00=GPS, 0x02=GAL, 0x03=BDS, 0x06=GLO, 0x20=ANO, 0x40=INI, 0x80=DBD)
+    Mga { id: u8 },
+
     /// Generic poll request (for unhandled polls)
     Poll { class: u8, id: u8 },
 
@@ -342,6 +346,10 @@ impl UbxParser {
 
             // SEC-UNIQID poll (0x27, 0x03)
             (0x27, 0x03) if self.len == 0 => UbxCommand::SecUniqidPoll,
+
+            // MGA-* (0x13, *) - AssistNow assistance data
+            // MGA-DBD (0x80), MGA-ANO (0x20), MGA-INI (0x40), MGA-GPS (0x00), etc.
+            (0x13, id) => UbxCommand::Mga { id },
 
             // Generic poll requests (zero length, unhandled)
             (class, id) if self.len == 0 => UbxCommand::Poll { class, id },

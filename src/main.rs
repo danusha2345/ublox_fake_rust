@@ -117,9 +117,16 @@ static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>,
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
 
-/// Message output started flag (set by CFG-RST with any reset_mode except 0x08)
+/// Message output started flag (set 700ms after first config command)
 /// Using AtomicBool instead of Signal because multiple tasks need to check this
 static MSG_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Timestamp when first config command was received (for 700ms delay)
+/// 0 = no config yet, >0 = time of first config command
+static FIRST_CONFIG_MILLIS: AtomicU32 = AtomicU32::new(0);
+
+/// Delay from first config command to NAV output start (ms)
+const CONFIG_TO_NAV_DELAY_MS: u32 = 700;
 
 /// Global SEC-SIGN accumulator (accumulates sent messages)
 static SEC_SIGN_ACC: Mutex<CriticalSectionRawMutex, Option<SecSignAccumulator>> = Mutex::new(None);
@@ -644,6 +651,18 @@ fn send_ack(cls_id: u8, msg_id: u8) {
     }
 }
 
+/// Record first config command time (called for all config commands)
+/// This starts the 700ms countdown to NAV output
+fn record_first_config() {
+    // Only record if not already set (first command)
+    if FIRST_CONFIG_MILLIS.load(Ordering::Acquire) == 0 {
+        let now = embassy_time::Instant::now().as_millis() as u32;
+        // Use compare_exchange to ensure only first call sets the value
+        let _ = FIRST_CONFIG_MILLIS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        info!("First config command received at {}ms", now);
+    }
+}
+
 /// Send ACK-NAK response for unknown/failed command
 #[allow(dead_code)]
 fn send_nak(cls_id: u8, msg_id: u8) {
@@ -770,6 +789,10 @@ fn process_valset_config_key(key: u32, val: u32) {
 
 /// Handle incoming UBX command
 async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
+    // Record first config command time (starts 700ms countdown to NAV output)
+    // All UBX commands from drone count as config commands
+    record_first_config();
+
     match cmd {
         ubx::UbxCommand::CfgPrt { baudrate } => {
             info!("CFG-PRT: baudrate={}", baudrate);
@@ -819,15 +842,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // 0x08 = GNSS stop
             // 0x09 = GNSS start
             info!("CFG-RST received, reset_mode=0x{:02X}", reset_mode);
-            // Start message output on any reset except GNSS stop (0x08)
-            if *reset_mode != 0x08 {
-                info!("CFG-RST - starting message output");
-                MSG_OUTPUT_STARTED.store(true, Ordering::Release);
-                // Record start time for 20s invalid satellites timer
-                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
-                // Reset invalid satellites flag (LED goes back to green)
-                SATELLITES_INVALID.store(false, Ordering::Release);
-            }
+            // 20s timer starts from NAV output start, not from CFG-RST
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
         ubx::UbxCommand::CfgNav5 => {
@@ -859,6 +874,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             let response = CfgValgetResponse::for_keys(&keys);
             send_ubx_message(&response);
             send_ack(0x06, 0x8B);
+            // NAV output now starts 700ms after first config command (handled in nav_message_task)
         }
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
@@ -895,6 +911,12 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&cfg41);
             send_ack(0x06, 0x41);
         }
+        ubx::UbxCommand::Mga { id } => {
+            // MGA-* messages: AssistNow assistance data upload
+            // Real u-blox modules ACK these messages
+            debug!("MGA message received: id=0x{:02X}", id);
+            send_ack(0x13, *id);
+        }
         ubx::UbxCommand::Poll { class, id } => {
             info!("Unhandled poll: class=0x{:02X} id=0x{:02X}", class, id);
         }
@@ -905,22 +927,35 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
 }
 
 /// NAV message task - sends navigation messages at configurable rate
-/// Only starts after receiving first CFG-MSG command + 1 second delay
+/// Starts 700ms after first config command from drone
 /// Uses Timer::at() for precise timing without drift
 #[embassy_executor::task]
 async fn nav_message_task() {
     use embassy_time::Instant;
 
-    info!("NAV message task waiting for CFG-RST...");
+    info!("NAV message task waiting for first config command...");
 
-    // Wait for CFG-RST with reset_mode=0x09
-    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+    // Wait for first config command (FIRST_CONFIG_MILLIS != 0)
+    while FIRST_CONFIG_MILLIS.load(Ordering::Acquire) == 0 {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // Delay after first CFG-MSG (like C version)
-    Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
-    info!("NAV message output started");
+    // Wait remaining time to reach 700ms after first config
+    let first_config_time = FIRST_CONFIG_MILLIS.load(Ordering::Acquire);
+    let now = Instant::now().as_millis() as u32;
+    let elapsed = now.wrapping_sub(first_config_time);
+    if elapsed < CONFIG_TO_NAV_DELAY_MS {
+        let remaining = CONFIG_TO_NAV_DELAY_MS - elapsed;
+        info!("Waiting {}ms more for NAV start (700ms from first config)", remaining);
+        Timer::after(Duration::from_millis(remaining as u64)).await;
+    }
+
+    // Set MSG_OUTPUT_STARTED flag (for other tasks like SEC-SIGN)
+    MSG_OUTPUT_STARTED.store(true, Ordering::Release);
+    // Record start time for 20s invalid satellites timer
+    OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
+    SATELLITES_INVALID.store(false, Ordering::Release);
+    info!("NAV message output started (700ms after first config)");
 
     // Use absolute timestamps to prevent timing drift
     // Timer::after() would cause drift because it waits AFTER processing completes
@@ -1128,9 +1163,6 @@ async fn sec_sign_timer_task() {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // First signature after initial delay
-    Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
-
     // Select SEC-SIGN period based on drone model
     let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
     let period_ms = match model {
@@ -1138,6 +1170,9 @@ async fn sec_sign_timer_task() {
         DroneModel::Mavic4Pro => config::timers::SEC_SIGN_PERIOD_MAVIC4_MS,
     };
     info!("SEC-SIGN timer task started (period={}ms for {:?})", period_ms, model);
+
+    // First signature after short delay (~660ms from real Mavic 4 Pro capture)
+    Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
 
     // Then at configured interval
     let mut ticker = Ticker::every(Duration::from_millis(period_ms));
@@ -1196,11 +1231,12 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
             new_mode.store();
             info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
 
-            // Reset 20s timer when switching TO emulation mode
+            // Reset 20s timer when switching Passthrough -> Emulation
+            // (new "session" of fake satellite data)
             if new_mode == OperatingMode::Emulation {
                 OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
                 SATELLITES_INVALID.store(false, Ordering::Release);
-                info!("Reset satellite validity timer");
+                info!("Reset satellite validity timer (mode switch)");
             }
 
             // Save to flash for persistence across power cycles

@@ -37,8 +37,8 @@ pub mod timers {
     pub const MON_PERIOD_MS: u64 = 1000;
     /// LED blink period
     pub const LED_BLINK_MS: u64 = 500;
-    /// First SEC-SIGN delay after start
-    pub const SEC_SIGN_FIRST_MS: u64 = 3000;
+    /// First SEC-SIGN delay after start (from real Mavic 4 Pro: ~660ms)
+    pub const SEC_SIGN_FIRST_MS: u64 = 650;
     /// SEC-SIGN interval for DJI Air 3
     pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;
     /// SEC-SIGN interval for DJI Mavic 4 Pro
