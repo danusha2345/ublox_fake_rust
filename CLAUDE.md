@@ -125,16 +125,21 @@ Mode is persisted to flash and survives reboots. Button press toggles mode (hot-
 
 ### NAV Output Start Timing
 
-NAV messages start **700ms after the first UBX command** from drone (any command: MON-VER poll, CFG-VALSET, etc.):
+NAV messages start after a model-specific delay from the first UBX command (any command: MON-VER poll, CFG-VALSET, etc.):
+
+| Model | Real Timing | Config Delay |
+|-------|-------------|--------------|
+| Air 3 | 666ms | 700ms |
+| Mavic 4 Pro | 399ms | 400ms |
 
 ```
-First UBX command → +700ms → NAV output starts → +650ms → First SEC-SIGN
+First UBX command → +delay → NAV output starts → +650ms → First SEC-SIGN
 ```
 
 Implementation:
 - `FIRST_CONFIG_MILLIS` records timestamp of first command
-- `nav_message_task` waits until `FIRST_CONFIG_MILLIS + 700ms`
-- `CONFIG_TO_NAV_DELAY_MS = 700` constant in main.rs
+- `nav_message_task` gets delay based on `DRONE_MODEL` AtomicU8
+- `CONFIG_TO_NAV_AIR3_MS = 700`, `CONFIG_TO_NAV_MAVIC4_MS = 400` in config.rs
 
 ### 20-Second Invalid Satellites Timer
 

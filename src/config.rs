@@ -37,12 +37,16 @@ pub mod timers {
     pub const MON_PERIOD_MS: u64 = 1000;
     /// LED blink period
     pub const LED_BLINK_MS: u64 = 500;
-    /// First SEC-SIGN delay after start (from real Mavic 4 Pro: ~660ms)
+    /// First SEC-SIGN delay after NAV start
     pub const SEC_SIGN_FIRST_MS: u64 = 650;
     /// SEC-SIGN interval for DJI Air 3
     pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;
     /// SEC-SIGN interval for DJI Mavic 4 Pro
     pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000;
+    /// Delay from first config to NAV start for Air 3 (real: 666ms)
+    pub const CONFIG_TO_NAV_AIR3_MS: u64 = 700;
+    /// Delay from first config to NAV start for Mavic 4 Pro (real: 399ms)
+    pub const CONFIG_TO_NAV_MAVIC4_MS: u64 = 400;
     /// Delay after CFG-RST before message output starts (0 = immediate)
     pub const UART_TX_INIT_DELAY_MS: u64 = 0;
     /// Time after start when satellites become invalid (ms)

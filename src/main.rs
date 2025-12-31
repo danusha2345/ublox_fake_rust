@@ -121,12 +121,9 @@ static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::ne
 /// Using AtomicBool instead of Signal because multiple tasks need to check this
 static MSG_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Timestamp when first config command was received (for 700ms delay)
+/// Timestamp when first config command was received (for NAV delay)
 /// 0 = no config yet, >0 = time of first config command
 static FIRST_CONFIG_MILLIS: AtomicU32 = AtomicU32::new(0);
-
-/// Delay from first config command to NAV output start (ms)
-const CONFIG_TO_NAV_DELAY_MS: u32 = 700;
 
 /// Global SEC-SIGN accumulator (accumulates sent messages)
 static SEC_SIGN_ACC: Mutex<CriticalSectionRawMutex, Option<SecSignAccumulator>> = Mutex::new(None);
@@ -929,14 +926,21 @@ async fn nav_message_task() {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // Wait remaining time to reach 700ms after first config
+    // Get model-specific delay
+    let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+    let config_to_nav_delay = match model {
+        DroneModel::Air3 => config::timers::CONFIG_TO_NAV_AIR3_MS,
+        DroneModel::Mavic4Pro => config::timers::CONFIG_TO_NAV_MAVIC4_MS,
+    };
+
+    // Wait remaining time to reach delay after first config
     let first_config_time = FIRST_CONFIG_MILLIS.load(Ordering::Acquire);
     let now = Instant::now().as_millis() as u32;
-    let elapsed = now.wrapping_sub(first_config_time);
-    if elapsed < CONFIG_TO_NAV_DELAY_MS {
-        let remaining = CONFIG_TO_NAV_DELAY_MS - elapsed;
-        info!("Waiting {}ms more for NAV start (700ms from first config)", remaining);
-        Timer::after(Duration::from_millis(remaining as u64)).await;
+    let elapsed = now.wrapping_sub(first_config_time) as u64;
+    if elapsed < config_to_nav_delay {
+        let remaining = config_to_nav_delay - elapsed;
+        info!("Waiting {}ms more for NAV start ({}ms from first config)", remaining, config_to_nav_delay);
+        Timer::after(Duration::from_millis(remaining)).await;
     }
 
     // Set MSG_OUTPUT_STARTED flag (for other tasks like SEC-SIGN)
@@ -944,7 +948,7 @@ async fn nav_message_task() {
     // Record start time for 20s invalid satellites timer
     OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
     SATELLITES_INVALID.store(false, Ordering::Release);
-    info!("NAV message output started (700ms after first config)");
+    info!("NAV message output started ({}ms after first config)", config_to_nav_delay);
 
     // Use absolute timestamps to prevent timing drift
     // Timer::after() would cause drift because it waits AFTER processing completes
