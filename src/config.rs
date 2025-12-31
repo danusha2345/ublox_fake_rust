@@ -57,22 +57,18 @@ pub mod default_position {
 }
 
 /// UBX protocol version emulation
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum UbloxVersion {
     M8,   // PROTVER 18.00
+    #[default]
     M10,  // PROTVER 34.10
 }
 
-impl Default for UbloxVersion {
-    fn default() -> Self {
-        Self::M10
-    }
-}
-
 /// Drone model for SEC-SIGN key selection
-#[derive(Clone, Copy, PartialEq, Eq, Debug, defmt::Format)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, defmt::Format)]
 #[repr(u8)]
 pub enum DroneModel {
+    #[default]
     Air3 = 0,
     Mavic4Pro = 1,
 }
@@ -83,11 +79,5 @@ impl DroneModel {
             1 => Self::Mavic4Pro,
             _ => Self::Air3,
         }
-    }
-}
-
-impl Default for DroneModel {
-    fn default() -> Self {
-        Self::Air3
     }
 }

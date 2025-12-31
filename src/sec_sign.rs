@@ -109,7 +109,7 @@ pub fn compute_z(sha256_field: &[u8; 32], session_id: &[u8; 24]) -> [u8; 24] {
 
     // Hash the concatenation
     let mut hasher = Sha256::new();
-    hasher.update(&to_sign);
+    hasher.update(to_sign);
     let final_hash = hasher.finalize();
 
     // Fold 32 bytes to 24 bytes: XOR bytes 0-7 with bytes 24-31

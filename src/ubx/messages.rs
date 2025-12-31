@@ -84,15 +84,16 @@ impl Default for NavPvt {
 impl NavPvt {
     /// Create NavPvt with no fix and single satellite (invalid state)
     pub fn invalid(itow: u32, hour: u8, min: u8, sec: u8) -> Self {
-        let mut pvt = Self::default();
-        pvt.itow = itow;
-        pvt.hour = hour;
-        pvt.min = min;
-        pvt.sec = sec;
-        pvt.fix_type = 0;  // No fix
-        pvt.flags = 0x00;  // gnssFixOK=0
-        pvt.num_sv = 1;    // 1 satellite visible but not used
-        pvt
+        Self {
+            itow,
+            hour,
+            min,
+            sec,
+            fix_type: 0,   // No fix
+            flags: 0x00,   // gnssFixOK=0
+            num_sv: 1,     // 1 satellite visible but not used
+            ..Self::default()
+        }
     }
 }
 
@@ -374,12 +375,13 @@ impl Default for NavSol {
 impl NavSol {
     /// Create NavSol with no fix (invalid state)
     pub fn invalid(itow: u32) -> Self {
-        let mut sol = Self::default();
-        sol.itow = itow;
-        sol.gps_fix = 0;   // No fix
-        sol.flags = 0x00;  // GPSfixOK=0
-        sol.num_sv = 1;    // 1 satellite visible
-        sol
+        Self {
+            itow,
+            gps_fix: 0,    // No fix
+            flags: 0x00,   // GPSfixOK=0
+            num_sv: 1,     // 1 satellite visible
+            ..Self::default()
+        }
     }
 }
 

@@ -181,8 +181,9 @@ static mut CORE1_STACK: Stack<8192> = Stack::new();
 // Operating Mode
 // ============================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, defmt::Format)]
 pub enum OperatingMode {
+    #[default]
     Emulation = 0,
     Passthrough = 1,
 }
@@ -197,12 +198,6 @@ impl OperatingMode {
 
     fn store(self) {
         MODE.store(self as u8, Ordering::Release);
-    }
-}
-
-impl Default for OperatingMode {
-    fn default() -> Self {
-        Self::Emulation
     }
 }
 
@@ -521,12 +516,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
             }
             OperatingMode::Passthrough => {
                 // Passthrough: forward data from external GNSS
-                match GNSS_RX_CHANNEL.receive().await {
-                    msg => {
-                        if let Err(e) = tx.write_all(&msg).await {
-                            error!("Passthrough TX error: {:?}", e);
-                        }
-                    }
+                let msg = GNSS_RX_CHANNEL.receive().await;
+                if let Err(e) = tx.write_all(&msg).await {
+                    error!("Passthrough TX error: {:?}", e);
                 }
             }
         }
@@ -538,7 +530,7 @@ fn set_uart0_baudrate(baudrate: u32) {
     let clk_peri = embassy_rp::clocks::clk_peri_freq();
     let baud_rate_div = (8 * clk_peri) / baudrate;
     let mut baud_ibrd = baud_rate_div >> 7;
-    let mut baud_fbrd = ((baud_rate_div & 0x7f) + 1) / 2;
+    let mut baud_fbrd = (baud_rate_div & 0x7f).div_ceil(2);
 
     if baud_ibrd == 0 {
         baud_ibrd = 1;
@@ -621,12 +613,9 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             Ok(n) if n > 0 => {
                 // Forward received data to channel
                 let mut vec = heapless::Vec::<u8, 256>::new();
-                if vec.extend_from_slice(&buf[..n]).is_ok() {
-                    if GNSS_RX_CHANNEL.try_send(vec).is_err() {
-                        // Channel full - data will be lost in emulation mode anyway
-                        // In passthrough mode this shouldn't happen often
-                        debug!("GNSS RX channel full, {} bytes dropped", n);
-                    }
+                if vec.extend_from_slice(&buf[..n]).is_ok() && GNSS_RX_CHANNEL.try_send(vec).is_err() {
+                    // Channel full - data will be lost in emulation mode anyway
+                    debug!("GNSS RX channel full, {} bytes dropped", n);
                 }
             }
             Ok(_) => {}
@@ -871,7 +860,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         }
         ubx::UbxCommand::CfgValget { keys } => {
             info!("CFG-VALGET received for {} keys", keys.len());
-            let response = CfgValgetResponse::for_keys(&keys);
+            let response = CfgValgetResponse::for_keys(keys);
             send_ubx_message(&response);
             send_ack(0x06, 0x8B);
             // NAV output now starts 700ms after first config command (handled in nav_message_task)
