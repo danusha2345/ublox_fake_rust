@@ -72,11 +72,12 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 ### Core0 Tasks (src/main.rs)
 | Task | Rate | Purpose |
 |------|------|---------|
-| `uart_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates SHA256 for SEC-SIGN |
-| `uart_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
+| `uart0_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates SHA256 for SEC-SIGN |
+| `uart0_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
+| `uart1_rx_task` | async | Receives data from external GNSS (passthrough input) |
 | `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (uses Timer::at for drift-free timing) |
 | `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1, waits via SEC_SIGN_DONE Signal |
-| `button_task` | async | Mode toggle on GPIO button press |
+| `button_task` | async | Mode cycle on GPIO button press |
 
 ### Core1 Tasks
 | Task | Rate | Purpose |
@@ -211,11 +212,17 @@ Timer does **NOT** reset on:
 Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow safety.
 
 ### Passthrough Implementation
-- Uses PIO1 state machine 0 for signal copying
-- Input: GPIO3 (from external GNSS TX)
-- Output: GPIO0 (to host, same as UART TX)
+
+**Current implementation (algos-v2):**
+- Uses UART1 RX (GPIO5) for receiving external GNSS data
+- Data flows: UART1 RX → `UbxFrameParser` → `GNSS_RX_CHANNEL` → `uart0_tx_task` → UART0 TX
+- Allows frame-by-frame parsing for spoof detection and NAV modification
+
+**Legacy PIO passthrough (in passthrough.rs, NOT USED):**
+- `struct Passthrough` exists but is not instantiated in main.rs
+- Was designed for pure bit-level copying GPIO3→GPIO0 via PIO
 - PIO clock: 8MHz (~8 samples per bit at 921600 baud)
-- PIO program waits for pin state changes and copies them:
+- Could be used for future ultra-low-latency transparent mode:
 ```asm
 .wrap_target
     wait 1 pin 0    ; wait for input high
