@@ -81,7 +81,7 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 ### Core1 Tasks
 | Task | Rate | Purpose |
 |------|------|---------|
-| `led_task` | 500ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough) |
+| `led_task` | 500ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, red=spoof) |
 | `sec_sign_compute_task` | async | ECDSA signature computation (CPU intensive) |
 | `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS |
 
@@ -119,10 +119,11 @@ The `coordinates` module computes once at init:
 Uses WGS84 ellipsoid parameters for LLH→ECEF conversion.
 
 ### Operating Modes
-- **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green→yellow)
-- **Passthrough**: Forwards data from real GNSS module with spoof detection (LED blue, blinking red on spoof)
+- **Emulation** (0): Generates fake GNSS data with SEC-SIGN authentication (LED green→yellow)
+- **Passthrough** (1): Forwards data from real GNSS module with spoof detection (LED blue, blinking red on spoof)
+- **PassthroughRaw** (2): Raw passthrough without spoof detection - pure transparent forwarding (LED purple)
 
-Mode is persisted to flash and survives reboots. Button press toggles mode (hot-switch, no reboot).
+Mode is persisted to flash and survives reboots. Button press cycles modes: Emulation → Passthrough → PassthroughRaw → Emulation (hot-switch, no reboot).
 
 ### Spoof Detection in Passthrough Mode
 

@@ -204,13 +204,15 @@ pub enum OperatingMode {
     #[default]
     Emulation = 0,
     Passthrough = 1,
+    PassthroughRaw = 2,  // Passthrough without spoof detection
 }
 
 impl OperatingMode {
     fn load() -> Self {
         match MODE.load(Ordering::Acquire) {
             0 => Self::Emulation,
-            _ => Self::Passthrough,
+            1 => Self::Passthrough,
+            _ => Self::PassthroughRaw,
         }
     }
 
@@ -421,6 +423,14 @@ async fn led_task(
                     }
                 }
             }
+            OperatingMode::PassthroughRaw => {
+                // Raw passthrough (no spoof detection): purple (blink every 5 ticks = 500ms)
+                if blink_counter % 5 < 3 {
+                    RGB8::new(20, 0, 30)  // Purple
+                } else {
+                    RGB8::new(0, 0, 0)    // Off
+                }
+            }
             OperatingMode::Emulation => {
                 // Slow blink (500ms cycle)
                 if blink_counter % 5 < 3 {
@@ -619,6 +629,13 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     }
                 }
             }
+            OperatingMode::PassthroughRaw => {
+                // Raw passthrough: just forward without any processing
+                let msg = GNSS_RX_CHANNEL.receive().await;
+                if let Err(e) = tx.write_all(&msg).await {
+                    error!("PassthroughRaw TX error: {:?}", e);
+                }
+            }
         }
     }
 }
@@ -722,7 +739,15 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             Ok(n) if n > 0 => {
                 let mode = OperatingMode::load();
 
-                if mode == OperatingMode::Passthrough {
+                if mode == OperatingMode::PassthroughRaw {
+                    // Raw passthrough: just forward data without any parsing or processing
+                    let mut vec = heapless::Vec::<u8, 256>::new();
+                    if vec.extend_from_slice(&buf[..n]).is_ok()
+                       && GNSS_RX_CHANNEL.try_send(vec).is_err()
+                    {
+                        debug!("GNSS RX channel full, {} bytes dropped (raw)", n);
+                    }
+                } else if mode == OperatingMode::Passthrough {
                     // Passthrough mode: parse UBX frames, detect spoofing
                     for &byte in &buf[..n] {
                         if let Some(mut frame) = parser.feed(byte) {
@@ -1467,6 +1492,7 @@ async fn sec_sign_timer_task() {
 
 /// Mode button task - hot-switches mode without reboot
 /// Settings are preserved because UART RX runs in both modes
+/// Cycle: Emulation -> Passthrough -> PassthroughRaw -> Emulation
 #[embassy_executor::task]
 async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
     loop {
@@ -1477,19 +1503,28 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
             let current = OperatingMode::load();
             let new_mode = match current {
                 OperatingMode::Emulation => OperatingMode::Passthrough,
-                OperatingMode::Passthrough => OperatingMode::Emulation,
+                OperatingMode::Passthrough => OperatingMode::PassthroughRaw,
+                OperatingMode::PassthroughRaw => OperatingMode::Emulation,
             };
 
             // Hot-switch: just change MODE atomically
             new_mode.store();
             info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
 
-            // Reset 20s timer when switching Passthrough -> Emulation
+            // Reset 20s timer when switching to Emulation
             // (new "session" of fake satellite data)
             if new_mode == OperatingMode::Emulation {
                 OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
                 SATELLITES_INVALID.store(false, Ordering::Release);
                 info!("Reset satellite validity timer (mode switch)");
+            }
+
+            // Clear spoof flag when switching to PassthroughRaw
+            // (raw mode doesn't detect spoofing)
+            if new_mode == OperatingMode::PassthroughRaw {
+                SPOOF_DETECTED.store(false, Ordering::Release);
+                SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                info!("Cleared spoof detection state (entering raw passthrough)");
             }
 
             // Save to flash for persistence across power cycles
