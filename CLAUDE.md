@@ -140,11 +140,11 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 2. Modify ALL NAV messages: `num_sv=2`, `fix_type=0`, `flags=0`
 3. LED: Fast blinking red (200ms cycle)
 4. Recalculate Fletcher-8 checksum after modification
-5. **Drop original SEC-SIGN** from real GNSS (hash would be invalid)
-6. **Generate new SEC-SIGN** with our private key (Air3/Mavic4)
-   - `sec_sign_timer_task` runs in passthrough+spoof mode
-   - `uart0_tx_task` accumulates hash of modified messages
-   - ECDSA signature computed on Core1
+5. **Replace SEC-SIGN** when received from real GNSS:
+   - Incoming SEC-SIGN triggers signature generation (not timer)
+   - `uart1_rx_task` captures hash and requests ECDSA from Core1
+   - `uart0_tx_task` sends our SEC-SIGN instead of original
+   - Synchronized with real GNSS timing
 
 **Recovery**:
 - 5 seconds of clean (non-spoofed) data required
