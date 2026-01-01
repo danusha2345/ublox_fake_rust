@@ -486,7 +486,7 @@ async fn sec_sign_compute_task() {
 /// In Passthrough mode: forwards data from GNSS_RX_CHANNEL (external GNSS)
 #[embassy_executor::task]
 async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
-    use embassy_futures::select::{select3, Either3};
+    use embassy_futures::select::{select, select3, Either, Either3};
 
     Timer::after(Duration::from_millis(50)).await;
     info!("UART0 TX task ready (hot-switch enabled)");
@@ -555,10 +555,68 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                 }
             }
             OperatingMode::Passthrough => {
-                // Passthrough: forward data from external GNSS
-                let msg = GNSS_RX_CHANNEL.receive().await;
-                if let Err(e) = tx.write_all(&msg).await {
-                    error!("Passthrough TX error: {:?}", e);
+                let spoof = SPOOF_DETECTED.load(Ordering::Acquire);
+
+                if spoof {
+                    // Spoofing mode: handle SEC-SIGN like Emulation
+                    match select(
+                        SEC_SIGN_RESULT.wait(),
+                        GNSS_RX_CHANNEL.receive(),
+                    ).await {
+                        Either::First(result) => {
+                            // SEC-SIGN computed - send it
+                            let sec_sign_msg = SecSign {
+                                version: 0x01,
+                                reserved1: 0,
+                                msg_cnt: result.packet_count,
+                                sha256_hash: result.sha256_hash,
+                                session_id: result.session_id,
+                                signature_r: result.signature.r,
+                                signature_s: result.signature.s,
+                            };
+
+                            let mut buf = [0u8; 128];
+                            let len = sec_sign_msg.build(&mut buf);
+                            if len > 0 {
+                                if let Err(e) = tx.write_all(&buf[..len]).await {
+                                    error!("Passthrough+Spoof SEC-SIGN TX error: {:?}", e);
+                                }
+                                info!("SEC-SIGN sent in passthrough+spoof ({} packets)", result.packet_count);
+                            }
+                            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                            SEC_SIGN_DONE.signal(());
+                        }
+                        Either::Second(msg) => {
+                            // Wait during SEC-SIGN computation
+                            if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                                if GNSS_RX_CHANNEL.try_send(msg).is_err() {
+                                    debug!("Failed to re-queue passthrough msg during SEC-SIGN");
+                                }
+                                continue;
+                            }
+
+                            // Send and accumulate hash for SEC-SIGN
+                            if let Err(e) = tx.write_all(&msg).await {
+                                error!("Passthrough TX error: {:?}", e);
+                                continue;
+                            }
+
+                            // Accumulate for our SEC-SIGN (skip SEC-SIGN messages themselves)
+                            let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
+                            if !is_sec_sign {
+                                let mut acc = SEC_SIGN_ACC.lock().await;
+                                if let Some(ref mut accumulator) = *acc {
+                                    accumulator.accumulate(&msg);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Normal passthrough: just forward
+                    let msg = GNSS_RX_CHANNEL.receive().await;
+                    if let Err(e) = tx.write_all(&msg).await {
+                        error!("Passthrough TX error: {:?}", e);
+                    }
                 }
             }
         }
@@ -730,6 +788,14 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                                                 SPOOF_DETECTED.store(false, Ordering::Release);
                                                 SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                                                 info!("Spoof recovery complete after 5s of clean data");
+
+                                                // Reset SEC-SIGN accumulator for clean start
+                                                if let Ok(mut acc) = SEC_SIGN_ACC.try_lock() {
+                                                    if let Some(ref mut accumulator) = *acc {
+                                                        accumulator.reset();
+                                                        info!("SEC_SIGN_ACC reset after spoof recovery");
+                                                    }
+                                                }
                                             }
                                         }
                                     } else if is_spoofed && was_spoofed {
@@ -751,6 +817,12 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                                 }
                                 // Recalculate checksum after modification
                                 recalc_checksum(&mut frame);
+                            }
+
+                            // Drop original SEC-SIGN when spoofing - we generate our own
+                            if class == 0x27 && id == 0x04 && SPOOF_DETECTED.load(Ordering::Acquire) {
+                                debug!("Dropped original SEC-SIGN during spoof detection");
+                                continue;  // Skip sending to GNSS_RX_CHANNEL
                             }
 
                             // Send frame to TX channel
@@ -1338,8 +1410,11 @@ async fn sec_sign_timer_task() {
         ticker.next().await;
 
         let mode = OperatingMode::load();
-        if mode != OperatingMode::Emulation {
-            continue;
+        let spoof = SPOOF_DETECTED.load(Ordering::Acquire);
+
+        // SEC-SIGN needed in Emulation OR in Passthrough+Spoof
+        if mode == OperatingMode::Passthrough && !spoof {
+            continue;  // Normal passthrough - no SEC-SIGN
         }
 
         // CRITICAL: Pause TX before capturing hash to prevent race condition
