@@ -94,7 +94,8 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 - `src/sec_sign.rs` - SHA256 accumulator for SEC-SIGN authentication
 - `src/config.rs` - Pin assignments, timing constants, default position
 - `src/coordinates.rs` - LLH→ECEF conversion, cached at startup
-- `src/passthrough.rs` - PIO-based UART passthrough driver
+- `src/passthrough.rs` - UBX frame parser, position buffer, NAV modification for spoof detection
+- `src/spoof_detector.rs` - GPS spoofing detection algorithms (teleportation, speed, altitude, acceleration)
 - `src/flash_storage.rs` - Flash persistence for operating mode
 
 ### Coordinate System
@@ -119,9 +120,50 @@ Uses WGS84 ellipsoid parameters for LLH→ECEF conversion.
 
 ### Operating Modes
 - **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green→yellow)
-- **Passthrough**: Forwards data from real GNSS module via PIO (LED blue)
+- **Passthrough**: Forwards data from real GNSS module with spoof detection (LED blue, blinking red on spoof)
 
 Mode is persisted to flash and survives reboots. Button press toggles mode (hot-switch, no reboot).
+
+### Spoof Detection in Passthrough Mode
+
+When in passthrough mode, the device parses incoming UBX frames and detects GPS spoofing:
+
+**Detection algorithms** (in `spoof_detector.rs`):
+- **Teleportation**: Position jump > 500m
+- **Speed anomaly**: Ground speed > 30 m/s (108 km/h)
+- **Altitude anomaly**: Altitude jump > 10m or vertical speed > 15 m/s
+- **Acceleration anomaly**: Speed change > 20 m/s² (2G)
+- **Signal quality**: Suspicious satellite count or accuracy values
+
+**On spoofing detected**:
+1. Save last good coordinates (2 seconds before spoofing started)
+2. Modify ALL NAV messages: `num_sv=2`, `fix_type=0`, `flags=0`
+3. LED: Fast blinking red (200ms cycle)
+4. Recalculate Fletcher-8 checksum after modification
+
+**Recovery**:
+- 5 seconds of clean (non-spoofed) data required
+- Then restore real coordinates from GNSS
+
+**Global state** (atomics in `main.rs`):
+- `SPOOF_DETECTED: AtomicBool` - spoofing active flag
+- `SPOOF_RECOVERY_START_MS: AtomicU32` - recovery timer start
+- `LAST_GOOD_LAT/LON/ALT: AtomicI32` - saved good coordinates
+
+**Implementation** (in `passthrough.rs`):
+- `UbxFrameParser` - state machine for UBX frame parsing
+- `PositionBuffer` - ring buffer for 3 seconds of position history (15 samples at 5Hz)
+- `modify_nav_pvt/sol/status/sat/svinfo` - in-place NAV modification
+- `recalc_checksum` - Fletcher-8 recalculation
+
+**NAV message offsets modified**:
+| Message | Size | Offsets modified |
+|---------|------|------------------|
+| NAV-PVT | 92B | fix_type=20, flags=21, num_sv=23 |
+| NAV-SOL | 52B | gps_fix=10, num_sv=47 |
+| NAV-STATUS | 16B | gps_fix=4, flags=5 |
+| NAV-SAT | 8+12n | num_svs=5 |
+| NAV-SVINFO | 8+12n | num_ch=4 |
 
 ### NAV Output Start Timing
 

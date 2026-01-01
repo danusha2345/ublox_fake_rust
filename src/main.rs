@@ -13,6 +13,7 @@ mod config;
 mod coordinates;
 mod flash_storage;
 mod led;
+mod passthrough;
 mod sec_sign;
 mod spoof_detector;
 mod ubx;
@@ -165,6 +166,25 @@ static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
 
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
+
+// ============================================================================
+// Spoof Detection State (for passthrough mode)
+// ============================================================================
+
+/// Spoof detection active (satellites being masked)
+pub static SPOOF_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Timestamp when spoof recovery started (for 5-second confirmation)
+pub static SPOOF_RECOVERY_START_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Last known good coordinates before spoofing (lat * 1e-7)
+pub static LAST_GOOD_LAT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+
+/// Last known good coordinates before spoofing (lon * 1e-7)
+pub static LAST_GOOD_LON: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+
+/// Last known good altitude before spoofing (mm)
+pub static LAST_GOOD_ALT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 
 /// Flash mutex type for mode persistence
 type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>;
@@ -360,6 +380,7 @@ async fn main(spawner: Spawner) {
 /// LED control task - WS2812B on PIO (runs on Core1)
 /// GPIO25 on RP2350-Core-A
 /// Green = Emulation mode, Blue = Passthrough mode
+/// Blinking Red = Spoofing detected (in passthrough mode)
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
@@ -372,27 +393,48 @@ async fn led_task(
     let program = PioWs2812Program::new(&mut pio.common);
     let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio.common, pio.sm0, dma, pin, &program);
 
-    let mut ticker = Ticker::every(Duration::from_millis(500));
-    let mut on = false;
+    // Faster tick for smooth blinking during spoof detection
+    let mut ticker = Ticker::every(Duration::from_millis(100));
+    let mut blink_counter: u8 = 0;
 
     loop {
-        on = !on;
+        blink_counter = blink_counter.wrapping_add(1);
         let mode = OperatingMode::load();
         let sats_invalid = SATELLITES_INVALID.load(Ordering::Acquire);
-        let color = if on {
-            match mode {
-                OperatingMode::Emulation => {
+        let spoof_detected = SPOOF_DETECTED.load(Ordering::Acquire);
+
+        let color = match mode {
+            OperatingMode::Passthrough => {
+                if spoof_detected {
+                    // Fast blinking red (200ms cycle = on 100ms, off 100ms)
+                    if blink_counter % 2 == 0 {
+                        RGB8::new(50, 0, 0)  // Red ON
+                    } else {
+                        RGB8::new(0, 0, 0)   // OFF
+                    }
+                } else {
+                    // Normal passthrough: solid blue (blink every 5 ticks = 500ms)
+                    if blink_counter % 5 < 3 {
+                        RGB8::new(0, 0, 30)  // Blue
+                    } else {
+                        RGB8::new(0, 0, 0)   // Off
+                    }
+                }
+            }
+            OperatingMode::Emulation => {
+                // Slow blink (500ms cycle)
+                if blink_counter % 5 < 3 {
                     if sats_invalid {
                         RGB8::new(30, 20, 0)  // Yellow (satellites invalid)
                     } else {
                         RGB8::new(0, 30, 0)   // Green (satellites valid)
                     }
+                } else {
+                    RGB8::new(0, 0, 0) // Off
                 }
-                OperatingMode::Passthrough => RGB8::new(0, 0, 30), // Blue
             }
-        } else {
-            RGB8::new(0, 0, 0) // Off
         };
+
         let _ = ws.write(&[color]).await;
         ticker.next().await;
     }
@@ -599,21 +641,137 @@ async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 }
 
 /// UART1 RX task - receives data from external GNSS module
-/// Forwards to GNSS_RX_CHANNEL for passthrough mode
+/// In passthrough mode: parses UBX frames, detects spoofing, modifies NAV messages
+/// Forwards to GNSS_RX_CHANNEL for uart0_tx_task
 #[embassy_executor::task]
 async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
-    let mut buf = [0u8; 256];
+    use passthrough::{
+        UbxFrameParser, PositionBuffer, extract_position_from_pvt,
+        modify_nav_pvt, modify_nav_sol, modify_nav_status, modify_nav_sat, modify_nav_svinfo,
+        recalc_checksum,
+    };
+    use spoof_detector::{SpoofDetector, Position, AnalysisResult, FixType};
 
-    info!("UART1 RX task ready (external GNSS input)");
+    let mut buf = [0u8; 256];
+    let mut parser = UbxFrameParser::new();
+    let mut detector = SpoofDetector::new();
+    let mut pos_buffer = PositionBuffer::new();
+
+    info!("UART1 RX task ready (external GNSS input with spoof detection)");
 
     loop {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
-                // Forward received data to channel
-                let mut vec = heapless::Vec::<u8, 256>::new();
-                if vec.extend_from_slice(&buf[..n]).is_ok() && GNSS_RX_CHANNEL.try_send(vec).is_err() {
-                    // Channel full - data will be lost in emulation mode anyway
-                    debug!("GNSS RX channel full, {} bytes dropped", n);
+                let mode = OperatingMode::load();
+
+                if mode == OperatingMode::Passthrough {
+                    // Passthrough mode: parse UBX frames, detect spoofing
+                    for &byte in &buf[..n] {
+                        if let Some(mut frame) = parser.feed(byte) {
+                            let class = frame[2];
+                            let id = frame[3];
+                            let now_ms = embassy_time::Instant::now().as_millis() as u32;
+
+                            // Detect spoofing ONLY from NAV-PVT (0x01, 0x07)
+                            if class == 0x01 && id == 0x07 && frame.len() >= 100 {
+                                // Extract position from NAV-PVT payload (starts at byte 6)
+                                if let Some((lat, lon, alt, h_acc, _speed, num_sv)) =
+                                    extract_position_from_pvt(&frame[6..])
+                                {
+                                    // Add to position history
+                                    pos_buffer.push(lat, lon, alt, now_ms);
+
+                                    // Get fix_type from NAV-PVT payload offset 20
+                                    let fix_type = FixType::from_u8(frame[6 + 20]);
+
+                                    // Convert to spoof_detector Position struct
+                                    let pos = Position {
+                                        lat,
+                                        lon,
+                                        alt_mm: alt,
+                                        time_ms: now_ms,
+                                        fix_type,
+                                        h_acc_mm: h_acc,
+                                        num_sv,
+                                        pdop: 100, // Default PDOP, not available in NAV-PVT directly
+                                    };
+
+                                    // Run spoof detection
+                                    let result = detector.analyze(pos);
+
+                                    // Handle spoof detection state transitions
+                                    let was_spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
+                                    let is_spoofed = result == AnalysisResult::Spoofed;
+
+                                    if is_spoofed && !was_spoofed {
+                                        // Spoof just started - save last good coordinates (2 sec ago)
+                                        if let Some((good_lat, good_lon, good_alt)) =
+                                            pos_buffer.get_position_at(2, now_ms)
+                                        {
+                                            LAST_GOOD_LAT.store(good_lat, Ordering::Release);
+                                            LAST_GOOD_LON.store(good_lon, Ordering::Release);
+                                            LAST_GOOD_ALT.store(good_alt, Ordering::Release);
+                                            info!("Spoof detected! Saved good coords: lat={}, lon={}",
+                                                  good_lat, good_lon);
+                                        }
+                                        SPOOF_DETECTED.store(true, Ordering::Release);
+                                        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                                        warn!("SPOOF DETECTED");
+                                    } else if !is_spoofed && was_spoofed {
+                                        // Spoof may have ended - start recovery timer
+                                        let recovery_start = SPOOF_RECOVERY_START_MS.load(Ordering::Acquire);
+                                        if recovery_start == 0 {
+                                            SPOOF_RECOVERY_START_MS.store(now_ms, Ordering::Release);
+                                            info!("Spoof may have ended, starting 5s recovery timer");
+                                        } else {
+                                            // Check if 5 seconds of clean data
+                                            let elapsed = now_ms.wrapping_sub(recovery_start);
+                                            if elapsed >= 5000 {
+                                                SPOOF_DETECTED.store(false, Ordering::Release);
+                                                SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                                                info!("Spoof recovery complete after 5s of clean data");
+                                            }
+                                        }
+                                    } else if is_spoofed && was_spoofed {
+                                        // Still spoofed - reset recovery timer
+                                        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                                    }
+                                }
+                            }
+
+                            // Modify ALL NAV messages if spoofing detected
+                            if class == 0x01 && SPOOF_DETECTED.load(Ordering::Acquire) {
+                                match id {
+                                    0x07 => modify_nav_pvt(&mut frame),      // NAV-PVT
+                                    0x06 => modify_nav_sol(&mut frame),      // NAV-SOL
+                                    0x03 => modify_nav_status(&mut frame),   // NAV-STATUS
+                                    0x35 => modify_nav_sat(&mut frame),      // NAV-SAT
+                                    0x30 => modify_nav_svinfo(&mut frame),   // NAV-SVINFO
+                                    _ => {}
+                                }
+                                // Recalculate checksum after modification
+                                recalc_checksum(&mut frame);
+                            }
+
+                            // Send frame to TX channel
+                            let mut vec = heapless::Vec::<u8, 256>::new();
+                            // Truncate if too large for channel (rare for NAV messages)
+                            let copy_len = frame.len().min(256);
+                            if vec.extend_from_slice(&frame[..copy_len]).is_ok()
+                               && GNSS_RX_CHANNEL.try_send(vec).is_err()
+                            {
+                                debug!("GNSS RX channel full, frame dropped");
+                            }
+                        }
+                    }
+                } else {
+                    // Emulation mode: just forward raw data (will be ignored by uart0_tx_task)
+                    let mut vec = heapless::Vec::<u8, 256>::new();
+                    if vec.extend_from_slice(&buf[..n]).is_ok()
+                       && GNSS_RX_CHANNEL.try_send(vec).is_err()
+                    {
+                        debug!("GNSS RX channel full, {} bytes dropped", n);
+                    }
                 }
             }
             Ok(_) => {}
