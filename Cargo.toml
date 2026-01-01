@@ -53,12 +53,12 @@ smart-leds = "0.4"
 embedded-io-async = "0.6"
 
 # Direct register access for baudrate change
-rp-pac = { version = "7", features = ["rp2040"] }
+rp-pac = { version = "7", features = ["rp235x"] }
 
 [features]
-default = ["rp2040"]
+default = ["rp2350"]
 rp2040 = ["embassy-rp/rp2040"]
-rp2350 = ["embassy-rp/rp235xa"]
+rp2350 = ["embassy-rp/rp235xa", "embassy-rp/imagedef-secure-exe"]
 
 [profile.dev]
 debug = 2

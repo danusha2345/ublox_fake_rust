@@ -36,47 +36,54 @@ rustup target add thumbv8m.main-none-eabihf  # RP2350
 
 ## Build Commands
 
+**CRITICAL: Always use Makefile to build UF2 files!**
+
 ```bash
-# Build for RP2040 (default)
-cargo build
+# Build UF2 for RP2350 (ALWAYS use this!)
+make rp2350
 
-# Build release for RP2040
-cargo build --release
-
-# Build for RP2350
-cargo build --release --features rp2350 --target thumbv8m.main-none-eabihf
+# Build UF2 for RP2040
+make rp2040
 
 # Flash and run (requires probe-rs)
 cargo run --release
+make flash
+```
 
+**WARNING:** Do NOT use manual uf2conv.py or objcopy commands!
+The Makefile uses `elf2uf2-rs` (takes addresses from ELF sections) + patches Family ID for RP2350.
+Manual conversion with objcopy loses address info and creates broken firmware.
+
+```bash
 # Aliases defined in .cargo/config.toml:
 cargo rb        # run release binary
-cargo rp2350    # build for RP2350
+cargo rp2350    # build for RP2350 (ELF only, no UF2)
 ```
 
 ## Architecture
 
 ### Dual-core async design (Embassy)
-- **Core0**: Embassy executor - UART TX/RX, NAV/MON message generation, button handling
-- **Core1**: Embassy executor - LED control (PIO), SEC-SIGN ECDSA computation
+- **Core0**: Embassy executor - UART TX/RX, NAV message generation, button handling
+- **Core1**: Embassy executor - LED control (PIO), SEC-SIGN ECDSA, MON messages
 - Inter-core communication via `Signal` and `Channel` from `embassy-sync`
 - Mode state shared via `AtomicU8` with `Acquire/Release` ordering
+- TX_CHANNEL capacity: 32 messages (buffer for SEC-SIGN computation delays)
 
 ### Core0 Tasks (src/main.rs)
 | Task | Rate | Purpose |
 |------|------|---------|
-| `uart_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates for SEC-SIGN |
+| `uart_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates SHA256 for SEC-SIGN |
 | `uart_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
-| `nav_message_task` | 200ms (5Hz) | Sends NAV-PVT, NAV-STATUS, NAV-DOP, NAV-EOE |
-| `mon_message_task` | 1s | Sends MON-* messages (TODO: implement message structs) |
-| `sec_sign_timer_task` | 4s | Requests SEC-SIGN from Core1 |
+| `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (uses Timer::at for drift-free timing) |
+| `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1, waits via SEC_SIGN_DONE Signal |
 | `button_task` | async | Mode toggle on GPIO button press |
 
 ### Core1 Tasks
 | Task | Rate | Purpose |
 |------|------|---------|
-| `led_task` | 500ms | WS2812 LED blinking (green=emulation, blue=passthrough) |
+| `led_task` | 500ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough) |
 | `sec_sign_compute_task` | async | ECDSA signature computation (CPU intensive) |
+| `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS |
 
 ### Module Structure
 - `src/ubx/` - UBX protocol implementation
@@ -86,14 +93,73 @@ cargo rp2350    # build for RP2350
 - `src/led.rs` - WS2812 driver using PIO (`pio::pio_asm!` macro)
 - `src/sec_sign.rs` - SHA256 accumulator for SEC-SIGN authentication
 - `src/config.rs` - Pin assignments, timing constants, default position
+- `src/coordinates.rs` - LLH→ECEF conversion, cached at startup
 - `src/passthrough.rs` - PIO-based UART passthrough driver
 - `src/flash_storage.rs` - Flash persistence for operating mode
 
+### Coordinate System
+
+Default coordinates are set in `config.rs` and automatically converted to all required formats at startup:
+
+```rust
+// config.rs
+pub mod default_position {
+    pub const LATITUDE: f64 = 25.7889186;   // degrees
+    pub const LONGITUDE: f64 = -80.1919471; // degrees
+    pub const ALTITUDE_M: i32 = 101;        // meters
+}
+```
+
+The `coordinates` module computes once at init:
+- `lat_1e7()`, `lon_1e7()` - for NAV-PVT, NAV-POSLLH (deg × 1e-7)
+- `alt_mm()` - altitude in mm
+- `ecef_x_cm()`, `ecef_y_cm()`, `ecef_z_cm()` - for NAV-POSECEF, NAV-SOL, NAV-HPPOSECEF
+
+Uses WGS84 ellipsoid parameters for LLH→ECEF conversion.
+
 ### Operating Modes
-- **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green)
+- **Emulation**: Generates fake GNSS data with SEC-SIGN authentication (LED green→yellow)
 - **Passthrough**: Forwards data from real GNSS module via PIO (LED blue)
 
-Mode is persisted to flash and survives reboots. Button press toggles mode and reboots.
+Mode is persisted to flash and survives reboots. Button press toggles mode (hot-switch, no reboot).
+
+### NAV Output Start Timing
+
+NAV messages start after a model-specific delay from the first UBX command (any command: MON-VER poll, CFG-VALSET, etc.):
+
+| Model | Real Timing | Config Delay |
+|-------|-------------|--------------|
+| Air 3 | 666ms | 700ms |
+| Mavic 4 Pro | 399ms | 400ms |
+
+```
+First UBX command → +delay → NAV output starts → +650ms → First SEC-SIGN
+```
+
+Implementation:
+- `FIRST_CONFIG_MILLIS` records timestamp of first command
+- `nav_message_task` gets delay based on `DRONE_MODEL` AtomicU8
+- `CONFIG_TO_NAV_AIR3_MS = 700`, `CONFIG_TO_NAV_MAVIC4_MS = 400` in config.rs
+
+### 20-Second Invalid Satellites Timer
+
+After 20 seconds from NAV output start, satellites become invalid to simulate signal loss:
+
+| Message | Invalid State |
+|---------|---------------|
+| NAV-PVT | fix_type=0, flags=0, num_sv=1 |
+| NAV-STATUS | gps_fix=0, flags=0 |
+| NAV-SOL | gps_fix=0, num_sv=1 |
+| NAV-SAT | 1 satellite, cno=8 dBHz, not used |
+| NAV-SVINFO | 1 satellite, low quality |
+
+Timer resets **only** on:
+- Mode switch from Passthrough → Emulation (button)
+
+Timer does **NOT** reset on:
+- CFG-RST command from drone
+
+Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow safety.
 
 ### Passthrough Implementation
 - Uses PIO1 state machine 0 for signal copying
@@ -110,11 +176,11 @@ Mode is persisted to flash and survives reboots. Button press toggles mode and r
 .wrap
 ```
 
-## Hardware Pins (RP2040)
-- UART0: TX=GPIO0, RX=GPIO1 (921600 baud default)
-- Passthrough input: GPIO3 (external GNSS TX)
-- WS2812 LED: GPIO16 (PIO0)
-- Mode button: GPIO6 (input), GPIO5 (power)
+## Hardware Pins (RP2350A - Spotpear RP2350-Core-A)
+- UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
+- UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
+- WS2812B LED: GPIO25 (PIO0)
+- Mode button: GPIO7 (input), GPIO6 (power)
 
 ## Key Dependencies
 - `embassy-rp 0.9` - RP2040/RP2350 HAL
@@ -131,10 +197,10 @@ Mode is persisted to flash and survives reboots. Button press toggles mode and r
 
 **Private keys** location: `src/sec_sign.rs`
 
-| Drone Model | Constant | Value |
-|-------------|----------|-------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | `0xeaa5c0111e18dbd1...` |
-| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | `0x9089a21814a62fc3...` |
+| Drone Model | Constant | First Delay | SEC-SIGN Period |
+|-------------|----------|-------------|-----------------|
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 1000ms | 4 seconds |
+| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 650ms | 2 seconds |
 
 Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro)
 
@@ -176,6 +242,67 @@ Critical synchronization points:
 - All ACK-ACK responses to CFG commands
 - SEC-UNIQID (0x27, 0x03) - IS included in hash
 - TIM-TP, RXM-RAWX
+
+## CFG-0x41 (OTP Configuration / DJI Proprietary)
+
+CFG-0x41 is u-blox's **OTP (One-Time Programmable)** configuration command for M10 modules.
+DJI extended this format for SEC-SIGN private key storage and ROM patches.
+
+**Standard u-blox OTP format**:
+```
+B5 62 06 41 [len] 04 01 A4 [size] [hash:4] 28 EF 12 05 [config_data] [checksum]
+```
+- `04 01 A4` — OTP header
+- `28 EF 12 05` — constant marker in all OTP messages
+- Source: https://github.com/cturvey/RandomNinjaChef/tree/main/uBloxM10OTPCodes
+
+**DJI extension**: Poll (0x06, 0x41) with zero-length payload returns 256-byte response with SEC-SIGN config.
+
+**Payload structure (256 bytes) - detailed breakdown**:
+
+| Section | Offset | Size | Description |
+|---------|--------|------|-------------|
+| 1. Bitmasks | 0 | 26 | Signal enable bitmasks |
+| 2. ROM Patch #1 | 26 | 28 | file 0x82, ARM Thumb-2 code |
+| 3. ROM Patch #2 | 54 | 42 | file 0x83, ARM Thumb-2 code |
+| 4. CFG-SIGNAL | 96 | ~20 | group 0x31, signal config |
+| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory |
+| 6. SEC/KEY | ~166 | 26 | group 0xA6, **Private Key** |
+| 7. CFG-UART1 | ~192 | 10 | group 0x52, baudrate |
+| 8. CFG-CLOCK | ~202 | 40 | group 0xA4, clock frequencies |
+| 9. Padding | ~242 | 14 | 0xFF fill |
+
+**Section 5 - CFG-RINV (Remote Inventory)**:
+```
+C7 10 01                              ← DUMP = 1
+03 00 C7 20 1E                        ← SIZE = 30 bytes
+04 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA0 (8 bytes)
+05 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA1 (8 bytes)
+06 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA2 (8 bytes)
+07 00 C7 50 xx xx xx xx xx xx xx xx   ← DATA3 (8 bytes)
+```
+
+**Section 6 - SEC/KEY (Private Key)**:
+```
+A6 18                                 ← Group tag + length
+xx xx xx xx xx xx xx xx xx xx xx xx   ← Private Key P-192
+xx xx xx xx xx xx xx xx xx xx xx xx   ← (24 bytes, big-endian)
+```
+
+**Section 8 - CFG-CLOCK frequencies**:
+```
+A4 20 01
+00 A4 40 00 B0 71 0B                  ← item 00 = 192 MHz
+03 00 A4 40 00 B0 71 0B               ← item 03 = 192 MHz
+05 00 A4 40 00 B0 71 0B               ← item 05 = 192 MHz
+0A 00 A4 40 00 D8 B8 05               ← item 0A = 96 MHz
+```
+
+**Implementation**: `src/ubx/messages.rs` → `Cfg41`, `cfg41_templates`
+- `PRIVATE_KEY_OFFSET = 175` - where key is inserted in template
+- Template captured from real Mavic 4 Pro GNSS module
+
+**Security note**: This command exposes the private key, allowing key extraction from real DJI GNSS modules.
 
 ## RAM/Flash Usage Comparison (vs C/FreeRTOS)
 
@@ -226,7 +353,9 @@ All core features complete:
 6. ✅ CFG-VALSET - Full M10 configuration support
 7. ✅ ACK-ACK/ACK-NAK - Command acknowledgement
 8. ✅ SEC-UNIQID - Unique ID poll response
-9. ✅ Release build - 0 warnings, pure Rust
+9. ✅ CFG-0x41 - DJI proprietary SEC-SIGN config (256-byte response with private key)
+10. ✅ MGA-* - AssistNow assistance data (ACK-ACK response)
+11. ✅ Release build - 0 warnings, pure Rust
 
 ## Implemented UBX Messages
 
@@ -265,9 +394,11 @@ All core features complete:
 | 0x02 | 0x15 | RXM-RAWX | 16+ | Raw measurements |
 | 0x05 | 0x00 | ACK-NAK | 2 | Negative acknowledgement |
 | 0x05 | 0x01 | ACK-ACK | 2 | Acknowledgement |
+| 0x06 | 0x41 | CFG-0x41 | 256 | DJI proprietary (private key at offset 175) |
 | 0x0D | 0x01 | TIM-TP | 16 | Timepulse |
-| 0x27 | 0x04 | SEC-SIGN | 108 | Signature |
+| 0x13 | * | MGA-* | var | AssistNow data (ACK-ACK response) |
 | 0x27 | 0x03 | SEC-UNIQID | 10 | Unique ID (poll) |
+| 0x27 | 0x04 | SEC-SIGN | 108 | Signature |
 
 ## Embassy 0.9 API Notes
 

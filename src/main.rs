@@ -10,9 +10,9 @@
 #![no_main]
 
 mod config;
+mod coordinates;
 mod flash_storage;
 mod led;
-mod passthrough;
 mod sec_sign;
 mod spoof_detector;
 mod ubx;
@@ -25,7 +25,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Async, Flash};
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
-use embassy_rp::peripherals::{FLASH, PIO0, PIO1, UART0};
+use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -34,7 +34,6 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker, Timer};
 use embedded_io_async::{Read, Write};
-use cortex_m::peripheral::SCB;
 use panic_probe as _;
 use static_cell::StaticCell;
 
@@ -49,13 +48,17 @@ use ubx::{
     MonHw, MonRf, MonComms,
     // TIM and RXM messages
     TimTp, RxmRawx,
+    // DJI proprietary
+    Cfg41,
+    // CFG-VALGET response
+    CfgValgetResponse,
 };
 
 // Interrupt bindings
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
+    UART1_IRQ => BufferedInterruptHandler<UART1>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
-    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
 });
 
 // ============================================================================
@@ -106,14 +109,22 @@ macro_rules! send_msg {
 // ============================================================================
 
 /// Channel for outgoing UBX messages (serialized, ready to send)
-static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 16> = Channel::new();
+/// Capacity 32 provides buffer for SEC-SIGN computation delays
+static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 32> = Channel::new();
+
+/// Channel for data from external GNSS (UART1 RX -> passthrough TX)
+static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 8> = Channel::new();
 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
 
-/// Message output started flag (set by CFG-RST with any reset_mode except 0x08)
+/// Message output started flag (set 700ms after first config command)
 /// Using AtomicBool instead of Signal because multiple tasks need to check this
 static MSG_OUTPUT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Timestamp when first config command was received (for NAV delay)
+/// 0 = no config yet, >0 = time of first config command
+static FIRST_CONFIG_MILLIS: AtomicU32 = AtomicU32::new(0);
 
 /// Global SEC-SIGN accumulator (accumulates sent messages)
 static SEC_SIGN_ACC: Mutex<CriticalSectionRawMutex, Option<SecSignAccumulator>> = Mutex::new(None);
@@ -128,6 +139,9 @@ static SEC_SIGN_RESULT: Signal<CriticalSectionRawMutex, SecSignResult> = Signal:
 /// When true: NAV/MON tasks skip sending, uart_tx_task waits for result
 static SEC_SIGN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// Signal when SEC-SIGN computation completes (replaces busy-wait yield_now loop)
+static SEC_SIGN_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(0);
 
@@ -141,7 +155,13 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
+
+/// Timestamp when message output started (for 20s invalid satellites timer)
+static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
+
+/// Flag indicating satellites are invalid (for LED color change)
+static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
 
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
@@ -159,8 +179,9 @@ static mut CORE1_STACK: Stack<8192> = Stack::new();
 // Operating Mode
 // ============================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, defmt::Format)]
 pub enum OperatingMode {
+    #[default]
     Emulation = 0,
     Passthrough = 1,
 }
@@ -178,57 +199,71 @@ impl OperatingMode {
     }
 }
 
-impl Default for OperatingMode {
-    fn default() -> Self {
-        Self::Emulation
-    }
-}
-
 // ============================================================================
 // Core0 Entry Point
 // ============================================================================
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    info!("u-blox GNSS Emulator starting on Core0...");
-
     let p = embassy_rp::init(Default::default());
+
+    // Initialize coordinate conversion (LLH -> ECEF) from config
+    coordinates::init();
+
+    // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
+    {
+        use embassy_rp::pio::Pio;
+        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+        use smart_leds::RGB8;
+
+        let mut pio0 = Pio::new(p.PIO0, Irqs);
+        let program = PioWs2812Program::new(&mut pio0.common);
+        let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
+
+        for _ in 0..3 {
+            ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
+            Timer::after(Duration::from_millis(200)).await;
+            ws.write(&[RGB8::new(0, 0, 0)]).await; // Off
+            Timer::after(Duration::from_millis(200)).await;
+        }
+    }
+    // ===== END TEST =====
+
+    // Re-init peripherals (PIO0 was consumed by test)
+    let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
     let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
     // Load saved mode from flash
-    let is_passthrough = {
+    {
         let mut flash = flash_mutex.lock().await;
         if let Some(saved_mode) = flash_storage::load_mode(&mut flash) {
             if saved_mode == 1 {
                 info!("Loaded passthrough mode from flash");
                 OperatingMode::Passthrough.store();
-                true
             } else {
                 info!("Loaded emulation mode from flash");
                 OperatingMode::Emulation.store();
-                false
             }
         } else {
             info!("No saved mode, defaulting to emulation");
             OperatingMode::Emulation.store();
-            false
         }
     };
 
-    // Initialize PIO0 for WS2812 LED
+    // Initialize PIO0 for WS2812 LED (GPIO25 on RP2350-Core-A)
     let pio0 = Pio::new(p.PIO0, Irqs);
-
-    // Mode button (GPIO5 = power, GPIO6 = input)
-    let _btn_pwr = Output::new(p.PIN_5, Level::High);
-    let btn_input = Input::new(p.PIN_6, Pull::Down);
-
-    // Spawn Core1 for LED and SEC-SIGN computation
-    info!("Spawning Core1...");
     let dma_ch1 = p.DMA_CH1;
-    let pin_16 = p.PIN_16;
+    let pin_25 = p.PIN_25;  // WS2812B on GPIO25
+
+    // Mode button (GPIO6 = power, GPIO7 = input) - updated for RP2350
+    let _btn_pwr = Output::new(p.PIN_6, Level::High);
+    let btn_input = Input::new(p.PIN_7, Pull::Down);
+
+    // Spawn Core1 for LED, SEC-SIGN computation, and MON messages
+    // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -236,71 +271,81 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, dma_ch1, pin_16));
+                spawner.must_spawn(led_task(pio0, dma_ch1, pin_25));
                 spawner.must_spawn(sec_sign_compute_task());
+                spawner.must_spawn(mon_message_task());
             });
         },
     );
 
-    if is_passthrough {
-        // Passthrough mode: PIO copies GPIO3 -> GPIO0
-        info!("Starting in PASSTHROUGH mode");
+    // ========================================================================
+    // UART0: Communication with drone/host (TX=GPIO0, RX=GPIO1)
+    // ========================================================================
+    static TX_BUF0: StaticCell<[u8; 512]> = StaticCell::new();
+    static RX_BUF0: StaticCell<[u8; 256]> = StaticCell::new();
+    let tx_buf0 = &mut TX_BUF0.init([0; 512])[..];
+    let rx_buf0 = &mut RX_BUF0.init([0; 256])[..];
 
-        let mut pio1 = Pio::new(p.PIO1, Irqs);
-        let mut passthrough = passthrough::Passthrough::new(
-            &mut pio1.common,
-            pio1.sm0,
-            p.PIN_3,  // Input from external GNSS
-            p.PIN_0,  // Output to host
-        );
-        passthrough.enable();
+    let mut uart0_config = UartConfig::default();
+    uart0_config.baudrate = DEFAULT_BAUDRATE;
+    let uart0 = BufferedUart::new(
+        p.UART0,
+        p.PIN_0, // TX
+        p.PIN_1, // RX
+        Irqs,
+        tx_buf0,
+        rx_buf0,
+        uart0_config,
+    );
+    let (uart0_tx, uart0_rx) = uart0.split();
 
-        // Prevent drop - keep PIO running (sm0 is owned by passthrough)
-        core::mem::forget(passthrough);
+    // ========================================================================
+    // UART1: External GNSS module input (RX=GPIO5)
+    // ========================================================================
+    static TX_BUF1: StaticCell<[u8; 64]> = StaticCell::new();
+    static RX_BUF1: StaticCell<[u8; 512]> = StaticCell::new();
+    let tx_buf1 = &mut TX_BUF1.init([0; 64])[..];
+    let rx_buf1 = &mut RX_BUF1.init([0; 512])[..];
 
-        // Only button task in passthrough mode
-        spawner.must_spawn(button_task(btn_input, flash_mutex));
+    let mut uart1_config = UartConfig::default();
+    uart1_config.baudrate = DEFAULT_BAUDRATE;
+    let uart1 = BufferedUart::new(
+        p.UART1,
+        p.PIN_4, // TX (not used, but required)
+        p.PIN_5, // RX from external GNSS
+        Irqs,
+        tx_buf1,
+        rx_buf1,
+        uart1_config,
+    );
+    let (_uart1_tx, uart1_rx) = uart1.split();
 
-        info!("Passthrough active, press button to switch to emulation");
-    } else {
-        // Emulation mode: UART for UBX messages
-        info!("Starting in EMULATION mode");
-
-        static TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
-        static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-        let tx_buf = &mut TX_BUF.init([0; 512])[..];
-        let rx_buf = &mut RX_BUF.init([0; 256])[..];
-
-        let mut uart_config = UartConfig::default();
-        uart_config.baudrate = DEFAULT_BAUDRATE;
-        let uart = BufferedUart::new(
-            p.UART0,
-            p.PIN_0, // TX
-            p.PIN_1, // RX
-            Irqs,
-            tx_buf,
-            rx_buf,
-            uart_config,
-        );
-        let (tx, rx) = uart.split();
-
-        // Initialize SEC-SIGN accumulator early (avoid delay in uart_tx_task)
-        {
-            // Use try_lock since we're in async context but no contention yet
-            let mut acc = SEC_SIGN_ACC.try_lock().unwrap();
-            *acc = Some(SecSignAccumulator::new());
-        }
-
-        // All Core0 tasks for emulation
-        spawner.must_spawn(uart_tx_task(tx));
-        spawner.must_spawn(uart_rx_task(rx));
-        spawner.must_spawn(nav_message_task());
-        spawner.must_spawn(mon_message_task());
-        spawner.must_spawn(sec_sign_timer_task());
-        spawner.must_spawn(button_task(btn_input, flash_mutex));
+    // Initialize SEC-SIGN accumulator
+    {
+        let mut acc = SEC_SIGN_ACC.try_lock().unwrap();
+        *acc = Some(SecSignAccumulator::new());
     }
 
-    info!("All tasks spawned, running");
+    // ========================================================================
+    // Spawn all tasks - they check MODE internally for hot-switching
+    // ========================================================================
+    let mode = OperatingMode::load();
+    info!("Starting in {:?} mode (hot-switchable)", mode);
+
+    // Core communication tasks (always running)
+    spawner.must_spawn(uart0_tx_task(uart0_tx));
+    spawner.must_spawn(uart0_rx_task(uart0_rx));
+    spawner.must_spawn(uart1_rx_task(uart1_rx));
+
+    // Emulation tasks (check MODE internally, skip work in passthrough)
+    // Note: mon_message_task runs on Core1 for load balancing
+    spawner.must_spawn(nav_message_task());
+    spawner.must_spawn(sec_sign_timer_task());
+
+    // Button task for mode switching (no reboot!)
+    spawner.must_spawn(button_task(btn_input, flash_mutex));
+
+    info!("All tasks spawned, hot-switch enabled");
 
     // Core0 main loop - idle
     loop {
@@ -312,34 +357,43 @@ async fn main(spawner: Spawner) {
 // Core1 Tasks
 // ============================================================================
 
-/// LED control task - WS2812 on PIO (runs on Core1)
+/// LED control task - WS2812B on PIO (runs on Core1)
+/// GPIO25 on RP2350-Core-A
+/// Green = Emulation mode, Blue = Passthrough mode
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
-    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
+    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
 ) {
-    use led::Ws2812;
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+    use smart_leds::RGB8;
 
-    info!("LED task starting on Core1");
-    let mut ws2812 = Ws2812::new(&mut pio.common, pio.sm0, dma, pin);
-    let mut ticker = Ticker::every(Duration::from_millis(config::timers::LED_BLINK_MS));
-    let mut led_on = false;
+    let program = PioWs2812Program::new(&mut pio.common);
+    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio.common, pio.sm0, dma, pin, &program);
+
+    let mut ticker = Ticker::every(Duration::from_millis(500));
+    let mut on = false;
 
     loop {
+        on = !on;
         let mode = OperatingMode::load();
-        let color = match mode {
-            OperatingMode::Emulation => led::Color::green(),
-            OperatingMode::Passthrough => led::Color::blue(),
-        };
-
-        led_on = !led_on;
-        if led_on {
-            ws2812.write_color(color).await;
+        let sats_invalid = SATELLITES_INVALID.load(Ordering::Acquire);
+        let color = if on {
+            match mode {
+                OperatingMode::Emulation => {
+                    if sats_invalid {
+                        RGB8::new(30, 20, 0)  // Yellow (satellites invalid)
+                    } else {
+                        RGB8::new(0, 30, 0)   // Green (satellites valid)
+                    }
+                }
+                OperatingMode::Passthrough => RGB8::new(0, 0, 30), // Blue
+            }
         } else {
-            ws2812.write_color(led::Color::off()).await;
-        }
-
+            RGB8::new(0, 0, 0) // Off
+        };
+        let _ = ws.write(&[color]).await;
         ticker.next().await;
     }
 }
@@ -385,70 +439,84 @@ async fn sec_sign_compute_task() {
 // Core0 Tasks
 // ============================================================================
 
-/// UART TX task - sends UBX messages from TX_CHANNEL
-/// Handles SEC-SIGN synchronization: uses select! to handle both regular TX and SEC-SIGN
+/// UART0 TX task - sends data to drone/host
+/// In Emulation mode: sends generated UBX from TX_CHANNEL + SEC-SIGN
+/// In Passthrough mode: forwards data from GNSS_RX_CHANNEL (external GNSS)
 #[embassy_executor::task]
-async fn uart_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
-    use embassy_futures::select::{select, Either};
+async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
+    use embassy_futures::select::{select3, Either3};
 
-    // Short delay to let UART settle (accumulator already initialized in main)
     Timer::after(Duration::from_millis(50)).await;
-    info!("UART TX task ready");
+    info!("UART0 TX task ready (hot-switch enabled)");
 
     loop {
-        // Use select! to wait for either:
-        // 1. SEC-SIGN result from Core1 (priority)
-        // 2. Regular message from TX_CHANNEL
-        match select(SEC_SIGN_RESULT.wait(), TX_CHANNEL.receive()).await {
-            Either::First(result) => {
-                // SEC-SIGN result received - send signature
-                let sec_sign_msg = SecSign {
-                    version: 0x01,
-                    reserved1: 0,
-                    msg_cnt: result.packet_count,
-                    sha256_hash: result.sha256_hash,
-                    session_id: result.session_id,
-                    signature_r: result.signature.r,
-                    signature_s: result.signature.s,
-                };
+        let mode = OperatingMode::load();
 
-                let mut buf = [0u8; 128];
-                let len = sec_sign_msg.build(&mut buf);
-                if len > 0 {
-                    if let Err(e) = tx.write_all(&buf[..len]).await {
-                        error!("UART TX SEC-SIGN error: {:?}", e);
+        match mode {
+            OperatingMode::Emulation => {
+                // Emulation: wait for TX_CHANNEL or SEC-SIGN result
+                match select3(
+                    SEC_SIGN_RESULT.wait(),
+                    TX_CHANNEL.receive(),
+                    GNSS_RX_CHANNEL.receive(), // Drain passthrough channel if any
+                ).await {
+                    Either3::First(result) => {
+                        // SEC-SIGN result received - send signature
+                        let sec_sign_msg = SecSign {
+                            version: 0x01,
+                            reserved1: 0,
+                            msg_cnt: result.packet_count,
+                            sha256_hash: result.sha256_hash,
+                            session_id: result.session_id,
+                            signature_r: result.signature.r,
+                            signature_s: result.signature.s,
+                        };
+
+                        let mut buf = [0u8; 128];
+                        let len = sec_sign_msg.build(&mut buf);
+                        if len > 0 {
+                            if let Err(e) = tx.write_all(&buf[..len]).await {
+                                error!("UART TX SEC-SIGN error: {:?}", e);
+                            }
+                            info!("SEC-SIGN sent ({} packets)", result.packet_count);
+                        }
+                        // Clear flag and wake waiting tasks (NAV/MON)
+                        SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                        SEC_SIGN_DONE.signal(());
                     }
-                    info!("SEC-SIGN sent ({} packets)", result.packet_count);
-                }
+                    Either3::Second(msg) => {
+                        // Regular emulation message
+                        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                            if TX_CHANNEL.try_send(msg).is_err() {
+                                error!("Failed to re-queue message during SEC-SIGN!");
+                            }
+                            continue;
+                        }
 
-                // Clear pause flag - resume normal TX
-                SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                        if let Err(e) = tx.write_all(&msg).await {
+                            error!("UART TX error: {:?}", e);
+                            continue;
+                        }
+
+                        // Accumulate for SEC-SIGN
+                        let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
+                        if !is_sec_sign {
+                            let mut acc = SEC_SIGN_ACC.lock().await;
+                            if let Some(ref mut accumulator) = *acc {
+                                accumulator.accumulate(&msg);
+                            }
+                        }
+                    }
+                    Either3::Third(_) => {
+                        // Discard passthrough data in emulation mode
+                    }
+                }
             }
-            Either::Second(msg) => {
-                // Regular message - check if SEC-SIGN is in progress
-                if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-                    // Re-queue the message and wait for SEC-SIGN first
-                    if TX_CHANNEL.try_send(msg).is_err() {
-                        error!("Failed to re-queue message during SEC-SIGN!");
-                    }
-                    continue;
-                }
-
-                // Send via UART
+            OperatingMode::Passthrough => {
+                // Passthrough: forward data from external GNSS
+                let msg = GNSS_RX_CHANNEL.receive().await;
                 if let Err(e) = tx.write_all(&msg).await {
-                    error!("UART TX error: {:?}", e);
-                    continue;
-                }
-
-                // Accumulate for SEC-SIGN (except SEC-SIGN message itself)
-                // SEC-SIGN = class 0x27, id 0x04
-                // SEC-UNIQID (0x27, 0x03) IS accumulated, only SEC-SIGN excluded
-                let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-                if !is_sec_sign {
-                    let mut acc = SEC_SIGN_ACC.lock().await;
-                    if let Some(ref mut accumulator) = *acc {
-                        accumulator.accumulate(&msg);
-                    }
+                    error!("Passthrough TX error: {:?}", e);
                 }
             }
         }
@@ -460,7 +528,7 @@ fn set_uart0_baudrate(baudrate: u32) {
     let clk_peri = embassy_rp::clocks::clk_peri_freq();
     let baud_rate_div = (8 * clk_peri) / baudrate;
     let mut baud_ibrd = baud_rate_div >> 7;
-    let mut baud_fbrd = ((baud_rate_div & 0x7f) + 1) / 2;
+    let mut baud_fbrd = (baud_rate_div & 0x7f).div_ceil(2);
 
     if baud_ibrd == 0 {
         baud_ibrd = 1;
@@ -493,9 +561,10 @@ fn set_uart0_baudrate(baudrate: u32) {
     });
 }
 
-/// UART RX task - receives and processes UBX commands
+/// UART0 RX task - receives and processes UBX commands from drone
+/// Runs in BOTH modes to preserve settings during hot-switch
 #[embassy_executor::task]
-async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
+async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     let mut buf = [0u8; 128];
     let mut parser = ubx::UbxParser::new();
 
@@ -510,6 +579,7 @@ async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             Ok(n) if n > 0 => {
                 for &byte in &buf[..n] {
                     if let Some(cmd) = parser.parse_byte(byte) {
+                        // Process commands in BOTH modes - preserves settings
                         handle_ubx_command(&cmd).await;
                     }
                 }
@@ -522,7 +592,33 @@ async fn uart_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             }
             Ok(_) => {}
             Err(e) => {
-                error!("UART RX error: {:?}", e);
+                error!("UART0 RX error: {:?}", e);
+            }
+        }
+    }
+}
+
+/// UART1 RX task - receives data from external GNSS module
+/// Forwards to GNSS_RX_CHANNEL for passthrough mode
+#[embassy_executor::task]
+async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
+    let mut buf = [0u8; 256];
+
+    info!("UART1 RX task ready (external GNSS input)");
+
+    loop {
+        match rx.read(&mut buf).await {
+            Ok(n) if n > 0 => {
+                // Forward received data to channel
+                let mut vec = heapless::Vec::<u8, 256>::new();
+                if vec.extend_from_slice(&buf[..n]).is_ok() && GNSS_RX_CHANNEL.try_send(vec).is_err() {
+                    // Channel full - data will be lost in emulation mode anyway
+                    debug!("GNSS RX channel full, {} bytes dropped", n);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("UART1 RX error: {:?}", e);
             }
         }
     }
@@ -539,6 +635,18 @@ fn send_ack(cls_id: u8, msg_id: u8) {
         if TX_CHANNEL.try_send(vec).is_err() {
             warn!("TX channel full, dropped ACK for {:02X}:{:02X}", cls_id, msg_id);
         }
+    }
+}
+
+/// Record first config command time (called for all config commands)
+/// This starts the 700ms countdown to NAV output
+fn record_first_config() {
+    // Only record if not already set (first command)
+    if FIRST_CONFIG_MILLIS.load(Ordering::Acquire) == 0 {
+        let now = embassy_time::Instant::now().as_millis() as u32;
+        // Use compare_exchange to ensure only first call sets the value
+        let _ = FIRST_CONFIG_MILLIS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        info!("First config command received at {}ms", now);
     }
 }
 
@@ -668,6 +776,10 @@ fn process_valset_config_key(key: u32, val: u32) {
 
 /// Handle incoming UBX command
 async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
+    // Record first config command time (starts 700ms countdown to NAV output)
+    // All UBX commands from drone count as config commands
+    record_first_config();
+
     match cmd {
         ubx::UbxCommand::CfgPrt { baudrate } => {
             info!("CFG-PRT: baudrate={}", baudrate);
@@ -717,11 +829,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // 0x08 = GNSS stop
             // 0x09 = GNSS start
             info!("CFG-RST received, reset_mode=0x{:02X}", reset_mode);
-            // Start message output on any reset except GNSS stop (0x08)
-            if *reset_mode != 0x08 {
-                info!("CFG-RST - starting message output");
-                MSG_OUTPUT_STARTED.store(true, Ordering::Release);
-            }
+            // 20s timer starts from NAV output start, not from CFG-RST
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
         ubx::UbxCommand::CfgNav5 => {
@@ -748,6 +856,13 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             info!("CFG-PMS received");
             send_ack(0x06, 0x86); // ACK for CFG-PMS
         }
+        ubx::UbxCommand::CfgValget { keys } => {
+            info!("CFG-VALGET received for {} keys", keys.len());
+            let response = CfgValgetResponse::for_keys(keys);
+            send_ubx_message(&response);
+            send_ack(0x06, 0x8B);
+            // NAV output now starts 700ms after first config command (handled in nav_message_task)
+        }
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
             info!("CFG-VALSET received with {} keys", keys.len());
 
@@ -770,9 +885,24 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&ver);
         }
         ubx::UbxCommand::SecUniqidPoll => {
-            info!("SEC-UNIQID poll received, sending unique ID");
-            let uniqid = SecUniqid::default();
+            let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+            info!("SEC-UNIQID poll received, sending unique ID for {:?}", model);
+            let uniqid = SecUniqid::for_model(model);
             send_ubx_message(&uniqid);
+        }
+        ubx::UbxCommand::Cfg41Poll => {
+            // DJI proprietary command - returns SEC-SIGN private key and configuration
+            let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+            info!("CFG-0x41 poll received, sending SEC-SIGN config for {:?}", model);
+            let cfg41 = Cfg41::for_model(model);
+            send_ubx_message(&cfg41);
+            send_ack(0x06, 0x41);
+        }
+        ubx::UbxCommand::Mga { id } => {
+            // MGA-* messages: AssistNow assistance data upload
+            // Real u-blox modules ACK these messages
+            debug!("MGA message received: id=0x{:02X}", id);
+            send_ack(0x13, *id);
         }
         ubx::UbxCommand::Poll { class, id } => {
             info!("Unhandled poll: class=0x{:02X} id=0x{:02X}", class, id);
@@ -784,36 +914,66 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
 }
 
 /// NAV message task - sends navigation messages at configurable rate
-/// Only starts after receiving first CFG-MSG command + 1 second delay
+/// Starts 700ms after first config command from drone
+/// Uses Timer::at() for precise timing without drift
 #[embassy_executor::task]
 async fn nav_message_task() {
-    info!("NAV message task waiting for CFG-RST...");
+    use embassy_time::Instant;
 
-    // Wait for CFG-RST with reset_mode=0x09
-    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+    info!("NAV message task waiting for first config command...");
+
+    // Wait for first config command (FIRST_CONFIG_MILLIS != 0)
+    while FIRST_CONFIG_MILLIS.load(Ordering::Acquire) == 0 {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // Delay after first CFG-MSG (like C version)
-    Timer::after(Duration::from_millis(config::timers::UART_TX_INIT_DELAY_MS)).await;
-    info!("NAV message output started");
+    // Get model-specific delay
+    let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+    let config_to_nav_delay = match model {
+        DroneModel::Air3 => config::timers::CONFIG_TO_NAV_AIR3_MS,
+        DroneModel::Mavic4Pro => config::timers::CONFIG_TO_NAV_MAVIC4_MS,
+    };
+
+    // Wait remaining time to reach delay after first config
+    let first_config_time = FIRST_CONFIG_MILLIS.load(Ordering::Acquire);
+    let now = Instant::now().as_millis() as u32;
+    let elapsed = now.wrapping_sub(first_config_time) as u64;
+    if elapsed < config_to_nav_delay {
+        let remaining = config_to_nav_delay - elapsed;
+        info!("Waiting {}ms more for NAV start ({}ms from first config)", remaining, config_to_nav_delay);
+        Timer::after(Duration::from_millis(remaining)).await;
+    }
+
+    // Set MSG_OUTPUT_STARTED flag (for other tasks like SEC-SIGN)
+    MSG_OUTPUT_STARTED.store(true, Ordering::Release);
+    // Record start time for 20s invalid satellites timer
+    OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
+    SATELLITES_INVALID.store(false, Ordering::Release);
+    info!("NAV message output started ({}ms after first config)", config_to_nav_delay);
+
+    // Use absolute timestamps to prevent timing drift
+    // Timer::after() would cause drift because it waits AFTER processing completes
+    let mut next_tick = Instant::now();
 
     loop {
         // Calculate effective period = meas_period * nav_rate
         let meas_period = NAV_MEAS_PERIOD_MS.load(Ordering::Acquire);
         let nav_rate = NAV_RATE.load(Ordering::Acquire);
         let effective_period = meas_period * nav_rate;
-        Timer::after(Duration::from_millis(effective_period as u64)).await;
+
+        // Schedule next tick at absolute time (no drift accumulation)
+        next_tick += Duration::from_millis(effective_period as u64);
+        Timer::at(next_tick).await;
 
         let mode = OperatingMode::load();
         if mode != OperatingMode::Emulation {
             continue;
         }
 
-        // Wait for SEC-SIGN computation to complete (like C version's busy-wait)
-        // This prevents packet drops while ensuring SEC-SIGN is sent first
-        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            embassy_futures::yield_now().await;
+        // Wait for SEC-SIGN computation to complete using async Signal
+        // This is more efficient than busy-wait yield_now loop
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            SEC_SIGN_DONE.wait().await;
         }
 
         // Get current message flags
@@ -830,11 +990,41 @@ async fn nav_message_task() {
         let min = ((total_secs / 60) % 60) as u8;
         let hour = ((total_secs / 3600) % 24) as u8;
 
+        // Check if 20 seconds have passed since output started (satellites become invalid)
+        // Using wrapping_sub to handle u32 overflow correctly (~49 days)
+        let start_time = OUTPUT_START_MILLIS.load(Ordering::Acquire);
+        let elapsed_ms = (now.as_millis() as u32).wrapping_sub(start_time);
+        let satellites_invalid = elapsed_ms >= config::timers::SATELLITES_INVALID_AFTER_MS as u32;
+
+        // Update global flag for LED indication (Core1)
+        SATELLITES_INVALID.store(satellites_invalid, Ordering::Release);
+
         // Build and send enabled NAV messages using send_msg! macro
         let mut buf = [0u8; 256];
 
-        // NAV-PVT (0x01 0x07)
-        send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
+        // Helper macro for sending message with UbxMessage trait
+        macro_rules! send_ubx {
+            ($flag:expr, $msg:expr) => {
+                if $flag {
+                    let msg = $msg;
+                    let len = msg.build(&mut buf);
+                    if len > 0 {
+                        let mut vec = heapless::Vec::<u8, 256>::new();
+                        let _ = vec.extend_from_slice(&buf[..len]);
+                        if TX_CHANNEL.try_send(vec).is_err() {
+                            warn!("TX channel full");
+                        }
+                    }
+                }
+            };
+        }
+
+        // NAV-PVT (0x01 0x07) - with fix status
+        if satellites_invalid {
+            send_ubx!(flags.nav_pvt, NavPvt::invalid(itow, hour, min, sec));
+        } else {
+            send_msg!(buf, flags.nav_pvt, NavPvt, { itow: itow, hour: hour, min: min, sec: sec });
+        }
 
         // NAV-POSECEF (0x01 0x01) - uses Default ECEF from C version
         send_msg!(buf, flags.nav_posecef, NavPosecef, { itow: itow });
@@ -842,14 +1032,22 @@ async fn nav_message_task() {
         // NAV-POSLLH (0x01 0x02) - uses Default LLH from C version
         send_msg!(buf, flags.nav_posllh, NavPosllh, { itow: itow });
 
-        // NAV-STATUS (0x01 0x03)
-        send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
+        // NAV-STATUS (0x01 0x03) - with fix status
+        if satellites_invalid {
+            send_ubx!(flags.nav_status, NavStatus::invalid(itow, itow));
+        } else {
+            send_msg!(buf, flags.nav_status, NavStatus, { itow: itow, msss: itow });
+        }
 
         // NAV-DOP (0x01 0x04)
         send_msg!(buf, flags.nav_dop, NavDop, { itow: itow });
 
-        // NAV-SOL (0x01 0x06) - legacy but important for many FCs
-        send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
+        // NAV-SOL (0x01 0x06) - legacy but important for many FCs, with fix status
+        if satellites_invalid {
+            send_ubx!(flags.nav_sol, NavSol::invalid(itow));
+        } else {
+            send_msg!(buf, flags.nav_sol, NavSol, { itow: itow });
+        }
 
         // NAV-VELECEF (0x01 0x11)
         send_msg!(buf, flags.nav_velecef, NavVelecef, { itow: itow });
@@ -872,11 +1070,19 @@ async fn nav_message_task() {
         // NAV-TIMELS (0x01 0x26)
         send_msg!(buf, flags.nav_timels, NavTimels, { itow: itow });
 
-        // NAV-SVINFO (0x01 0x30) - legacy format
-        send_msg!(buf, flags.nav_svinfo, NavSvinfo, { itow: itow });
+        // NAV-SVINFO (0x01 0x30) - legacy format, with satellite info
+        if satellites_invalid {
+            send_ubx!(flags.nav_svinfo, NavSvinfo::invalid(itow));
+        } else {
+            send_msg!(buf, flags.nav_svinfo, NavSvinfo, { itow: itow });
+        }
 
-        // NAV-SAT (0x01 0x35) - M10 format
-        send_msg!(buf, flags.nav_sat, NavSat, { itow: itow });
+        // NAV-SAT (0x01 0x35) - M10 format, with satellite info
+        if satellites_invalid {
+            send_ubx!(flags.nav_sat, NavSat::invalid(itow));
+        } else {
+            send_msg!(buf, flags.nav_sat, NavSat, { itow: itow });
+        }
 
         // NAV-COV (0x01 0x36)
         send_msg!(buf, flags.nav_cov, NavCov, { itow: itow });
@@ -916,10 +1122,10 @@ async fn mon_message_task() {
             continue;
         }
 
-        // Wait for SEC-SIGN computation to complete (like C version's busy-wait)
-        // This prevents packet drops while ensuring SEC-SIGN is sent first
-        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            embassy_futures::yield_now().await;
+        // Wait for SEC-SIGN computation to complete using async Signal
+        // This is more efficient than busy-wait yield_now loop
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            SEC_SIGN_DONE.wait().await;
         }
 
         // Get current message flags
@@ -941,6 +1147,7 @@ async fn mon_message_task() {
 
 /// SEC-SIGN timer task - requests signature at configured interval
 /// Only starts after message output begins (like C version)
+/// Period depends on drone model: Air3=4s, Mavic4Pro=2s
 #[embassy_executor::task]
 async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
@@ -950,13 +1157,25 @@ async fn sec_sign_timer_task() {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // First signature after initial delay
-    Timer::after(Duration::from_millis(config::timers::SEC_SIGN_FIRST_MS)).await;
+    // Select SEC-SIGN timings based on drone model
+    let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+    let (first_delay_ms, period_ms) = match model {
+        DroneModel::Air3 => (
+            config::timers::SEC_SIGN_FIRST_AIR3_MS,
+            config::timers::SEC_SIGN_PERIOD_AIR3_MS,
+        ),
+        DroneModel::Mavic4Pro => (
+            config::timers::SEC_SIGN_FIRST_MAVIC4_MS,
+            config::timers::SEC_SIGN_PERIOD_MAVIC4_MS,
+        ),
+    };
+    info!("SEC-SIGN timer task started (first={}ms, period={}ms for {:?})", first_delay_ms, period_ms, model);
 
-    info!("SEC-SIGN timer task started");
+    // First signature after model-specific delay from NAV start
+    Timer::after(Duration::from_millis(first_delay_ms)).await;
 
     // Then at configured interval
-    let mut ticker = Ticker::every(Duration::from_millis(config::timers::SEC_SIGN_PERIOD_MS));
+    let mut ticker = Ticker::every(Duration::from_millis(period_ms));
     loop {
         ticker.next().await;
 
@@ -993,7 +1212,8 @@ async fn sec_sign_timer_task() {
     }
 }
 
-/// Mode button task - switches mode, saves to flash, and reboots
+/// Mode button task - hot-switches mode without reboot
+/// Settings are preserved because UART RX runs in both modes
 #[embassy_executor::task]
 async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
     loop {
@@ -1007,28 +1227,31 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
                 OperatingMode::Passthrough => OperatingMode::Emulation,
             };
 
-            info!("Switching to {:?}, saving to flash...", new_mode);
+            // Hot-switch: just change MODE atomically
+            new_mode.store();
+            info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
 
-            // Save new mode to flash
-            let save_ok = {
-                let mut flash = flash_mutex.lock().await;
-                flash_storage::save_mode(&mut flash, new_mode as u8).await
-            };
-
-            if save_ok {
-                info!("Mode saved, rebooting...");
-
-                // Wait for button release before reboot
-                btn.wait_for_low().await;
-                Timer::after(Duration::from_millis(100)).await;
-
-                // Reboot to apply new mode
-                SCB::sys_reset();
-            } else {
-                error!("Failed to save mode, not rebooting");
-                // Wait for button release before continuing
-                btn.wait_for_low().await;
+            // Reset 20s timer when switching Passthrough -> Emulation
+            // (new "session" of fake satellite data)
+            if new_mode == OperatingMode::Emulation {
+                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+                SATELLITES_INVALID.store(false, Ordering::Release);
+                info!("Reset satellite validity timer (mode switch)");
             }
+
+            // Save to flash for persistence across power cycles
+            {
+                let mut flash = flash_mutex.lock().await;
+                if flash_storage::save_mode(&mut flash, new_mode as u8).await {
+                    info!("Mode saved to flash");
+                } else {
+                    warn!("Failed to save mode to flash");
+                }
+            }
+
+            // Wait for button release before allowing next switch
+            btn.wait_for_low().await;
+            Timer::after(Duration::from_millis(100)).await;
         }
     }
 }

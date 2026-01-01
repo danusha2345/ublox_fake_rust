@@ -43,11 +43,23 @@ pub enum UbxCommand {
     /// keys: Vec of (key_id, value) pairs - value stored as u32 for all sizes
     CfgValset { _layer: u8, keys: heapless::Vec<(u32, u32), 32> },
 
+    /// CFG-VALGET: Value get (M10)
+    /// keys: Vec of key_ids to query
+    CfgValget { keys: heapless::Vec<u32, 32> },
+
+    /// CFG-0x41: DJI proprietary SEC-SIGN config poll
+    /// Returns 256-byte payload with private key and configuration
+    Cfg41Poll,
+
     /// MON-VER poll: Version request
     MonVerPoll,
 
     /// SEC-UNIQID poll: Unique ID request
     SecUniqidPoll,
+
+    /// MGA-* messages (AssistNow): Assistance data upload
+    /// class 0x13, various IDs (0x00=GPS, 0x02=GAL, 0x03=BDS, 0x06=GLO, 0x20=ANO, 0x40=INI, 0x80=DBD)
+    Mga { id: u8 },
 
     /// Generic poll request (for unhandled polls)
     Poll { class: u8, id: u8 },
@@ -251,6 +263,32 @@ impl UbxParser {
             // CFG-PMS (0x06, 0x86)
             (0x06, 0x86) => UbxCommand::CfgPms,
 
+            // CFG-0x41: DJI proprietary SEC-SIGN config poll
+            (0x06, 0x41) if self.len == 0 => UbxCommand::Cfg41Poll,
+
+            // CFG-VALGET (0x06, 0x8B) - M10 configuration poll
+            (0x06, 0x8B) if self.len >= 8 => {
+                // Payload: version(1), layer(1), position(2), keys...
+                let mut keys: heapless::Vec<u32, 32> = heapless::Vec::new();
+
+                // Parse key IDs starting at offset 4
+                let mut i = 4usize;
+                let end = self.len as usize;
+
+                while i + 4 <= end {
+                    let key = u32::from_le_bytes([
+                        self.payload[i],
+                        self.payload[i + 1],
+                        self.payload[i + 2],
+                        self.payload[i + 3],
+                    ]);
+                    let _ = keys.push(key);
+                    i += 4;
+                }
+
+                UbxCommand::CfgValget { keys }
+            }
+
             // CFG-VALSET (0x06, 0x8A) - M10
             (0x06, 0x8A) if self.len >= 4 => {
                 let _layer = self.payload[1];
@@ -308,6 +346,10 @@ impl UbxParser {
 
             // SEC-UNIQID poll (0x27, 0x03)
             (0x27, 0x03) if self.len == 0 => UbxCommand::SecUniqidPoll,
+
+            // MGA-* (0x13, *) - AssistNow assistance data
+            // MGA-DBD (0x80), MGA-ANO (0x20), MGA-INI (0x40), MGA-GPS (0x00), etc.
+            (0x13, id) => UbxCommand::Mga { id },
 
             // Generic poll requests (zero length, unhandled)
             (class, id) if self.len == 0 => UbxCommand::Poll { class, id },

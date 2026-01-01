@@ -1,6 +1,7 @@
 //! UBX message definitions
 
 use super::UbxMessage;
+use crate::coordinates;
 
 /// UBX-NAV-PVT message (Position Velocity Time)
 #[derive(Clone)]
@@ -42,41 +43,56 @@ pub struct NavPvt {
 
 impl Default for NavPvt {
     fn default() -> Self {
-        // Values copied exactly from C version (massivs.h UBX_NAV_PVT)
         Self {
             itow: 0,
             year: 2025,
             month: 1,
-            day: 12,             // C: 0x0C
-            hour: 12,            // C: 0x0C
-            min: 43,             // C: 0x2B
-            sec: 2,              // C: 0x02
-            valid: 0x37,         // C: 0x37
-            t_acc: 6,            // C: 0x00000006
-            nano: 0x11DE89FD_u32 as i32,  // C: from real GNSS
-            fix_type: 3,         // C: 0x03
-            flags: 0x01,         // C: 0x01
-            flags2: 0x0E,        // C: 0x0E
-            num_sv: 18,          // C: 0x12
-            lon: -801919471,     // C: 0xD03BAA11 (real GNSS coordinates)
-            lat: 257889186,      // C: 0x0F5E13A2
-            height: 73449,       // C: 0x00011EE9
-            h_msl: 100902,       // C: 0x00018626
-            h_acc: 1435,         // C: 0x0000059B
-            v_acc: 2073,         // C: 0x00000819
-            vel_n: -2,           // C: 0xFFFFFFFE
-            vel_e: 1,            // C: 0x00000001
-            vel_d: 1,            // C: 0x00000001
-            g_speed: 0,          // C: 0x00000000
-            head_mot: 0x00C78ADA_u32 as i32,  // C: from real GNSS
-            s_acc: 8,            // C: 0x00000008
-            head_acc: 0x00F0D89E,  // C: from real GNSS
-            p_dop: 110,          // C: 0x006E
+            day: 12,
+            hour: 12,
+            min: 43,
+            sec: 2,
+            valid: 0x37,
+            t_acc: 6,
+            nano: 0x11DE89FD_u32 as i32,
+            fix_type: 3,
+            flags: 0x01,
+            flags2: 0x0E,
+            num_sv: 18,
+            lon: coordinates::lon_1e7(),       // From config
+            lat: coordinates::lat_1e7(),       // From config
+            height: coordinates::alt_mm(),     // From config
+            h_msl: coordinates::alt_mm(),      // From config (approx)
+            h_acc: 1435,
+            v_acc: 2073,
+            vel_n: -2,                         // From real GNSS
+            vel_e: 1,
+            vel_d: 1,
+            g_speed: 0,
+            head_mot: 0x00C78ADA_u32 as i32,   // From real GNSS
+            s_acc: 8,
+            head_acc: 0x00F0D89E,
+            p_dop: 110,
             flags3: 0,
             reserved1: [0; 5],
-            head_veh: 0x00234AE0_u32 as i32,  // C: from real GNSS
+            head_veh: 0x00234AE0_u32 as i32,   // From real GNSS
             mag_dec: 0,
             mag_acc: 0,
+        }
+    }
+}
+
+impl NavPvt {
+    /// Create NavPvt with no fix and single satellite (invalid state)
+    pub fn invalid(itow: u32, hour: u8, min: u8, sec: u8) -> Self {
+        Self {
+            itow,
+            hour,
+            min,
+            sec,
+            fix_type: 0,   // No fix
+            flags: 0x00,   // gnssFixOK=0
+            num_sv: 1,     // 1 satellite visible but not used
+            ..Self::default()
         }
     }
 }
@@ -136,13 +152,12 @@ pub struct NavPosecef {
 
 impl Default for NavPosecef {
     fn default() -> Self {
-        // Values from C version (massivs.h UBX_NAV_POSECEF)
         Self {
             itow: 0,
-            ecef_x: 0x05DDB07B_u32 as i32,  // 98230395 cm
-            ecef_y: 0xDE407016_u32 as i32,  // -565854186 cm
-            ecef_z: 0x106F7693_u32 as i32,  // 276297363 cm
-            p_acc: 252,                      // C: 0x000000FC
+            ecef_x: coordinates::ecef_x_cm(),  // From config
+            ecef_y: coordinates::ecef_y_cm(),  // From config
+            ecef_z: coordinates::ecef_z_cm(),  // From config
+            p_acc: 252,
         }
     }
 }
@@ -176,15 +191,14 @@ pub struct NavPosllh {
 
 impl Default for NavPosllh {
     fn default() -> Self {
-        // Values from C version (massivs.h UBX_NAV_POSLLH)
         Self {
             itow: 0,
-            lon: 0xD03BAA11_u32 as i32,   // -801919471 (deg * 1e-7)
-            lat: 0x0F5E13A2_u32 as i32,   // 257889186 (deg * 1e-7)
-            height: 73449,                 // C: 0x00011EE9 mm
-            h_msl: 100902,                 // C: 0x00018626 mm
-            h_acc: 1435,                   // C: 0x0000059B mm
-            v_acc: 2073,                   // C: 0x00000819 mm
+            lon: coordinates::lon_1e7(),    // From config
+            lat: coordinates::lat_1e7(),    // From config
+            height: coordinates::alt_mm(),  // From config
+            h_msl: coordinates::alt_mm(),   // From config (approx)
+            h_acc: 1435,
+            v_acc: 2073,
         }
     }
 }
@@ -229,6 +243,21 @@ impl Default for NavStatus {
             flags2: 0x08, // C: 0x08
             ttff: 0,      // C: 0x00000000
             msss: 0,      // C: 0x00000000
+        }
+    }
+}
+
+impl NavStatus {
+    /// Create NavStatus with no fix (invalid state)
+    pub fn invalid(itow: u32, msss: u32) -> Self {
+        Self {
+            itow,
+            gps_fix: 0,   // No fix
+            flags: 0x00,  // gpsFixOk=0
+            fix_stat: 0x00,
+            flags2: 0x00,
+            ttff: 0,
+            msss,
         }
     }
 }
@@ -321,25 +350,37 @@ pub struct NavSol {
 
 impl Default for NavSol {
     fn default() -> Self {
-        // ECEF coordinates from C version (same as NAV-POSECEF)
         Self {
             itow: 0,
             f_tow: 0,
-            week: 2349,                          // GPS week (0x092D)
-            gps_fix: 3,                          // 3D fix
-            flags: 0x0F,                         // GPSfixOK + DiffSoln + WKNSET + TOWSET
-            ecef_x: 0x05DDB07B_u32 as i32,       // 98230395 cm
-            ecef_y: 0xDE407016_u32 as i32,       // -565854186 cm
-            ecef_z: 0x106F7693_u32 as i32,       // 276297363 cm
-            p_acc: 252,                          // C: 0x000000FC cm
+            week: 2349,
+            gps_fix: 3,
+            flags: 0x0F,
+            ecef_x: coordinates::ecef_x_cm(),  // From config
+            ecef_y: coordinates::ecef_y_cm(),  // From config
+            ecef_z: coordinates::ecef_z_cm(),  // From config
+            p_acc: 252,
             ecef_vx: 0,
             ecef_vy: 0,
             ecef_vz: 0,
-            s_acc: 100,                          // 1 m/s (0x64)
-            p_dop: 110,                          // 1.10 (0x6E)
+            s_acc: 100,
+            p_dop: 110,
             reserved1: 0,
             num_sv: 18,
             reserved2: 0,
+        }
+    }
+}
+
+impl NavSol {
+    /// Create NavSol with no fix (invalid state)
+    pub fn invalid(itow: u32) -> Self {
+        Self {
+            itow,
+            gps_fix: 0,    // No fix
+            flags: 0x00,   // GPSfixOK=0
+            num_sv: 1,     // 1 satellite visible
+            ..Self::default()
         }
     }
 }
@@ -548,12 +589,36 @@ pub struct SecUniqid {
     pub reserved2: u8,
 }
 
+/// Unique IDs for different drone models (from real GNSS logs)
+pub mod uniqid {
+    /// DJI Air 3 chip unique ID
+    pub const AIR3: [u8; 5] = [0xE0, 0x95, 0x65, 0x0F, 0x2A];
+    /// DJI Mavic 4 Pro chip unique ID
+    pub const MAVIC4PRO: [u8; 5] = [0xEB, 0xB9, 0x91, 0x0F, 0x2B];
+}
+
+impl SecUniqid {
+    /// Create SEC-UNIQID for specific drone model
+    pub fn for_model(model: crate::config::DroneModel) -> Self {
+        let unique_id = match model {
+            crate::config::DroneModel::Air3 => uniqid::AIR3,
+            crate::config::DroneModel::Mavic4Pro => uniqid::MAVIC4PRO,
+        };
+        Self {
+            version: 0x02,
+            reserved: [0x00, 0x00, 0x00],
+            unique_id,
+            reserved2: 0x54,
+        }
+    }
+}
+
 impl Default for SecUniqid {
     fn default() -> Self {
         Self {
             version: 0x02,
             reserved: [0x00, 0x00, 0x00],
-            unique_id: [0xE0, 0x95, 0x65, 0x0F, 0x2A],  // Example chip ID
+            unique_id: uniqid::AIR3,  // Default to Air 3
             reserved2: 0x54,
         }
     }
@@ -965,19 +1030,18 @@ pub struct NavHpposecef {
 
 impl Default for NavHpposecef {
     fn default() -> Self {
-        // Values from C version (massivs.h UBX_NAV_HPPOSECEF)
         Self {
             version: 0,
             reserved1: [0; 3],
             itow: 0,
-            ecef_x: 0x05DDB07B_u32 as i32,  // 98230395 cm
-            ecef_y: 0xDE407016_u32 as i32,  // -565854186 cm
-            ecef_z: 0x106F7693_u32 as i32,  // 276297363 cm
+            ecef_x: coordinates::ecef_x_cm(),  // From config
+            ecef_y: coordinates::ecef_y_cm(),  // From config
+            ecef_z: coordinates::ecef_z_cm(),  // From config
             ecef_x_hp: 0,
             ecef_y_hp: 0,
             ecef_z_hp: 0,
             flags: 0,
-            p_acc: 252,                      // C: 0x000000FC (0.1mm units)
+            p_acc: 252,
         }
     }
 }
@@ -1058,6 +1122,31 @@ impl Default for NavSat {
             itow: 0,
             version: 0x01,
             num_svs: 18,
+            reserved1: [0; 2],
+            sats,
+        }
+    }
+}
+
+impl NavSat {
+    /// Create NavSat with single invalid satellite (no fix, low signal)
+    pub fn invalid(itow: u32) -> Self {
+        let mut sats = [SatInfo::default(); 18];
+        // One satellite with low signal, not used for navigation
+        // flags=0x0001: qualityInd=1 (searching), svUsed=0, health=0
+        sats[0] = SatInfo {
+            gnss_id: 0,  // GPS
+            sv_id: 1,
+            cno: 8,      // Very low signal (8 dBHz)
+            elev: 45,
+            azim: 180,
+            pr_res: 0,
+            flags: 0x00000001, // qualityInd=1, NOT used
+        };
+        Self {
+            itow,
+            version: 0x01,
+            num_svs: 1,  // Only 1 satellite
             reserved1: [0; 2],
             sats,
         }
@@ -1148,6 +1237,31 @@ impl Default for NavSvinfo {
             itow: 0,
             num_ch: 18,
             global_flags: 0x04,
+            reserved1: [0; 2],
+            svs,
+        }
+    }
+}
+
+impl NavSvinfo {
+    /// Create NavSvinfo with single invalid satellite (legacy format)
+    pub fn invalid(itow: u32) -> Self {
+        let mut svs = [SvInfo::default(); 18];
+        // One satellite with low signal, not used
+        svs[0] = SvInfo {
+            chn: 0,
+            svid: 1,
+            flags: 0x00,    // NOT used
+            quality: 0x01,  // low quality
+            cno: 8,         // Very low signal
+            elev: 45,
+            azim: 180,
+            pr_res: 0,
+        };
+        Self {
+            itow,
+            num_ch: 1,      // Only 1 satellite
+            global_flags: 0x00,
             reserved1: [0; 2],
             svs,
         }
@@ -1454,5 +1568,199 @@ impl UbxMessage for RxmRawx {
         buf[13] = self.version;
         buf[14..16].copy_from_slice(&self.reserved1);
         16
+    }
+}
+
+// ============================================================================
+// DJI Proprietary Messages
+// ============================================================================
+
+/// CFG-0x41 (0x06 0x41) - DJI proprietary SEC-SIGN configuration
+/// 256-byte response containing private key and configuration data
+/// Private key is located at offset 175 (0xAF) in payload
+#[derive(Clone)]
+pub struct Cfg41 {
+    /// Full 256-byte payload (template with private key embedded)
+    pub payload: [u8; 256],
+}
+
+/// CFG-0x41 payload templates for different drone models
+/// Captured from real DJI GNSS modules
+pub mod cfg41_templates {
+    /// Private key offset in CFG-0x41 payload
+    pub const PRIVATE_KEY_OFFSET: usize = 175;
+
+    /// Base template from Mavic 4 Pro (private key will be replaced)
+    pub const TEMPLATE: [u8; 256] = [
+        0xC4, 0x90, 0xF3, 0xFF, 0xAE, 0xFF, 0xFE, 0xFF, 0xF7, 0xFF, 0x9F, 0xFF, 0xFF, 0xF7, 0xBF, 0xFF,
+        0xEF, 0xFF, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x82, 0x18, 0xB0, 0x00, 0x00, 0x00,
+        0xF0, 0xA0, 0xF7, 0xF7, 0x00, 0x22, 0x42, 0x60, 0xC0, 0xF8, 0xBC, 0x10, 0x4F, 0xF4, 0x00, 0x31,
+        0xC1, 0x67, 0x70, 0x47, 0x00, 0x00, 0x83, 0x28, 0x8C, 0x16, 0x00, 0x00, 0xF1, 0xA0, 0xF7, 0xF7,
+        0x23, 0xF4, 0x40, 0x03, 0x8E, 0x68, 0x46, 0xF4, 0x40, 0x06, 0xC1, 0xF8, 0xBC, 0x20, 0x8E, 0x60,
+        0xCE, 0x68, 0xC1, 0xF8, 0xBC, 0x20, 0x46, 0xF4, 0xC0, 0x06, 0xCE, 0x60, 0x70, 0x47, 0x00, 0x00,
+        0xA4, 0x0F, 0x0F, 0x00, 0x31, 0x10, 0x00, 0x0D, 0x00, 0x31, 0x10, 0x01, 0x22, 0x00, 0x31, 0x10,
+        0x01, 0xA4, 0x3A, 0x02, 0x00, 0xC7, 0x10, 0x01, 0x03, 0x00, 0xC7, 0x20, 0x1E, 0x04, 0x00, 0xC7,
+        0x50, 0x6A, 0xFD, 0xDD, 0xD2, 0x50, 0x21, 0xEB, 0xB3, 0x05, 0x00, 0xC7, 0x50, 0x1D, 0xEB, 0xED,
+        0x47, 0x60, 0x44, 0x12, 0x42, 0x06, 0x00, 0xC7, 0x50, 0x6A, 0xC4, 0x43, 0x75, 0x06, 0x5A, 0x7A,
+        0xFD, 0x07, 0x00, 0xC7, 0x50, 0x41, 0x77, 0xD2, 0xE9, 0xA1, 0xF0, 0x00, 0x00, 0xA6, 0x18,
+        // Private key starts at offset 175 (next 24 bytes) - placeholder zeros
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Remaining config data
+        0xA4, 0x08, 0x01, 0x00, 0x52, 0x40, 0x00, 0x10, 0x0E, 0x00, 0xA4, 0x20, 0x01, 0x00, 0xA4, 0x40,
+        0x00, 0xB0, 0x71, 0x0B, 0x03, 0x00, 0xA4, 0x40, 0x00, 0xB0, 0x71, 0x0B, 0x05, 0x00, 0xA4, 0x40,
+        0x00, 0xB0, 0x71, 0x0B, 0x0A, 0x00, 0xA4, 0x40, 0x00, 0xD8, 0xB8, 0x05, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+}
+
+impl Cfg41 {
+    /// Create CFG-0x41 response for specific drone model
+    pub fn for_model(model: crate::config::DroneModel) -> Self {
+        use crate::sec_sign::{PRIVATE_KEY_AIR3, PRIVATE_KEY_MAVIC4PRO};
+
+        let mut payload = cfg41_templates::TEMPLATE;
+
+        // Insert private key at offset 175
+        let key = match model {
+            crate::config::DroneModel::Air3 => &PRIVATE_KEY_AIR3,
+            crate::config::DroneModel::Mavic4Pro => &PRIVATE_KEY_MAVIC4PRO,
+        };
+        payload[cfg41_templates::PRIVATE_KEY_OFFSET..cfg41_templates::PRIVATE_KEY_OFFSET + 24]
+            .copy_from_slice(key);
+
+        Self { payload }
+    }
+}
+
+impl Default for Cfg41 {
+    fn default() -> Self {
+        Self::for_model(crate::config::DroneModel::Air3)
+    }
+}
+
+impl UbxMessage for Cfg41 {
+    fn class(&self) -> u8 { 0x06 }
+    fn id(&self) -> u8 { 0x41 }
+    fn payload_len(&self) -> u16 { 256 }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[..256].copy_from_slice(&self.payload);
+        256
+    }
+}
+
+/// CFG-VALGET (0x06 0x8B) response - returns requested configuration values
+#[derive(Clone)]
+pub struct CfgValgetResponse {
+    /// Version (0x01)
+    pub version: u8,
+    /// Layer (0x00=RAM, 0x01=BBR, 0x02=Flash, 0x07=default)
+    pub layer: u8,
+    /// Key-value pairs (key_id, value) - value stored as u64 to support all sizes
+    pub values: heapless::Vec<(u32, u64), 8>,
+}
+
+impl Default for CfgValgetResponse {
+    fn default() -> Self {
+        Self {
+            version: 0x01,
+            layer: 0x04, // Default layer
+            values: heapless::Vec::new(),
+        }
+    }
+}
+
+/// Known CFG-VALGET keys and their default values
+pub mod valget_defaults {
+    /// CFG-UART1-BAUDRATE: 921600 (U4)
+    pub const UART1_BAUDRATE: (u32, u32) = (0x40520001, 921600);
+    /// CFG-HW-RF_LNA_MODE (crystal frequency): 192 MHz (U4)
+    pub const XTAL_FREQ: (u32, u32) = (0x40A40001, 192_000_000);
+    /// CFG-RINV-DUMP: Dump data at startup (L/1-bit)
+    pub const RINV_DUMP: (u32, u32) = (0x10C70001, 0);
+    /// CFG-RINV-SIZE: Size of RINV data (U1) = 30 bytes
+    pub const RINV_SIZE: (u32, u32) = (0x20C70003, 0x1E);
+
+    /// CFG-RINV-DATA0..DATA3: Remote Inventory data (U8 each)
+    /// These contain DJI identification data (from Mavic 4 Pro log)
+    pub const RINV_DATA0: (u32, u64) = (0x50C70004, 0xB3EB2150D2DDFD6A);
+    pub const RINV_DATA1: (u32, u64) = (0x50C70005, 0x4212446047EDEB1D);
+    pub const RINV_DATA2: (u32, u64) = (0x50C70006, 0xFD7A5A067543C46A);
+    pub const RINV_DATA3: (u32, u64) = (0x50C70007, 0x0000F0A1E9D27741);
+}
+
+/// Get value size in bytes from key (bits 28-30)
+fn key_value_size(key: u32) -> usize {
+    match (key >> 28) & 0x07 {
+        1 | 2 => 1,  // L (1-bit) or U1 (1-byte)
+        3 => 2,      // U2 (2-byte)
+        4 => 4,      // U4 (4-byte)
+        5 => 8,      // U8 (8-byte)
+        _ => 1,      // default to 1 byte
+    }
+}
+
+impl CfgValgetResponse {
+    /// Create response for requested keys
+    pub fn for_keys(keys: &[u32]) -> Self {
+        let mut resp = Self::default();
+        for &key in keys {
+            let value: u64 = match key {
+                // 4-byte values (U4)
+                0x40520001 => valget_defaults::UART1_BAUDRATE.1 as u64,
+                0x40A40001 => valget_defaults::XTAL_FREQ.1 as u64,
+                // 1-byte values (L/U1)
+                0x10C70001 => valget_defaults::RINV_DUMP.1 as u64,
+                0x20C70003 => valget_defaults::RINV_SIZE.1 as u64,
+                // 8-byte values (U8) - RINV data
+                0x50C70004 => valget_defaults::RINV_DATA0.1,
+                0x50C70005 => valget_defaults::RINV_DATA1.1,
+                0x50C70006 => valget_defaults::RINV_DATA2.1,
+                0x50C70007 => valget_defaults::RINV_DATA3.1,
+                _ => 0, // Unknown key - return 0
+            };
+            let _ = resp.values.push((key, value));
+        }
+        resp
+    }
+}
+
+impl UbxMessage for CfgValgetResponse {
+    fn class(&self) -> u8 { 0x06 }
+    fn id(&self) -> u8 { 0x8B }
+    fn payload_len(&self) -> u16 {
+        // Header: version(1) + layer(1) + position(2) = 4
+        // Each key-value: key(4) + value(size depends on key type)
+        let mut len = 4u16;
+        for &(key, _) in self.values.iter() {
+            len += 4 + key_value_size(key) as u16;
+        }
+        len
+    }
+
+    fn write_payload(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.version;
+        buf[1] = self.layer;
+        buf[2] = 0x00; // Position low
+        buf[3] = 0x00; // Position high
+
+        let mut offset = 4;
+        for &(key, value) in self.values.iter() {
+            buf[offset..offset + 4].copy_from_slice(&key.to_le_bytes());
+            offset += 4;
+
+            // Write value with correct size based on key type
+            let val_size = key_value_size(key);
+            match val_size {
+                1 => buf[offset] = value as u8,
+                2 => buf[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes()),
+                4 => buf[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes()),
+                8 => buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes()),
+                _ => buf[offset] = value as u8,
+            }
+            offset += val_size;
+        }
+        offset
     }
 }
