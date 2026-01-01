@@ -228,11 +228,7 @@ impl PositionBuffer {
         for i in 0..self.count {
             let idx = (self.write_idx + 15 - 1 - i) % 15;
             let entry = &self.entries[idx];
-            let diff = if entry.timestamp_ms > target_time {
-                entry.timestamp_ms - target_time
-            } else {
-                target_time - entry.timestamp_ms
-            };
+            let diff = entry.timestamp_ms.abs_diff(target_time);
 
             if diff < best_diff {
                 best_diff = diff;

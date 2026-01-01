@@ -63,6 +63,7 @@ pub enum FixType {
     TimeOnly = 5,
 }
 
+#[allow(dead_code)]
 impl FixType {
     pub fn from_u8(val: u8) -> Self {
         match val {
@@ -93,6 +94,7 @@ pub struct Position {
     /// Timestamp in milliseconds
     pub time_ms: u32,
     /// GPS fix type (need 3D fix for altitude checks)
+    #[allow(dead_code)]
     pub fix_type: FixType,
     /// Horizontal accuracy estimate in mm (from NAV-PVT hAcc)
     pub h_acc_mm: u32,
@@ -181,11 +183,13 @@ impl SpoofDetector {
     }
 
     /// Check if currently in spoofed state
+    #[allow(dead_code)]
     pub fn is_spoofed(&self) -> bool {
         self.spoofed
     }
 
     /// Get total anomaly count (for diagnostics)
+    #[allow(dead_code)]
     pub fn total_anomalies(&self) -> u32 {
         self.total_anomalies
     }
@@ -389,6 +393,7 @@ impl SpoofDetector {
     }
 
     /// Force reset detector state (e.g., on mode change)
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.last_good = None;
         self.prev = None;
@@ -403,6 +408,7 @@ impl SpoofDetector {
     }
 
     /// Get last known good position (for comparison/display)
+    #[allow(dead_code)]
     pub fn last_good_position(&self) -> Option<Position> {
         self.last_good
     }
@@ -484,12 +490,13 @@ impl SpoofDetector {
         // Low variance = linear pattern (suspicious)
         // Normalize to 0-1 range: 1.0 = perfectly linear
         let variance = vel_n_var + vel_e_var;
-        let linearity = 1.0 / (1.0 + variance * 0.01);
+        
 
-        linearity
+        1.0 / (1.0 + variance * 0.01)
     }
 
     /// Get smoothed velocity (from EMA filter)
+    #[allow(dead_code)]
     pub fn smoothed_velocity(&self) -> Option<(f32, f32, f32)> {
         if self.velocity.initialized {
             Some((self.velocity.vel_n, self.velocity.vel_e, self.velocity.vel_d))

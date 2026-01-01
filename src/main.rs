@@ -407,7 +407,7 @@ async fn led_task(
             OperatingMode::Passthrough => {
                 if spoof_detected {
                     // Fast blinking red (200ms cycle = on 100ms, off 100ms)
-                    if blink_counter % 2 == 0 {
+                    if blink_counter.is_multiple_of(2) {
                         RGB8::new(50, 0, 0)  // Red ON
                     } else {
                         RGB8::new(0, 0, 0)   // OFF
