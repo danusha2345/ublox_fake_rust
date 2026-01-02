@@ -56,10 +56,11 @@ pub mod timers {
 }
 
 /// Default coordinates (configurable)
+/// Flamingo Park, Miami Beach: 25°47'09.8"N 80°08'17.0"W
 pub mod default_position {
-    pub const LATITUDE: f64 = 25.7889186;
-    pub const LONGITUDE: f64 = -80.1919471;
-    pub const ALTITUDE_M: i32 = 101;
+    pub const LATITUDE: f64 = 25.7860556;
+    pub const LONGITUDE: f64 = -80.1380556;
+    pub const ALTITUDE_M: i32 = 3;
 }
 
 /// UBX protocol version emulation
