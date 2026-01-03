@@ -154,7 +154,16 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
+/// Default is Mavic 4 Pro, will be auto-detected from drone commands
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro (default)
+
+/// Auto-detection state flags
+/// Set to true once drone model is detected (prevents re-detection)
+static DRONE_DETECTED: AtomicBool = AtomicBool::new(false);
+/// Set to true if SEC-UNIQID poll received (Mavic 4 sends this, Air 3 doesn't)
+static SAW_SEC_UNIQID: AtomicBool = AtomicBool::new(false);
+/// Set to true if CFG-VALGET received before CFG-VALSET (Mavic 4 pattern)
+static SAW_CFG_VALGET: AtomicBool = AtomicBool::new(false);
 
 /// Timestamp when message output started (for 20s invalid satellites timer)
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
@@ -856,6 +865,10 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ack(0x06, 0x86); // ACK for CFG-PMS
         }
         ubx::UbxCommand::CfgValget { keys } => {
+            // CFG-VALGET before CFG-VALSET is a Mavic 4 pattern
+            // Mark this for auto-detection
+            SAW_CFG_VALGET.store(true, Ordering::Release);
+
             info!("CFG-VALGET received for {} keys", keys.len());
             let response = CfgValgetResponse::for_keys(keys);
             send_ubx_message(&response);
@@ -863,6 +876,24 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // NAV output now starts 700ms after first config command (handled in nav_message_task)
         }
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
+            // Auto-detect drone model on first CFG-VALSET
+            // If we haven't detected yet, decide based on what we saw before
+            if !DRONE_DETECTED.load(Ordering::Acquire) {
+                let saw_uniqid = SAW_SEC_UNIQID.load(Ordering::Acquire);
+                let saw_valget = SAW_CFG_VALGET.load(Ordering::Acquire);
+
+                if saw_uniqid || saw_valget {
+                    // Mavic 4 pattern: SEC-UNIQID or CFG-VALGET before CFG-VALSET
+                    DRONE_MODEL.store(1, Ordering::Release); // Mavic 4 Pro
+                    info!("AUTO-DETECT: Mavic 4 Pro (saw SEC-UNIQID={}, CFG-VALGET={})", saw_uniqid, saw_valget);
+                } else {
+                    // Air 3 pattern: CFG-VALSET immediately after MON-VER
+                    DRONE_MODEL.store(0, Ordering::Release); // Air 3
+                    info!("AUTO-DETECT: Air 3 (no SEC-UNIQID/CFG-VALGET before CFG-VALSET)");
+                }
+                DRONE_DETECTED.store(true, Ordering::Release);
+            }
+
             info!("CFG-VALSET received with {} keys", keys.len());
 
             // Process all keys (message output starts on CFG-RST)
@@ -884,6 +915,17 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&ver);
         }
         ubx::UbxCommand::SecUniqidPoll => {
+            // SEC-UNIQID poll is sent by Mavic 4, not by Air 3
+            // Mark this for auto-detection
+            SAW_SEC_UNIQID.store(true, Ordering::Release);
+
+            // Auto-detect: if we see SEC-UNIQID, it's Mavic 4
+            if !DRONE_DETECTED.load(Ordering::Acquire) {
+                DRONE_MODEL.store(1, Ordering::Release); // Mavic 4 Pro
+                DRONE_DETECTED.store(true, Ordering::Release);
+                info!("AUTO-DETECT: Mavic 4 Pro (SEC-UNIQID poll received)");
+            }
+
             let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
             info!("SEC-UNIQID poll received, sending unique ID for {:?}", model);
             let uniqid = SecUniqid::for_model(model);
@@ -1235,7 +1277,11 @@ async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) 
             if new_mode == OperatingMode::Emulation {
                 OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
                 SATELLITES_INVALID.store(false, Ordering::Release);
-                info!("Reset satellite validity timer (mode switch)");
+                // Reset auto-detection for new session
+                DRONE_DETECTED.store(false, Ordering::Release);
+                SAW_SEC_UNIQID.store(false, Ordering::Release);
+                SAW_CFG_VALGET.store(false, Ordering::Release);
+                info!("Reset satellite validity timer and auto-detect (mode switch)");
             }
 
             // Save to flash for persistence across power cycles
