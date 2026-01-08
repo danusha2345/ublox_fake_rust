@@ -196,7 +196,7 @@ pub static LAST_GOOD_LON: portable_atomic::AtomicI32 = portable_atomic::AtomicI3
 pub static LAST_GOOD_ALT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 
 /// Flash mutex type for mode persistence
-type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>;
+type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 4 * 1024 * 1024 }>>;
 
 /// Flash for mode persistence (initialized once in main)
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
@@ -244,12 +244,12 @@ async fn main(spawner: Spawner) {
     // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
     {
         use embassy_rp::pio::Pio;
-        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
         use smart_leds::RGB8;
 
         let mut pio0 = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut pio0.common);
-        let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
+        let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_16, &program);
 
         for _ in 0..3 {
             ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
@@ -264,7 +264,7 @@ async fn main(spawner: Spawner) {
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
-    let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
+    let flash = Flash::<_, Async, { 4 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
     // Load saved mode from flash
@@ -287,7 +287,7 @@ async fn main(spawner: Spawner) {
     // Initialize PIO0 for WS2812 LED (GPIO25 on RP2350-Core-A)
     let pio0 = Pio::new(p.PIO0, Irqs);
     let dma_ch1 = p.DMA_CH1;
-    let pin_25 = p.PIN_25;  // WS2812B on GPIO25
+    let led_pin = p.PIN_16;  // WS2812B on GPIO16 (RP2350-Tiny)
 
     // Mode button (GPIO6 = power, GPIO7 = input) - updated for RP2350
     let _btn_pwr = Output::new(p.PIN_6, Level::High);
@@ -302,7 +302,7 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, dma_ch1, pin_25));
+                spawner.must_spawn(led_task(pio0, dma_ch1, led_pin));
                 spawner.must_spawn(sec_sign_compute_task());
                 spawner.must_spawn(mon_message_task());
             });
@@ -396,13 +396,13 @@ async fn main(spawner: Spawner) {
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
-    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
+    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
 ) {
-    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
     use smart_leds::RGB8;
 
     let program = PioWs2812Program::new(&mut pio.common);
-    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio.common, pio.sm0, dma, pin, &program);
+    let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio.common, pio.sm0, dma, pin, &program);
 
     // Faster tick for smooth blinking during spoof detection
     let mut ticker = Ticker::every(Duration::from_millis(100));

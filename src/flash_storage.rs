@@ -32,7 +32,7 @@ impl Default for ModeData {
 }
 
 /// Save mode to flash. Returns true on success, false on error.
-pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>, mode: u8) -> bool {
+pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 4 * 1024 * 1024 }>, mode: u8) -> bool {
     let mut data = [0u8; ERASE_SIZE];
 
     // Prepare data
@@ -65,7 +65,7 @@ pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>,
 }
 
 /// Load mode from flash, returns None if no valid data
-pub fn load_mode(flash: &mut Flash<'_, FLASH, Async, { 2 * 1024 * 1024 }>) -> Option<u8> {
+pub fn load_mode(flash: &mut Flash<'_, FLASH, Async, { 4 * 1024 * 1024 }>) -> Option<u8> {
     let mut buf = [0u8; 8];
 
     if flash.blocking_read(FLASH_OFFSET, &mut buf).is_ok() {
