@@ -24,7 +24,7 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Async, Flash};
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{Flex, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
@@ -80,7 +80,7 @@ macro_rules! send_msg {
             let msg = <$msg_type>::default();
             let len = msg.build(&mut $buf);
             if len > 0 {
-                let mut vec = heapless::Vec::<u8, 256>::new();
+                let mut vec = heapless::Vec::<u8, 1024>::new();
                 let _ = vec.extend_from_slice(&$buf[..len]);
                 if TX_CHANNEL.try_send(vec).is_err() {
                     warn!("TX channel full, dropped {} message", stringify!($msg_type));
@@ -95,7 +95,7 @@ macro_rules! send_msg {
             $( msg.$field = $value; )*
             let len = msg.build(&mut $buf);
             if len > 0 {
-                let mut vec = heapless::Vec::<u8, 256>::new();
+                let mut vec = heapless::Vec::<u8, 1024>::new();
                 let _ = vec.extend_from_slice(&$buf[..len]);
                 if TX_CHANNEL.try_send(vec).is_err() {
                     warn!("TX channel full, dropped {} message", stringify!($msg_type));
@@ -111,10 +111,10 @@ macro_rules! send_msg {
 
 /// Channel for outgoing UBX messages (serialized, ready to send)
 /// Capacity 32 provides buffer for SEC-SIGN computation delays
-static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 32> = Channel::new();
+static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1024>, 32> = Channel::new();
 
 /// Channel for data from external GNSS (UART1 RX -> passthrough TX)
-static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 8> = Channel::new();
+static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1024>, 8> = Channel::new();
 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
@@ -144,7 +144,7 @@ static SEC_SIGN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static SEC_SIGN_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
-static MODE: AtomicU8 = AtomicU8::new(0);
+static MODE: AtomicU8 = AtomicU8::new(2);
 
 /// NAV message measurement period in milliseconds (default from config)
 static NAV_MEAS_PERIOD_MS: AtomicU32 = AtomicU32::new(config::timers::NAV_MEAS_PERIOD_MS);
@@ -270,18 +270,9 @@ async fn main(spawner: Spawner) {
     // Load saved mode from flash
     {
         let mut flash = flash_mutex.lock().await;
-        if let Some(saved_mode) = flash_storage::load_mode(&mut flash) {
-            if saved_mode == 1 {
-                info!("Loaded passthrough mode from flash");
-                OperatingMode::Passthrough.store();
-            } else {
-                info!("Loaded emulation mode from flash");
-                OperatingMode::Emulation.store();
-            }
-        } else {
-            info!("No saved mode, defaulting to emulation");
-            OperatingMode::Emulation.store();
-        }
+        // Force default to PassthroughRaw (Purple) for testing
+            info!("Forcing default to PassthroughRaw (Purple)");
+            OperatingMode::PassthroughRaw.store();
     };
 
     // Initialize PIO0 for WS2812 LED (GPIO16 on RP2350-Tiny)
@@ -289,9 +280,9 @@ async fn main(spawner: Spawner) {
     let dma_ch1 = p.DMA_CH1;
     let led_pin = p.PIN_16;  // WS2812B on GPIO16 (RP2350-Tiny)
 
-    // Mode button (GPIO6 = power, GPIO7 = input) - updated for RP2350
-    let _btn_pwr = Output::new(p.PIN_6, Level::High);
-    let btn_input = Input::new(p.PIN_7, Pull::Down);
+    // Mode button using Flex for E9 workaround (GPIO10=PWR, GPIO11=IN)
+    let _btn_pwr = Output::new(p.PIN_10, Level::High);
+    let btn_flex = Flex::new(p.PIN_11);
 
     // Spawn Core1 for LED, SEC-SIGN computation, and MON messages
     // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
@@ -312,10 +303,10 @@ async fn main(spawner: Spawner) {
     // ========================================================================
     // UART0: Communication with drone/host (TX=GPIO0, RX=GPIO1)
     // ========================================================================
-    static TX_BUF0: StaticCell<[u8; 512]> = StaticCell::new();
-    static RX_BUF0: StaticCell<[u8; 256]> = StaticCell::new();
-    let tx_buf0 = &mut TX_BUF0.init([0; 512])[..];
-    let rx_buf0 = &mut RX_BUF0.init([0; 256])[..];
+    static TX_BUF0: StaticCell<[u8; 1024]> = StaticCell::new();
+    static RX_BUF0: StaticCell<[u8; 512]> = StaticCell::new();
+    let tx_buf0 = &mut TX_BUF0.init([0; 1024])[..];
+    let rx_buf0 = &mut RX_BUF0.init([0; 512])[..];
 
     let mut uart0_config = UartConfig::default();
     uart0_config.baudrate = DEFAULT_BAUDRATE;
@@ -333,10 +324,10 @@ async fn main(spawner: Spawner) {
     // ========================================================================
     // UART1: External GNSS module input (RX=GPIO5)
     // ========================================================================
-    static TX_BUF1: StaticCell<[u8; 64]> = StaticCell::new();
-    static RX_BUF1: StaticCell<[u8; 512]> = StaticCell::new();
-    let tx_buf1 = &mut TX_BUF1.init([0; 64])[..];
-    let rx_buf1 = &mut RX_BUF1.init([0; 512])[..];
+    static TX_BUF1: StaticCell<[u8; 128]> = StaticCell::new();
+    static RX_BUF1: StaticCell<[u8; 1024]> = StaticCell::new();
+    let tx_buf1 = &mut TX_BUF1.init([0; 128])[..];
+    let rx_buf1 = &mut RX_BUF1.init([0; 1024])[..];
 
     let mut uart1_config = UartConfig::default();
     uart1_config.baudrate = DEFAULT_BAUDRATE;
@@ -374,7 +365,8 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(sec_sign_timer_task());
 
     // Button task for mode switching (no reboot!)
-    spawner.must_spawn(button_task(btn_input, flash_mutex));
+    // Button task for mode switching (no reboot!)
+    spawner.must_spawn(button_task(btn_flex, flash_mutex));
 
     info!("All tasks spawned, hot-switch enabled");
 
@@ -575,12 +567,15 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
             }
             OperatingMode::Passthrough => {
                 // Passthrough mode with SEC-SIGN generation (both Spoof and Normal)
-                // We always generate our own SEC-SIGN to ensure validity with our keys
-                match select(
-                    SEC_SIGN_RESULT.wait(),
-                    GNSS_RX_CHANNEL.receive(),
+                // Use timeout to limit blocking time to 100ms for mode switching check
+                match embassy_time::with_timeout(
+                    Duration::from_millis(100),
+                    select(
+                        SEC_SIGN_RESULT.wait(),
+                        GNSS_RX_CHANNEL.receive(),
+                    )
                 ).await {
-                    Either::First(result) => {
+                    Ok(Either::First(result)) => {
                         // SEC-SIGN computed - send it
                         let sec_sign_msg = SecSign {
                             version: 0x01,
@@ -602,7 +597,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                         SEC_SIGN_DONE.signal(());
                     }
-                    Either::Second(msg) => {
+                    Ok(Either::Second(msg)) => {
                         // Wait during SEC-SIGN computation
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
                             if GNSS_RX_CHANNEL.try_send(msg).is_err() {
@@ -626,13 +621,23 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
                         }
                     }
+                    Err(_) => {
+                        // Timeout - just loop to check mode
+                    }
                 }
             }
             OperatingMode::PassthroughRaw => {
                 // Raw passthrough: just forward without any processing
-                let msg = GNSS_RX_CHANNEL.receive().await;
-                if let Err(e) = tx.write_all(&msg).await {
-                    error!("PassthroughRaw TX error: {:?}", e);
+                // Use timeout to allow checking mode changes even if no data arrives
+                match embassy_time::with_timeout(Duration::from_millis(100), GNSS_RX_CHANNEL.receive()).await {
+                    Ok(msg) => {
+                        if let Err(e) = tx.write_all(&msg).await {
+                            error!("PassthroughRaw TX error: {:?}", e);
+                        }
+                    }
+                    Err(_) => {
+                        // Timeout, loop to check mode again
+                    }
                 }
             }
         }
@@ -717,6 +722,9 @@ async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 /// UART1 RX task - receives data from external GNSS module
 /// In passthrough mode: parses UBX frames, detects spoofing, modifies NAV messages
 /// Forwards to GNSS_RX_CHANNEL for uart0_tx_task
+/// UART1 RX task - receives data from external GNSS module
+/// In passthrough mode: parses UBX frames, detects spoofing, modifies NAV messages
+/// Forwards to GNSS_RX_CHANNEL for uart0_tx_task
 #[embassy_executor::task]
 async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     use passthrough::{
@@ -727,26 +735,53 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     use spoof_detector::{SpoofDetector, Position, AnalysisResult, FixType};
 
     let mut buf = [0u8; 256];
-    let mut parser = UbxFrameParser::new();
-    let mut detector = SpoofDetector::new();
-    let mut pos_buffer = PositionBuffer::new();
+    
+    // Lazy initialization of heavy structs to save stack initialization time/space until needed
+    let mut parser: Option<UbxFrameParser> = None;
+    let mut detector: Option<SpoofDetector> = None;
+    let mut pos_buffer: Option<PositionBuffer> = None;
 
-    info!("UART1 RX task ready (external GNSS input with spoof detection)");
+    info!("UART1 RX task ready (external GNSS input)");
+
+    let mut rx_count = 0;
 
     loop {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
+                if rx_count < 10 {
+                    info!("UART1 RX: read {} bytes", n);
+                    rx_count += 1;
+                }
+                
                 let mode = OperatingMode::load();
 
                 if mode == OperatingMode::PassthroughRaw {
                     // Raw passthrough: just forward data without any parsing or processing
-                    let mut vec = heapless::Vec::<u8, 256>::new();
-                    if vec.extend_from_slice(&buf[..n]).is_ok()
-                       && GNSS_RX_CHANNEL.try_send(vec).is_err()
-                    {
-                        debug!("GNSS RX channel full, {} bytes dropped (raw)", n);
+                    let mut vec = heapless::Vec::<u8, 1024>::new();
+                    if vec.extend_from_slice(&buf[..n]).is_ok() {
+                        if let Err(_) = GNSS_RX_CHANNEL.try_send(vec) {
+                            if rx_count < 20 {
+                                warn!("GNSS RX channel full (raw)!");
+                            }
+                        } else {
+                            if rx_count < 10 {
+                                info!("RX->CH success");
+                            }
+                        }
                     }
                 } else if mode == OperatingMode::Passthrough {
+                    // Initialize parsers if first time entering Passthrough
+                    if parser.is_none() {
+                        parser = Some(UbxFrameParser::new());
+                        detector = Some(SpoofDetector::new());
+                        pos_buffer = Some(PositionBuffer::new());
+                        info!("Initialized SpoofDetector and Parser for Passthrough mode");
+                    }
+                    
+                    let parser = parser.as_mut().unwrap();
+                    let detector = detector.as_mut().unwrap();
+                    let pos_buffer = pos_buffer.as_mut().unwrap();
+
                     // Passthrough mode: parse UBX frames, detect spoofing
                     for &byte in &buf[..n] {
                         if let Some(mut frame) = parser.feed(byte) {
@@ -822,7 +857,7 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                                                 }
                                             }
                                         }
-                                    } else if is_spoofed && was_spoofed {
+                                    } else if is_spoofed {
                                         // Still spoofed - reset recovery timer
                                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                                     }
@@ -849,23 +884,23 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                             }
 
                             // Send frame to TX channel
-                            let mut vec = heapless::Vec::<u8, 256>::new();
+                            let mut vec = heapless::Vec::<u8, 1024>::new();
                             // Truncate if too large for channel (rare for NAV messages)
-                            let copy_len = frame.len().min(256);
-                            if vec.extend_from_slice(&frame[..copy_len]).is_ok()
-                               && GNSS_RX_CHANNEL.try_send(vec).is_err()
-                            {
-                                debug!("GNSS RX channel full, frame dropped");
+                            let copy_len = frame.len().min(1024);
+                            if vec.extend_from_slice(&frame[..copy_len]).is_ok() {
+                               if GNSS_RX_CHANNEL.try_send(vec).is_err() {
+                                   debug!("GNSS RX channel full, frame dropped");
+                               }
                             }
                         }
                     }
                 } else {
                     // Emulation mode: just forward raw data (will be ignored by uart0_tx_task)
-                    let mut vec = heapless::Vec::<u8, 256>::new();
-                    if vec.extend_from_slice(&buf[..n]).is_ok()
-                       && GNSS_RX_CHANNEL.try_send(vec).is_err()
-                    {
-                        debug!("GNSS RX channel full, {} bytes dropped", n);
+                    let mut vec = heapless::Vec::<u8, 1024>::new();
+                    if vec.extend_from_slice(&buf[..n]).is_ok() {
+                       if GNSS_RX_CHANNEL.try_send(vec).is_err() {
+                           // debug!("GNSS RX channel full, {} bytes dropped", n);
+                       }
                     }
                 }
             }
@@ -1288,7 +1323,7 @@ async fn nav_message_task() {
                     let msg = $msg;
                     let len = msg.build(&mut buf);
                     if len > 0 {
-                        let mut vec = heapless::Vec::<u8, 256>::new();
+                        let mut vec = heapless::Vec::<u8, 1024>::new();
                         let _ = vec.extend_from_slice(&buf[..len]);
                         if TX_CHANNEL.try_send(vec).is_err() {
                             warn!("TX channel full");
@@ -1504,55 +1539,100 @@ async fn sec_sign_timer_task() {
 }
 
 /// Mode button task - hot-switches mode without reboot
-/// Settings are preserved because UART RX runs in both modes
+/// Uses pure polling and implements RP2350-E9 Errata Workaround (Input Latch-up fix)
 /// Cycle: Emulation -> Passthrough -> PassthroughRaw -> Emulation
 #[embassy_executor::task]
-async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
+async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) {
+    // Initial setup
+    flex.set_as_input();
+    flex.set_pull(Pull::Down);
+    
+    // Wait 1s at startup to ignore power-on noise
+    Timer::after(Duration::from_millis(1000)).await;
+
+    let mut was_high = false;
+
     loop {
-        btn.wait_for_high().await;
-        Timer::after(Duration::from_millis(50)).await; // Debounce
+        Timer::after(Duration::from_millis(20)).await;
+        
+        let is_high = flex.is_high();
 
-        if btn.is_high() {
-            let current = OperatingMode::load();
-            let new_mode = match current {
-                OperatingMode::Emulation => OperatingMode::Passthrough,
-                OperatingMode::Passthrough => OperatingMode::PassthroughRaw,
-                OperatingMode::PassthroughRaw => OperatingMode::Emulation,
-            };
+        if is_high && !was_high {
+             // 0 -> 1 transition
+             info!("button_task: edge detected (0->1), debouncing");
+             Timer::after(Duration::from_millis(50)).await;
+             
+             if flex.is_high() {
+                 info!("button_task: confirmed pressed, switching mode");
 
-            // Hot-switch: just change MODE atomically
-            new_mode.store();
-            info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
+                 let current = OperatingMode::load();
+                 let new_mode = match current {
+                    OperatingMode::Emulation => OperatingMode::Passthrough,
+                    OperatingMode::Passthrough => OperatingMode::PassthroughRaw,
+                    OperatingMode::PassthroughRaw => OperatingMode::Emulation,
+                 };
 
-            // Reset 20s timer when switching to Emulation
-            // (new "session" of fake satellite data)
-            if new_mode == OperatingMode::Emulation {
-                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
-                SATELLITES_INVALID.store(false, Ordering::Release);
-                info!("Reset satellite validity timer (mode switch)");
-            }
+                 // Hot-switch: just change MODE atomically
+                 new_mode.store();
+                 info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
 
-            // Clear spoof flag when switching to PassthroughRaw
-            // (raw mode doesn't detect spoofing)
-            if new_mode == OperatingMode::PassthroughRaw {
-                SPOOF_DETECTED.store(false, Ordering::Release);
-                SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
-                info!("Cleared spoof detection state (entering raw passthrough)");
-            }
+                 // Reset 20s timer when switching to Emulation
+                 if new_mode == OperatingMode::Emulation {
+                     OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+                     SATELLITES_INVALID.store(false, Ordering::Release);
+                     info!("Reset satellite validity timer (mode switch)");
+                 }
 
-            // Save to flash for persistence across power cycles
-            {
-                let mut flash = flash_mutex.lock().await;
-                if flash_storage::save_mode(&mut flash, new_mode as u8).await {
-                    info!("Mode saved to flash");
-                } else {
-                    warn!("Failed to save mode to flash");
-                }
-            }
+                 // Clear spoof flag when switching to PassthroughRaw
+                 if new_mode == OperatingMode::PassthroughRaw {
+                     SPOOF_DETECTED.store(false, Ordering::Release);
+                     SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                     info!("Cleared spoof detection state (entering raw passthrough)");
+                 }
 
-            // Wait for button release before allowing next switch
-            btn.wait_for_low().await;
-            Timer::after(Duration::from_millis(100)).await;
+                 // Save to flash
+                 {
+                    let mut flash = flash_mutex.lock().await;
+                    if flash_storage::save_mode(&mut flash, new_mode as u8).await {
+                        info!("Mode saved to flash");
+                    } else {
+                        warn!("Failed to save mode to flash");
+                    }
+                 }
+
+                 // Wait for release with Errata RP2350-E9 Workaround
+                 info!("button_task: waiting for release...");
+                 
+                 let mut high_count = 0;
+                 
+                 loop {
+                     if !flex.is_high() {
+                         info!("button_task: released!");
+                         break; // Released!
+                     }
+                     
+                     Timer::after(Duration::from_millis(50)).await;
+                     high_count += 1;
+                     
+                     // Every 250ms (5 * 50ms), try to discharge the pin
+                     if high_count % 5 == 0 {
+                         info!("button_task: still HIGH (2.4V latch?), attempting E9 discharge kick...");
+                         
+                         // Workaround: Drive LOW briefly to discharge latch-up
+                         flex.set_as_output();
+                         flex.set_low();
+                         Timer::after(Duration::from_micros(50)).await;
+                         
+                         // Restore Input Pull-Down
+                         flex.set_as_input();
+                         flex.set_pull(Pull::Down);
+                         
+                         // Short settling time
+                         Timer::after(Duration::from_micros(50)).await;
+                     }
+                 }
+             }
         }
+        was_high = is_high;
     }
 }

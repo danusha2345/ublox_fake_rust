@@ -10,7 +10,7 @@ const FLASH_MAGIC: u32 = 0xDEADBEEF;
 /// Flash offset - second-to-last sector (2MB flash)
 /// Last sector 0x1FF000 causes erase to fail (end=0x200000 == FLASH_SIZE)
 /// Using 0x1FE000 (sector 510 of 512)
-const FLASH_OFFSET: u32 = 0x1FE000;
+const FLASH_OFFSET: u32 = 0x3FE000;
 
 /// Mode data stored in flash
 #[repr(C)]

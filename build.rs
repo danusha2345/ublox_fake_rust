@@ -13,11 +13,11 @@ fn main() {
 
     // Select memory layout based on target architecture
     let memory_x = if target.contains("thumbv8m") {
-        // RP2350 (Cortex-M33) - 512KB RAM, 2MB Flash
+        // RP2350 (Cortex-M33) - 520KB RAM, 4MB Flash
         // Pattern from working RP2350 examples - start_block AFTER vector_table
         r#"/* Memory layout for RP2350A (Spotpear RP2350-Core-A) */
 MEMORY {
-    FLASH : ORIGIN = 0x10000000, LENGTH = 2048K
+    FLASH : ORIGIN = 0x10000000, LENGTH = 4096K
     RAM   : ORIGIN = 0x20000000, LENGTH = 512K
     SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
     SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K

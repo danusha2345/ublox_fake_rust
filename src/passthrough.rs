@@ -30,7 +30,7 @@ enum ParseState {
 /// UBX frame parser - accumulates bytes and returns complete frames
 /// Returns owned Vec to avoid borrow checker issues
 pub struct UbxFrameParser {
-    buffer: [u8; 512],
+    buffer: [u8; 1024],
     len: usize,
     state: ParseState,
     payload_len: usize,
@@ -40,7 +40,7 @@ pub struct UbxFrameParser {
 impl UbxFrameParser {
     pub const fn new() -> Self {
         Self {
-            buffer: [0u8; 512],
+            buffer: [0u8; 1024],
             len: 0,
             state: ParseState::WaitSync1,
             payload_len: 0,
@@ -57,7 +57,7 @@ impl UbxFrameParser {
     }
 
     /// Feed a byte to the parser. Returns complete frame as owned Vec if available.
-    pub fn feed(&mut self, byte: u8) -> Option<heapless::Vec<u8, 512>> {
+    pub fn feed(&mut self, byte: u8) -> Option<heapless::Vec<u8, 1024>> {
         match self.state {
             ParseState::WaitSync1 => {
                 if byte == 0xB5 {

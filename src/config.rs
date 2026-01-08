@@ -20,7 +20,7 @@ pub mod pins {
     pub const MODE_BTN_INPUT: u8 = 7;
 
     // WS2812B LED (RP2350-Core-A: GPIO25)
-    pub const WS2812_LED: u8 = 25;
+    pub const WS2812_LED: u8 = 16;
 
     // Legacy alias
     pub const UART_TX: u8 = UART0_TX;
