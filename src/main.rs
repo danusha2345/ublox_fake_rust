@@ -837,14 +837,8 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // 0x08 = GNSS stop
             // 0x09 = GNSS start
             info!("CFG-RST received, reset_mode=0x{:02X}", reset_mode);
-
-            // Reset auto-detection flags for new session (drone may reconnect)
-            DRONE_DETECTED.store(false, Ordering::Release);
-            SAW_SEC_UNIQID.store(false, Ordering::Release);
-            SAW_CFG_VALGET.store(false, Ordering::Release);
-            DRONE_MODEL.store(0, Ordering::Release); // Reset to Air 3 default
-            info!("Reset auto-detect flags (CFG-RST)");
-
+            // Note: Auto-detection is NOT reset here - model is determined once
+            // from initial command sequence before CFG-RST
             // 20s timer starts from NAV output start, not from CFG-RST
             // No ACK for CFG-RST (per u-blox spec - device would normally reboot)
         }
@@ -1201,12 +1195,23 @@ async fn mon_message_task() {
 async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
 
-    // Wait for CFG-RST with reset_mode=0x09
+    // Wait for message output to start
     while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // Select SEC-SIGN timings based on drone model
+    // Wait for drone model auto-detection to complete (with timeout)
+    // If detection doesn't happen within 500ms, use default model (Air 3)
+    let detect_start = embassy_time::Instant::now();
+    while !DRONE_DETECTED.load(Ordering::Acquire) {
+        if detect_start.elapsed().as_millis() > 500 {
+            info!("Auto-detect timeout, using default model (Air 3)");
+            break;
+        }
+        Timer::after(Duration::from_millis(10)).await;
+    }
+
+    // Read model once after detection is complete
     let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
     let (first_delay_ms, period_ms) = match model {
         DroneModel::Air3 => (
