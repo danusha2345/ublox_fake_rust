@@ -156,7 +156,16 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
+/// Default is Air 3, will be auto-detected from drone commands
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air 3 (default)
+
+/// Auto-detection state flags
+/// Set to true once drone model is detected (prevents re-detection)
+static DRONE_DETECTED: AtomicBool = AtomicBool::new(false);
+/// Set to true if SEC-UNIQID poll received (Mavic 4 sends this before CFG-RST, Air 3 doesn't)
+static SAW_SEC_UNIQID: AtomicBool = AtomicBool::new(false);
+/// Set to true if CFG-VALGET received before CFG-VALSET (Mavic 4 pattern)
+static SAW_CFG_VALGET: AtomicBool = AtomicBool::new(false);
 
 /// Timestamp when message output started (for 20s invalid satellites timer)
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
@@ -1134,6 +1143,10 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ack(0x06, 0x86); // ACK for CFG-PMS
         }
         ubx::UbxCommand::CfgValget { keys } => {
+            // CFG-VALGET before CFG-VALSET is a Mavic 4 pattern
+            // Mark this for auto-detection
+            SAW_CFG_VALGET.store(true, Ordering::Release);
+
             info!("CFG-VALGET received for {} keys", keys.len());
             let response = CfgValgetResponse::for_keys(keys);
             send_ubx_message(&response);
@@ -1141,6 +1154,24 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // NAV output now starts 700ms after first config command (handled in nav_message_task)
         }
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
+            // Auto-detect drone model on first CFG-VALSET
+            // If we haven't detected yet, decide based on what we saw before
+            if !DRONE_DETECTED.load(Ordering::Acquire) {
+                let saw_uniqid = SAW_SEC_UNIQID.load(Ordering::Acquire);
+                let saw_valget = SAW_CFG_VALGET.load(Ordering::Acquire);
+
+                if saw_uniqid || saw_valget {
+                    // Mavic 4 pattern: SEC-UNIQID or CFG-VALGET before CFG-VALSET
+                    DRONE_MODEL.store(1, Ordering::Release); // Mavic 4 Pro
+                    info!("AUTO-DETECT: Mavic 4 Pro (saw SEC-UNIQID={}, CFG-VALGET={})", saw_uniqid, saw_valget);
+                } else {
+                    // Air 3 pattern: CFG-VALSET immediately after MON-VER
+                    DRONE_MODEL.store(0, Ordering::Release); // Air 3
+                    info!("AUTO-DETECT: Air 3 (no SEC-UNIQID/CFG-VALGET before CFG-VALSET)");
+                }
+                DRONE_DETECTED.store(true, Ordering::Release);
+            }
+
             info!("CFG-VALSET received with {} keys", keys.len());
 
             // Process all keys (message output starts on CFG-RST)
@@ -1162,6 +1193,10 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&ver);
         }
         ubx::UbxCommand::SecUniqidPoll => {
+            // SEC-UNIQID poll is sent by Mavic 4 before CFG-RST
+            // Mark this for auto-detection (but don't change model here)
+            SAW_SEC_UNIQID.store(true, Ordering::Release);
+
             let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
             info!("SEC-UNIQID poll received, sending unique ID for {:?}", model);
             let uniqid = SecUniqid::for_model(model);
@@ -1429,12 +1464,23 @@ async fn mon_message_task() {
 async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
 
-    // Wait for CFG-RST with reset_mode=0x09
+    // Wait for message output to start
     while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // Select SEC-SIGN timings based on drone model
+    // Wait for drone model auto-detection to complete (with timeout)
+    // If detection doesn't happen within 500ms, use default model (Air 3)
+    let detect_start = embassy_time::Instant::now();
+    while !DRONE_DETECTED.load(Ordering::Acquire) {
+        if detect_start.elapsed().as_millis() > 500 {
+            info!("Auto-detect timeout, using default model (Air 3)");
+            break;
+        }
+        Timer::after(Duration::from_millis(10)).await;
+    }
+
+    // Read model once after detection is complete
     let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
     let (first_delay_ms, period_ms) = match model {
         DroneModel::Air3 => (
