@@ -598,7 +598,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                 error!("Passthrough SEC-SIGN TX error: {:?}", e);
                             }
-                            info!("SEC-SIGN sent in passthrough ({} packets)", result.packet_count);
                         }
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                         SEC_SIGN_DONE.signal(());
@@ -846,7 +845,6 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 
                             // Filter out original SEC-SIGN in Passthrough - we generate our own
                             if class == 0x27 && id == 0x04 {
-                                debug!("Filtered external SEC-SIGN (generating our own)");
                                 continue;
                             }
 
