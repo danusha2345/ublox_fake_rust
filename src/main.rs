@@ -244,12 +244,12 @@ async fn main(spawner: Spawner) {
     // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
     {
         use embassy_rp::pio::Pio;
-        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
         use smart_leds::RGB8;
 
         let mut pio0 = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut pio0.common);
-        let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_16, &program);
+        let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_16, &program);
 
         for _ in 0..3 {
             ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
@@ -398,11 +398,11 @@ async fn led_task(
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
     pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
 ) {
-    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
     use smart_leds::RGB8;
 
     let program = PioWs2812Program::new(&mut pio.common);
-    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::with_color_order(&mut pio.common, pio.sm0, dma, pin, &program);
+    let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio.common, pio.sm0, dma, pin, &program);
 
     // Faster tick for smooth blinking during spoof detection
     let mut ticker = Ticker::every(Duration::from_millis(100));
