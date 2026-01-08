@@ -20,13 +20,14 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Async, Flash};
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pin, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config as UartConfig};
+use embassy_rp::bind_interrupts;
+use embassy_rp::watchdog::Watchdog;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
@@ -57,7 +58,6 @@ use ubx::{
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     UART1_IRQ => BufferedInterruptHandler<UART1>;
-    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
 
 // ============================================================================
@@ -154,7 +154,7 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air 3
 
 /// Timestamp when message output started (for 20s invalid satellites timer)
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
@@ -165,8 +165,10 @@ static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
 /// Signal for baudrate change (value = new baudrate)
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
+
+
 /// Flash mutex type for mode persistence
-type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 2 * 1024 * 1024 }>>;
+type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 4 * 1024 * 1024 }>>;
 
 /// Flash for mode persistence (initialized once in main)
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
@@ -212,12 +214,12 @@ async fn main(spawner: Spawner) {
     // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
     {
         use embassy_rp::pio::Pio;
-        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
         use smart_leds::RGB8;
 
         let mut pio0 = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut pio0.common);
-        let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
+        let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_16, &program);
 
         for _ in 0..3 {
             ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
@@ -232,7 +234,7 @@ async fn main(spawner: Spawner) {
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
-    let flash = Flash::<_, Async, { 2 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
+    let flash = Flash::<_, Async, { 4 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
     // Load saved mode from flash
@@ -252,17 +254,17 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    // Initialize PIO0 for WS2812 LED (GPIO25 on RP2350-Core-A)
+    // Initialize PIO0 for WS2812 LED (GPIO16 on RP2350-Core-A)
     let pio0 = Pio::new(p.PIO0, Irqs);
     let dma_ch1 = p.DMA_CH1;
-    let pin_25 = p.PIN_25;  // WS2812B on GPIO25
+    let pin_16 = p.PIN_16;  // WS2812B on GPIO16
 
-    // Mode button (GPIO6 = power, GPIO7 = input) - updated for RP2350
-    let _btn_pwr = Output::new(p.PIN_6, Level::High);
-    let btn_input = Input::new(p.PIN_7, Pull::Down);
+    // Mode button (GPIO10 = power, GPIO11 = input) - changed for debugging
+    let _btn_pwr = Output::new(p.PIN_10, Level::High);
+    let btn_input = Input::new(p.PIN_11, Pull::Down);
+
 
     // Spawn Core1 for LED, SEC-SIGN computation, and MON messages
-    // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
     spawn_core1(
         p.CORE1,
@@ -270,13 +272,12 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, dma_ch1, pin_25));
+                spawner.must_spawn(led_task(pio0, dma_ch1, pin_16));
                 spawner.must_spawn(sec_sign_compute_task());
                 spawner.must_spawn(mon_message_task());
             });
         },
     );
-
     // ========================================================================
     // UART0: Communication with drone/host (TX=GPIO0, RX=GPIO1)
     // ========================================================================
@@ -338,11 +339,13 @@ async fn main(spawner: Spawner) {
 
     // Emulation tasks (check MODE internally, skip work in passthrough)
     // Note: mon_message_task runs on Core1 for load balancing
+    // Note: mon_message_task runs on Core1 for load balancing
     spawner.must_spawn(nav_message_task());
     spawner.must_spawn(sec_sign_timer_task());
-
-    // Button task for mode switching (no reboot!)
+    
+    // Button task MUST run on Core0 for Flash operations
     spawner.must_spawn(button_task(btn_input, flash_mutex));
+
 
     info!("All tasks spawned, hot-switch enabled");
 
@@ -357,19 +360,19 @@ async fn main(spawner: Spawner) {
 // ============================================================================
 
 /// LED control task - WS2812B on PIO (runs on Core1)
-/// GPIO25 on RP2350-Core-A
+/// GPIO16 on RP2350-Core-A
 /// Green = Emulation mode, Blue = Passthrough mode
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
-    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
+    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
 ) {
-    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
     use smart_leds::RGB8;
 
     let program = PioWs2812Program::new(&mut pio.common);
-    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::new(&mut pio.common, pio.sm0, dma, pin, &program);
+    let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio.common, pio.sm0, dma, pin, &program);
 
     let mut ticker = Ticker::every(Duration::from_millis(500));
     let mut on = false;
@@ -513,9 +516,19 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
             }
             OperatingMode::Passthrough => {
                 // Passthrough: forward data from external GNSS
-                let msg = GNSS_RX_CHANNEL.receive().await;
-                if let Err(e) = tx.write_all(&msg).await {
-                    error!("Passthrough TX error: {:?}", e);
+                // Используем timeout чтобы не блокировать executor (иначе button_task не работает)
+                match embassy_time::with_timeout(
+                    Duration::from_millis(100),
+                    GNSS_RX_CHANNEL.receive()
+                ).await {
+                    Ok(msg) => {
+                        if let Err(e) = tx.write_all(&msg).await {
+                            error!("Passthrough TX error: {:?}", e);
+                        }
+                    }
+                    Err(_) => {
+                        // Timeout - нет данных, продолжаем цикл
+                    }
                 }
             }
         }
@@ -1212,45 +1225,66 @@ async fn sec_sign_timer_task() {
 }
 
 /// Mode button task - hot-switches mode without reboot
-/// Settings are preserved because UART RX runs in both modes
+/// Uses pure polling to avoid RP2350 GPIO event issues
 #[embassy_executor::task]
-async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
+async fn button_task(btn: Input<'static>, flash_mutex: &'static FlashMutex) {
+    info!("button_task started (polling mode)");
+    
+    let mut was_high = false;
+    
     loop {
-        btn.wait_for_high().await;
-        Timer::after(Duration::from_millis(50)).await; // Debounce
-
-        if btn.is_high() {
-            let current = OperatingMode::load();
-            let new_mode = match current {
-                OperatingMode::Emulation => OperatingMode::Passthrough,
-                OperatingMode::Passthrough => OperatingMode::Emulation,
-            };
-
-            // Hot-switch: just change MODE atomically
-            new_mode.store();
-            info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
-
-            // Reset 20s timer when switching Passthrough -> Emulation
-            // (new "session" of fake satellite data)
-            if new_mode == OperatingMode::Emulation {
-                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
-                SATELLITES_INVALID.store(false, Ordering::Release);
-                info!("Reset satellite validity timer (mode switch)");
-            }
-
-            // Save to flash for persistence across power cycles
-            {
-                let mut flash = flash_mutex.lock().await;
-                if flash_storage::save_mode(&mut flash, new_mode as u8).await {
-                    info!("Mode saved to flash");
-                } else {
-                    warn!("Failed to save mode to flash");
-                }
-            }
-
-            // Wait for button release before allowing next switch
-            btn.wait_for_low().await;
-            Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(20)).await;
+        
+        let is_high = btn.is_high();
+        
+        if is_high && !was_high {
+             // 0 -> 1 transition
+             info!("button_task: edge detected (0->1), debouncing");
+             Timer::after(Duration::from_millis(50)).await;
+             
+             if btn.is_high() {
+                 info!("button_task: confirmed pressed, switching mode");
+                 
+                 let current = OperatingMode::load();
+                 let new_mode = match current {
+                    OperatingMode::Emulation => OperatingMode::Passthrough,
+                    OperatingMode::Passthrough => OperatingMode::Emulation,
+                 };
+                 
+                 new_mode.store();
+                 info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
+                 
+                 if new_mode == OperatingMode::Emulation {
+                    OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+                    SATELLITES_INVALID.store(false, Ordering::Release);
+                    info!("Reset satellite validity timer");
+                 }
+                 
+                 // Save
+                 {
+                    let mut flash = flash_mutex.lock().await;
+                    if flash_storage::save_mode(&mut flash, new_mode as u8).await {
+                        info!("Mode saved");
+                    } else {
+                        warn!("Mode save failed");
+                    }
+                 }
+                 
+                 // Wait for release
+                 info!("button_task: waiting for release (is_high=true)");
+                 
+                 let mut high_count = 0;
+                 while btn.is_high() {
+                     Timer::after(Duration::from_millis(50)).await;
+                     high_count += 1;
+                     if high_count % 20 == 0 { // log every 1s
+                         info!("button_task: button still held HIGH...");
+                     }
+                 }
+                 info!("button_task: released!");
+             }
         }
+        
+        was_high = is_high;
     }
 }
