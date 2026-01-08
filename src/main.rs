@@ -21,13 +21,13 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::flash::{Async, Flash};
-use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pin, Pull};
+use embassy_rp::gpio::{Flex, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config as UartConfig};
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_rp::bind_interrupts;
-use embassy_rp::watchdog::Watchdog;
+
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
@@ -58,6 +58,7 @@ use ubx::{
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     UART1_IRQ => BufferedInterruptHandler<UART1>;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
 
 // ============================================================================
@@ -259,9 +260,9 @@ async fn main(spawner: Spawner) {
     let dma_ch1 = p.DMA_CH1;
     let pin_16 = p.PIN_16;  // WS2812B on GPIO16
 
-    // Mode button (GPIO10 = power, GPIO11 = input) - changed for debugging
+    // Mode button using Flex for E9 workaround (GPIO10=PWR, GPIO11=IN)
     let _btn_pwr = Output::new(p.PIN_10, Level::High);
-    let btn_input = Input::new(p.PIN_11, Pull::Down);
+    let btn_flex = Flex::new(p.PIN_11);
 
 
     // Spawn Core1 for LED, SEC-SIGN computation, and MON messages
@@ -344,7 +345,7 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(sec_sign_timer_task());
     
     // Button task MUST run on Core0 for Flash operations
-    spawner.must_spawn(button_task(btn_input, flash_mutex));
+    spawner.must_spawn(button_task(btn_flex, flash_mutex));
 
 
     info!("All tasks spawned, hot-switch enabled");
@@ -1225,24 +1226,28 @@ async fn sec_sign_timer_task() {
 }
 
 /// Mode button task - hot-switches mode without reboot
-/// Uses pure polling to avoid RP2350 GPIO event issues
+/// Uses pure polling and implements RP2350-E9 Errata Workaround (Input Latch-up fix)
 #[embassy_executor::task]
-async fn button_task(btn: Input<'static>, flash_mutex: &'static FlashMutex) {
-    info!("button_task started (polling mode)");
+async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) {
+    info!("button_task started (polling mode with E9 workaround via Flex)");
+    
+    // Initial setup
+    flex.set_as_input();
+    flex.set_pull(Pull::Down);
     
     let mut was_high = false;
     
     loop {
         Timer::after(Duration::from_millis(20)).await;
         
-        let is_high = btn.is_high();
+        let is_high = flex.is_high();
         
         if is_high && !was_high {
              // 0 -> 1 transition
              info!("button_task: edge detected (0->1), debouncing");
              Timer::after(Duration::from_millis(50)).await;
              
-             if btn.is_high() {
+             if flex.is_high() {
                  info!("button_task: confirmed pressed, switching mode");
                  
                  let current = OperatingMode::load();
@@ -1270,18 +1275,37 @@ async fn button_task(btn: Input<'static>, flash_mutex: &'static FlashMutex) {
                     }
                  }
                  
-                 // Wait for release
-                 info!("button_task: waiting for release (is_high=true)");
+                 // Wait for release with Errata RP2350-E9 Workaround
+                 info!("button_task: waiting for release...");
                  
                  let mut high_count = 0;
-                 while btn.is_high() {
+                 
+                 loop {
+                     if !flex.is_high() {
+                         info!("button_task: released!");
+                         break; // Released!
+                     }
+                     
                      Timer::after(Duration::from_millis(50)).await;
                      high_count += 1;
-                     if high_count % 20 == 0 { // log every 1s
-                         info!("button_task: button still held HIGH...");
+                     
+                     // Every 250ms (5 * 50ms), try to discharge the pin
+                     if high_count % 5 == 0 {
+                         info!("button_task: still HIGH (2.4V latch?), attempting E9 discharge kick...");
+                         
+                         // Workaround: Drive LOW briefly to discharge latch-up
+                         flex.set_as_output();
+                         flex.set_low();
+                         Timer::after(Duration::from_micros(50)).await;
+                         
+                         // Restore Input Pull-Down
+                         flex.set_as_input();
+                         flex.set_pull(Pull::Down);
+                         
+                         // Short settling time
+                         Timer::after(Duration::from_micros(50)).await;
                      }
                  }
-                 info!("button_task: released!");
              }
         }
         
