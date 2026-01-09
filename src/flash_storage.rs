@@ -7,10 +7,8 @@ use embassy_rp::peripherals::FLASH;
 /// Magic value to identify valid flash data
 const FLASH_MAGIC: u32 = 0xDEADBEEF;
 
-/// Flash offset - second-to-last sector (2MB flash)
-/// Last sector 0x1FF000 causes erase to fail (end=0x200000 == FLASH_SIZE)
-/// Using 0x1FE000 (sector 510 of 512)
-const FLASH_OFFSET: u32 = 0x1FE000;
+/// Flash offset - автоматически вычисляется от размера памяти
+const FLASH_OFFSET: u32 = (crate::config::FLASH_SIZE_BYTES as u32) - (2 * ERASE_SIZE as u32);
 
 /// Mode data stored in flash
 #[repr(C)]
@@ -32,7 +30,7 @@ impl Default for ModeData {
 }
 
 /// Save mode to flash. Returns true on success, false on error.
-pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 4 * 1024 * 1024 }>, mode: u8) -> bool {
+pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>, mode: u8) -> bool {
     let mut data = [0u8; ERASE_SIZE];
 
     // Prepare data
@@ -65,7 +63,7 @@ pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { 4 * 1024 * 1024 }>,
 }
 
 /// Load mode from flash, returns None if no valid data
-pub fn load_mode(flash: &mut Flash<'_, FLASH, Async, { 4 * 1024 * 1024 }>) -> Option<u8> {
+pub fn load_mode(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>) -> Option<u8> {
     let mut buf = [0u8; 8];
 
     if flash.blocking_read(FLASH_OFFSET, &mut buf).is_ok() {

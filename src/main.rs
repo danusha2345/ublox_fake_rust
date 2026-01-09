@@ -22,7 +22,7 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Async, Flash};
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{Flex, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
 use embassy_rp::pio::Pio;
@@ -175,7 +175,7 @@ static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
 static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
 /// Flash mutex type for mode persistence
-type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 4 * 1024 * 1024 }>>;
+type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { config::FLASH_SIZE_BYTES }>>;
 
 /// Flash for mode persistence (initialized once in main)
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
@@ -241,7 +241,7 @@ async fn main(spawner: Spawner) {
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
-    let flash = Flash::<_, Async, { 4 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
+    let flash = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
     // Load saved mode from flash
@@ -266,9 +266,9 @@ async fn main(spawner: Spawner) {
     let dma_ch1 = p.DMA_CH1;
     let led_pin = p.PIN_16;  // WS2812B on GPIO16
 
-    // Mode button (GPIO6 = power, GPIO7 = input) - updated for RP2350
-    let _btn_pwr = Output::new(p.PIN_6, Level::High);
-    let btn_input = Input::new(p.PIN_7, Pull::Down);
+    // Mode button using Flex for E9 workaround (GPIO10=PWR, GPIO11=IN)
+    let _btn_pwr = Output::new(p.PIN_10, Level::High);
+    let btn_flex = Flex::new(p.PIN_11);
 
     // Spawn Core1 for LED, SEC-SIGN computation, and MON messages
     // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
@@ -351,7 +351,7 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(sec_sign_timer_task());
 
     // Button task for mode switching (no reboot!)
-    spawner.must_spawn(button_task(btn_input, flash_mutex));
+    spawner.must_spawn(button_task(btn_flex, flash_mutex));
 
     info!("All tasks spawned, hot-switch enabled");
 
@@ -1267,49 +1267,95 @@ async fn sec_sign_timer_task() {
 }
 
 /// Mode button task - hot-switches mode without reboot
-/// Settings are preserved because UART RX runs in both modes
+/// Uses pure polling and implements RP2350-E9 Errata Workaround (Input Latch-up fix)
 #[embassy_executor::task]
-async fn button_task(mut btn: Input<'static>, flash_mutex: &'static FlashMutex) {
+async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) {
+    // Initial setup
+    flex.set_as_input();
+    flex.set_pull(Pull::Down);
+    
+    // Wait 1s at startup to ignore power-on noise
+    Timer::after(Duration::from_millis(1000)).await;
+
+    let mut was_high = false;
+
     loop {
-        btn.wait_for_high().await;
-        Timer::after(Duration::from_millis(50)).await; // Debounce
+        Timer::after(Duration::from_millis(20)).await;
+        
+        let is_high = flex.is_high();
 
-        if btn.is_high() {
-            let current = OperatingMode::load();
-            let new_mode = match current {
-                OperatingMode::Emulation => OperatingMode::Passthrough,
-                OperatingMode::Passthrough => OperatingMode::Emulation,
-            };
+        if is_high && !was_high {
+             // 0 -> 1 transition
+             info!("button_task: edge detected (0->1), debouncing");
+             Timer::after(Duration::from_millis(50)).await;
+             
+             if flex.is_high() {
+                 info!("button_task: confirmed pressed, switching mode");
 
-            // Hot-switch: just change MODE atomically
-            new_mode.store();
-            info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
+                 let current = OperatingMode::load();
+                 let new_mode = match current {
+                    OperatingMode::Emulation => OperatingMode::Passthrough,
+                    OperatingMode::Passthrough => OperatingMode::Emulation,
+                 };
 
-            // Reset 20s timer when switching Passthrough -> Emulation
-            // (new "session" of fake satellite data)
-            if new_mode == OperatingMode::Emulation {
-                OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
-                SATELLITES_INVALID.store(false, Ordering::Release);
-                // Reset auto-detection for new session
-                DRONE_DETECTED.store(false, Ordering::Release);
-                SAW_SEC_UNIQID.store(false, Ordering::Release);
-                SAW_CFG_VALGET.store(false, Ordering::Release);
-                info!("Reset satellite validity timer and auto-detect (mode switch)");
-            }
+                 // Hot-switch: just change MODE atomically
+                 new_mode.store();
+                 info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
 
-            // Save to flash for persistence across power cycles
-            {
-                let mut flash = flash_mutex.lock().await;
-                if flash_storage::save_mode(&mut flash, new_mode as u8).await {
-                    info!("Mode saved to flash");
-                } else {
-                    warn!("Failed to save mode to flash");
-                }
-            }
+                 // Reset 20s timer when switching Passthrough -> Emulation
+                 if new_mode == OperatingMode::Emulation {
+                     OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+                     SATELLITES_INVALID.store(false, Ordering::Release);
+                     // Reset auto-detection for new session
+                     DRONE_DETECTED.store(false, Ordering::Release);
+                     SAW_SEC_UNIQID.store(false, Ordering::Release);
+                     SAW_CFG_VALGET.store(false, Ordering::Release);
+                     info!("Reset satellite validity timer and auto-detect (mode switch)");
+                 }
 
-            // Wait for button release before allowing next switch
-            btn.wait_for_low().await;
-            Timer::after(Duration::from_millis(100)).await;
+                 // Save to flash
+                 {
+                    let mut flash = flash_mutex.lock().await;
+                    if flash_storage::save_mode(&mut flash, new_mode as u8).await {
+                        info!("Mode saved to flash");
+                    } else {
+                        warn!("Failed to save mode to flash");
+                    }
+                 }
+
+                 // Wait for release with Errata RP2350-E9 Workaround
+                 info!("button_task: waiting for release...");
+                 
+                 let mut high_count = 0;
+                 
+                 loop {
+                     if !flex.is_high() {
+                         info!("button_task: released!");
+                         break; // Released!
+                     }
+                     
+                     Timer::after(Duration::from_millis(50)).await;
+                     high_count += 1;
+                     
+                     // Every 250ms (5 * 50ms), try to discharge the pin
+                     if high_count % 5 == 0 {
+                         info!("button_task: still HIGH (2.4V latch?), attempting E9 discharge kick...");
+                         
+                         // Workaround: Drive LOW briefly to discharge latch-up
+                         flex.set_as_output();
+                         flex.set_low();
+                         Timer::after(Duration::from_micros(50)).await;
+                         
+                         // Restore Input Pull-Down
+                         flex.set_as_input();
+                         flex.set_pull(Pull::Down);
+                         
+                         // Short settling time
+                         Timer::after(Duration::from_micros(50)).await;
+                     }
+                 }
+             }
         }
+        was_high = is_high;
     }
 }
