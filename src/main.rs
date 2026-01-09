@@ -314,9 +314,9 @@ async fn main(spawner: Spawner) {
     // ========================================================================
     // UART0: Communication with drone/host (TX=GPIO0, RX=GPIO1)
     // ========================================================================
-    static TX_BUF0: StaticCell<[u8; 1024]> = StaticCell::new();
+    static TX_BUF0: StaticCell<[u8; 2048]> = StaticCell::new();
     static RX_BUF0: StaticCell<[u8; 512]> = StaticCell::new();
-    let tx_buf0 = &mut TX_BUF0.init([0; 1024])[..];
+    let tx_buf0 = &mut TX_BUF0.init([0; 2048])[..];
     let rx_buf0 = &mut RX_BUF0.init([0; 512])[..];
 
     let mut uart0_config = UartConfig::default();
@@ -336,9 +336,9 @@ async fn main(spawner: Spawner) {
     // UART1: External GNSS module input (RX=GPIO5)
     // ========================================================================
     static TX_BUF1: StaticCell<[u8; 128]> = StaticCell::new();
-    static RX_BUF1: StaticCell<[u8; 1024]> = StaticCell::new();
+    static RX_BUF1: StaticCell<[u8; 4096]> = StaticCell::new();
     let tx_buf1 = &mut TX_BUF1.init([0; 128])[..];
-    let rx_buf1 = &mut RX_BUF1.init([0; 1024])[..];
+    let rx_buf1 = &mut RX_BUF1.init([0; 4096])[..];
 
     let mut uart1_config = UartConfig::default();
     uart1_config.baudrate = DEFAULT_BAUDRATE;
@@ -609,12 +609,35 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         SEC_SIGN_DONE.signal(());
                     }
                     Ok(Either::Second(msg)) => {
-                        // Wait during SEC-SIGN computation
+                        // If SEC-SIGN is in progress, we MUST wait for it before sending this packet
+                        // This prevents race conditions where packet is sent after hash capture but before signature
+                        // AND prevents packet loss/reordering caused by re-queueing to channel
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-                            if GNSS_RX_CHANNEL.try_send(msg).is_err() {
-                                debug!("Failed to re-queue passthrough msg during SEC-SIGN");
+                            // Block and wait for signature
+                            let result = SEC_SIGN_RESULT.wait().await;
+
+                            // --- Send Signature (Inline) ---
+                            let sec_sign_msg = SecSign {
+                                version: 0x01,
+                                reserved1: 0,
+                                msg_cnt: result.packet_count,
+                                sha256_hash: result.sha256_hash,
+                                session_id: result.session_id,
+                                signature_r: result.signature.r,
+                                signature_s: result.signature.s,
+                            };
+
+                            let mut buf = [0u8; 128];
+                            let len = sec_sign_msg.build(&mut buf);
+                            if len > 0 {
+                                if let Err(e) = tx.write_all(&buf[..len]).await {
+                                    error!("Passthrough SEC-SIGN TX error: {:?}", e);
+                                }
                             }
-                            continue;
+                            // Clear flag and wake tasks
+                            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                            SEC_SIGN_DONE.signal(());
+                            // -------------------------------
                         }
 
                         // Send and accumulate hash for SEC-SIGN
