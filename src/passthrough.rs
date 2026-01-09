@@ -30,26 +30,26 @@ enum ParseState {
 /// UBX frame parser - accumulates bytes and returns complete frames
 /// Returns owned Vec to avoid borrow checker issues
 pub struct UbxFrameParser {
-    buffer: [u8; 1024],
+    buffer: [u8; 2048],
     len: usize,
     state: ParseState,
     payload_len: usize,
     payload_collected: usize,
     // Buffer for non-UBX data (NMEA, RTCM, etc.)
-    // Size matches GNSS_RX_CHANNEL capacity (1024)
-    non_ubx_buffer: [u8; 1024],
+    // Size matches GNSS_RX_CHANNEL capacity (2048)
+    non_ubx_buffer: [u8; 2048],
     non_ubx_len: usize,
 }
 
 impl UbxFrameParser {
     pub const fn new() -> Self {
         Self {
-            buffer: [0u8; 1024],
+            buffer: [0u8; 2048],
             len: 0,
             state: ParseState::WaitSync1,
             payload_len: 0,
             payload_collected: 0,
-            non_ubx_buffer: [0u8; 1024],
+            non_ubx_buffer: [0u8; 2048],
             non_ubx_len: 0,
         }
     }
@@ -64,7 +64,7 @@ impl UbxFrameParser {
     }
 
     /// Feed a byte to the parser. Returns complete frame as owned Vec if available.
-    pub fn feed(&mut self, byte: u8) -> Option<heapless::Vec<u8, 1024>> {
+    pub fn feed(&mut self, byte: u8) -> Option<heapless::Vec<u8, 2048>> {
         match self.state {
             ParseState::WaitSync1 => {
                 if byte == 0xB5 {
@@ -189,7 +189,7 @@ impl UbxFrameParser {
 
     /// Take accumulated non-UBX data and clear the buffer
     /// Returns None if no data accumulated
-    pub fn take_non_ubx_data(&mut self) -> Option<heapless::Vec<u8, 1024>> {
+    pub fn take_non_ubx_data(&mut self) -> Option<heapless::Vec<u8, 2048>> {
         if self.non_ubx_len > 0 {
             let mut vec = heapless::Vec::new();
             if vec.extend_from_slice(&self.non_ubx_buffer[..self.non_ubx_len]).is_ok() {

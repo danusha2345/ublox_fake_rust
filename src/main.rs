@@ -80,7 +80,7 @@ macro_rules! send_msg {
             let msg = <$msg_type>::default();
             let len = msg.build(&mut $buf);
             if len > 0 {
-                let mut vec = heapless::Vec::<u8, 1024>::new();
+                let mut vec = heapless::Vec::<u8, 2048>::new();
                 let _ = vec.extend_from_slice(&$buf[..len]);
                 if TX_CHANNEL.try_send(vec).is_err() {
                     warn!("TX channel full, dropped {} message", stringify!($msg_type));
@@ -95,7 +95,7 @@ macro_rules! send_msg {
             $( msg.$field = $value; )*
             let len = msg.build(&mut $buf);
             if len > 0 {
-                let mut vec = heapless::Vec::<u8, 1024>::new();
+                let mut vec = heapless::Vec::<u8, 2048>::new();
                 let _ = vec.extend_from_slice(&$buf[..len]);
                 if TX_CHANNEL.try_send(vec).is_err() {
                     warn!("TX channel full, dropped {} message", stringify!($msg_type));
@@ -109,12 +109,13 @@ macro_rules! send_msg {
 // Inter-core communication
 // ============================================================================
 
-/// Channel for outgoing UBX messages (serialized, ready to send)
-/// Capacity 32 provides buffer for SEC-SIGN computation delays
-static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1024>, 32> = Channel::new();
+// TX channel for messages to drone (priority high)
+static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 2048>, 32> = Channel::new();
 
-/// Channel for data from external GNSS (UART1 RX -> passthrough TX)
-static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1024>, 8> = Channel::new();
+// RX channel for messages from real GNSS (priority high)
+// Increased buffer size to 2048 bytes for large UBX frames (RXM-RAWX with many satellites)
+// Increased depth to 32 to handle bursts of messages without dropping
+static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 2048>, 32> = Channel::new();
 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
@@ -771,8 +772,9 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 
                 if mode == OperatingMode::PassthroughRaw {
                     // Raw passthrough: just forward data without any parsing or processing
-                    let mut vec = heapless::Vec::<u8, 1024>::new();
-                    if vec.extend_from_slice(&buf[..n]).is_ok() {
+                    let mut vec = heapless::Vec::<u8, 2048>::new();
+                    let copy_len = n.min(2048);
+                    if vec.extend_from_slice(&buf[..copy_len]).is_ok() {
                         if GNSS_RX_CHANNEL.try_send(vec).is_err() {
                             if rx_count < 20 {
                                 warn!("GNSS RX channel full (raw)!");
@@ -907,9 +909,10 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                             }
 
                             // Send frame to TX channel
-                            let mut vec = heapless::Vec::<u8, 1024>::new();
+                            let mut vec = heapless::Vec::<u8, 2048>::new();
                             // Truncate if too large for channel (rare for NAV messages)
-                            let copy_len = frame.len().min(1024);
+                            // RXM-RAWX can be > 1000 bytes with many satellites
+                            let copy_len = frame.len().min(2048);
                             if vec.extend_from_slice(&frame[..copy_len]).is_ok()
                                 && GNSS_RX_CHANNEL.try_send(vec).is_err()
                             {
@@ -926,8 +929,9 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                     }
                 } else {
                     // Emulation mode: just forward raw data (will be ignored by uart0_tx_task)
-                    let mut vec = heapless::Vec::<u8, 1024>::new();
-                    if vec.extend_from_slice(&buf[..n]).is_ok()
+                    let mut vec = heapless::Vec::<u8, 2048>::new();
+                    let copy_len = n.min(2048);
+                    if vec.extend_from_slice(&buf[..copy_len]).is_ok()
                         && GNSS_RX_CHANNEL.try_send(vec).is_err()
                     {
                         // Channel full, drop
@@ -1350,13 +1354,13 @@ async fn nav_message_task() {
         macro_rules! send_ubx {
             ($flag:expr, $msg:expr) => {
                 if $flag {
-                    let msg = $msg;
-                    let len = msg.build(&mut buf);
+                    let mut buf = [0u8; 2048];
+                    let len = $msg.build(&mut buf);
                     if len > 0 {
-                        let mut vec = heapless::Vec::<u8, 1024>::new();
+                        let mut vec = heapless::Vec::<u8, 2048>::new();
                         let _ = vec.extend_from_slice(&buf[..len]);
                         if TX_CHANNEL.try_send(vec).is_err() {
-                            warn!("TX channel full");
+                            warn!("TX channel full, dropped message");
                         }
                     }
                 }
