@@ -110,12 +110,12 @@ macro_rules! send_msg {
 // ============================================================================
 
 // TX channel for messages to drone (priority high)
-static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 16> = Channel::new();
+static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 32> = Channel::new();
 
 // RX channel for messages from real GNSS (priority high)
 // Increased buffer size to 1280 bytes for large UBX frames (RXM-RAWX with many satellites)
-// Depth 16 prevents burst drops while saving memory
-static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 16> = Channel::new();
+// Depth 32 prevents burst drops (16 was insufficient)
+static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 32> = Channel::new();
 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
