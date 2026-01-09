@@ -16,6 +16,13 @@
     - Drift > 10 seconds = spoofing indicator
     - Recovery when drift ≤ 3 seconds
 
+## 3. Bug Fixes (IN PROGRESS) ⚠️
+- [x] **SEC-SIGN not enabled in Passthrough**: Fixed by removing `MSG_OUTPUT_STARTED` wait condition for Passthrough mode
+- [ ] **Hash Mismatch / Packet Drops**:
+    - **Issue**: `GNSS_RX_CHANNEL full` errors observed on startup and high load
+    - **Effect**: Skipped packets causing SEC-SIGN hash mismatch (drone rejects signature)
+    - **Investigation**: `uart0_tx_task` might be too slow or channel (16 frames) too small for burst data
+
 ## Current Active Detection Algorithms
 1. ✅ Teleportation (>500m position jump)
 2. ✅ Speed anomaly (>30 m/s)

@@ -279,6 +279,10 @@ pub struct SpoofDetector {
     
     /// How long we've had valid GNSS time (ms) for calibration
     valid_gnss_duration_ms: u32,
+    
+    /// Warmup sample counter - ignore first N positions to avoid false positives
+    /// on startup when GNSS time and coordinates are first established
+    warmup_samples: u8,
 }
 
 /// Result of position analysis
@@ -295,6 +299,9 @@ pub enum AnalysisResult {
 }
 
 impl SpoofDetector {
+    /// Warmup period - ignore first N positions to avoid false positives
+    const WARMUP_SAMPLES: u8 = 10;
+    
     pub const fn new() -> Self {
         Self {
             last_good: None,
@@ -318,6 +325,8 @@ impl SpoofDetector {
             calibrated_gnss_unix: 0,
             clock_calibrated: false,
             valid_gnss_duration_ms: 0,
+            // Warmup counter
+            warmup_samples: 0,
         }
     }
 
@@ -409,15 +418,37 @@ impl SpoofDetector {
         //     warn!("CNO ANOMALY detected - uniform high signal strength across satellites");
         // }
 
+        // Warmup period - ignore anomalies during first N samples
+        // This prevents false positives when GNSS first acquires fix
+        let in_warmup = self.warmup_samples < Self::WARMUP_SAMPLES;
+        if in_warmup {
+            self.warmup_samples += 1;
+            if self.warmup_samples == Self::WARMUP_SAMPLES {
+                info!("Spoof detector warmup complete ({} samples) - time checks enabled", Self::WARMUP_SAMPLES);
+            }
+        }
+
         // Check for anomalies - SIMPLIFIED: only coordinate + time based checks
+        // 
+        // WARMUP LOGIC:
+        // - Coordinate-based checks (teleport, speed) work IMMEDIATELY
+        //   because if drone "moves" from first position, it's likely spoofing
+        // - Time-based checks (time_spoof, clock_drift) are DELAYED during warmup
+        //   because GNSS time needs calibration first (5 seconds)
+        //
         // Disabled: is_alt_anomaly, is_accel_anomaly, cno_anomaly
-        let is_anomaly = analysis.is_teleport
-            || analysis.is_speed_anomaly
-            // || analysis.is_alt_anomaly    // DISABLED: altitude jumps
-            // || analysis.is_accel_anomaly  // DISABLED: acceleration
-            || time_spoof
-            || clock_drift_spoof;
-            // || cno_anomaly;               // DISABLED: CNO uniformity
+        
+        // Coordinate anomalies - always active (detect movement from start)
+        let coord_anomaly = analysis.is_teleport || analysis.is_speed_anomaly;
+        
+        // Time anomalies - only after warmup (need calibration first)
+        let time_anomaly = if in_warmup {
+            false  // Ignore time anomalies during warmup
+        } else {
+            time_spoof || clock_drift_spoof
+        };
+        
+        let is_anomaly = coord_anomaly || time_anomaly;
 
         // NEW: Prioritize time-based recovery (stronger signal than coordinates)
         if (time_recovery || clock_drift_recovery) && self.spoofed {
@@ -591,6 +622,8 @@ impl SpoofDetector {
         self.calibrated_gnss_unix = 0;
         self.clock_calibrated = false;
         self.valid_gnss_duration_ms = 0;
+        // Reset warmup counter
+        self.warmup_samples = 0;
         info!("Spoof detector reset");
     }
 

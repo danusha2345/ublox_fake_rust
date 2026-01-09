@@ -269,10 +269,20 @@ async fn main(spawner: Spawner) {
 
     // Load saved mode from flash
     {
-        let _flash = flash_mutex.lock().await;
-        // Force default to PassthroughRaw (Purple) for testing
-            info!("Forcing default to PassthroughRaw (Purple)");
-            OperatingMode::PassthroughRaw.store();
+        let mut flash = flash_mutex.lock().await;
+        if let Some(mode_byte) = flash_storage::load_mode(&mut flash) {
+            let mode = match mode_byte {
+                0 => OperatingMode::Emulation,
+                1 => OperatingMode::Passthrough,
+                _ => OperatingMode::PassthroughRaw,
+            };
+            mode.store();
+            info!("Loaded mode {} from flash: {:?}", mode_byte, mode);
+        } else {
+            // No saved mode, default to Emulation
+            info!("No saved mode, defaulting to Emulation");
+            OperatingMode::Emulation.store();
+        }
     };
 
     // Initialize PIO0 for WS2812 LED (GPIO16 on RP2350-Tiny)
@@ -1487,7 +1497,26 @@ async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
 
     // Wait for message output to start
-    while !MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+    // In Passthrough mode, don't wait for MSG_OUTPUT_STARTED - it's set by nav_message_task
+    // which requires first UBX command from host. In Passthrough we start immediately.
+    let start_time = embassy_time::Instant::now();
+    loop {
+        let mode = OperatingMode::load();
+        if mode == OperatingMode::Passthrough {
+            // In Passthrough, wait a fixed delay then start
+            if start_time.elapsed().as_millis() >= 2000 {
+                info!("SEC-SIGN timer: Passthrough mode, starting after 2s delay");
+                break;
+            }
+        } else if mode == OperatingMode::PassthroughRaw {
+            // Raw mode doesn't use SEC-SIGN, but we still need to wait
+            // until mode changes or MSG_OUTPUT_STARTED
+        } else {
+            // Emulation mode - wait for MSG_OUTPUT_STARTED
+            if MSG_OUTPUT_STARTED.load(Ordering::Acquire) {
+                break;
+            }
+        }
         Timer::after(Duration::from_millis(10)).await;
     }
 
