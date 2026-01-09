@@ -269,7 +269,7 @@ async fn main(spawner: Spawner) {
 
     // Load saved mode from flash
     {
-        let mut flash = flash_mutex.lock().await;
+        let _flash = flash_mutex.lock().await;
         // Force default to PassthroughRaw (Purple) for testing
             info!("Forcing default to PassthroughRaw (Purple)");
             OperatingMode::PassthroughRaw.store();
@@ -728,7 +728,8 @@ async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 #[embassy_executor::task]
 async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     use passthrough::{
-        UbxFrameParser, PositionBuffer, extract_position_from_pvt,
+        UbxFrameParser, PositionBuffer, extract_position_from_pvt, extract_gnss_time_from_pvt,
+        extract_cno_from_nav_sat,
         modify_nav_pvt, modify_nav_sol, modify_nav_status, modify_nav_sat, modify_nav_svinfo,
         recalc_checksum,
     };
@@ -740,6 +741,9 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     let mut parser: Option<UbxFrameParser> = None;
     let mut detector: Option<SpoofDetector> = None;
     let mut pos_buffer: Option<PositionBuffer> = None;
+    
+    // CNO buffer - accumulates CNO values from NAV-SAT messages
+    let mut last_cno_values: heapless::Vec<u8, 16> = heapless::Vec::new();
 
     info!("UART1 RX task ready (external GNSS input)");
 
@@ -759,14 +763,12 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                     // Raw passthrough: just forward data without any parsing or processing
                     let mut vec = heapless::Vec::<u8, 1024>::new();
                     if vec.extend_from_slice(&buf[..n]).is_ok() {
-                        if let Err(_) = GNSS_RX_CHANNEL.try_send(vec) {
+                        if GNSS_RX_CHANNEL.try_send(vec).is_err() {
                             if rx_count < 20 {
                                 warn!("GNSS RX channel full (raw)!");
                             }
-                        } else {
-                            if rx_count < 10 {
-                                info!("RX->CH success");
-                            }
+                        } else if rx_count < 10 {
+                            info!("RX->CH success");
                         }
                     }
                 } else if mode == OperatingMode::Passthrough {
@@ -788,6 +790,12 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                             let class = frame[2];
                             let id = frame[3];
                             let now_ms = embassy_time::Instant::now().as_millis() as u32;
+                            
+                            // Extract CNO values from NAV-SAT (0x01, 0x35)
+                            // These will be used in spoof detection for next NAV-PVT
+                            if class == 0x01 && id == 0x35 && frame.len() >= 14 {
+                                last_cno_values = extract_cno_from_nav_sat(&frame[6..]);
+                            }
 
                             // Detect spoofing ONLY from NAV-PVT (0x01, 0x07)
                             if class == 0x01 && id == 0x07 && frame.len() >= 100 {
@@ -800,6 +808,9 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 
                                     // Get fix_type from NAV-PVT payload offset 20
                                     let fix_type = FixType::from_u8(frame[6 + 20]);
+                                    
+                                    // NEW: Extract GNSS time from NAV-PVT
+                                    let gnss_time = extract_gnss_time_from_pvt(&frame[6..], now_ms);
 
                                     // Convert to spoof_detector Position struct
                                     let pos = Position {
@@ -811,6 +822,8 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                                         h_acc_mm: h_acc,
                                         num_sv,
                                         pdop: 100, // Default PDOP, not available in NAV-PVT directly
+                                        gnss_time,
+                                        cno_values: last_cno_values.clone(), // Use accumulated CNO from NAV-SAT
                                     };
 
                                     // Run spoof detection
@@ -887,20 +900,27 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                             let mut vec = heapless::Vec::<u8, 1024>::new();
                             // Truncate if too large for channel (rare for NAV messages)
                             let copy_len = frame.len().min(1024);
-                            if vec.extend_from_slice(&frame[..copy_len]).is_ok() {
-                               if GNSS_RX_CHANNEL.try_send(vec).is_err() {
-                                   debug!("GNSS RX channel full, frame dropped");
-                               }
+                            if vec.extend_from_slice(&frame[..copy_len]).is_ok()
+                                && GNSS_RX_CHANNEL.try_send(vec).is_err()
+                            {
+                                debug!("GNSS RX channel full, frame dropped");
                             }
+                        }
+                    }
+                    
+                    // NEW: Send accumulated non-UBX data (NMEA, RTCM, etc.)
+                    if let Some(non_ubx_data) = parser.take_non_ubx_data() {
+                        if GNSS_RX_CHANNEL.try_send(non_ubx_data).is_err() {
+                            debug!("GNSS RX channel full, non-UBX data dropped");
                         }
                     }
                 } else {
                     // Emulation mode: just forward raw data (will be ignored by uart0_tx_task)
                     let mut vec = heapless::Vec::<u8, 1024>::new();
-                    if vec.extend_from_slice(&buf[..n]).is_ok() {
-                       if GNSS_RX_CHANNEL.try_send(vec).is_err() {
-                           // debug!("GNSS RX channel full, {} bytes dropped", n);
-                       }
+                    if vec.extend_from_slice(&buf[..n]).is_ok()
+                        && GNSS_RX_CHANNEL.try_send(vec).is_err()
+                    {
+                        // Channel full, drop
                     }
                 }
             }

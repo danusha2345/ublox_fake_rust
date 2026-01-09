@@ -35,6 +35,10 @@ pub struct UbxFrameParser {
     state: ParseState,
     payload_len: usize,
     payload_collected: usize,
+    // Buffer for non-UBX data (NMEA, RTCM, etc.)
+    // Size matches GNSS_RX_CHANNEL capacity (1024)
+    non_ubx_buffer: [u8; 1024],
+    non_ubx_len: usize,
 }
 
 impl UbxFrameParser {
@@ -45,6 +49,8 @@ impl UbxFrameParser {
             state: ParseState::WaitSync1,
             payload_len: 0,
             payload_collected: 0,
+            non_ubx_buffer: [0u8; 1024],
+            non_ubx_len: 0,
         }
     }
 
@@ -54,6 +60,7 @@ impl UbxFrameParser {
         self.state = ParseState::WaitSync1;
         self.payload_len = 0;
         self.payload_collected = 0;
+        // Don't reset non_ubx_buffer - it accumulates between UBX frames
     }
 
     /// Feed a byte to the parser. Returns complete frame as owned Vec if available.
@@ -64,6 +71,12 @@ impl UbxFrameParser {
                     self.buffer[0] = byte;
                     self.len = 1;
                     self.state = ParseState::WaitSync2;
+                } else {
+                    // Not a UBX sync byte - accumulate as non-UBX data  
+                    if self.non_ubx_len < self.non_ubx_buffer.len() {
+                        self.non_ubx_buffer[self.non_ubx_len] = byte;
+                        self.non_ubx_len += 1;
+                    }
                 }
                 None
             }
@@ -172,6 +185,22 @@ impl UbxFrameParser {
         }
 
         ck_a == self.buffer[self.len - 2] && ck_b == self.buffer[self.len - 1]
+    }
+
+    /// Take accumulated non-UBX data and clear the buffer
+    /// Returns None if no data accumulated
+    pub fn take_non_ubx_data(&mut self) -> Option<heapless::Vec<u8, 1024>> {
+        if self.non_ubx_len > 0 {
+            let mut vec = heapless::Vec::new();
+            if vec.extend_from_slice(&self.non_ubx_buffer[..self.non_ubx_len]).is_ok() {
+                self.non_ubx_len = 0;
+                Some(vec)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -344,6 +373,110 @@ pub fn extract_position_from_pvt(payload: &[u8]) -> Option<(i32, i32, i32, u32, 
     let speed = libm::sqrtf(vel_n_f * vel_n_f + vel_e_f * vel_e_f) as i32;
 
     Some((lat, lon, height, h_acc, speed, num_sv))
+}
+
+/// Extract GNSS time from NAV-PVT payload
+/// Returns GnssTime if date and time are valid
+pub fn extract_gnss_time_from_pvt(payload: &[u8], system_time_ms: u32) -> Option<crate::spoof_detector::GnssTime> {
+    if payload.len() < 92 {
+        return None;
+    }
+    
+    // NAV-PVT payload offsets (relative to payload start):
+    // iTOW: 0-3 (u32, ms) - GPS time of week
+    // year: 4-5 (u16) - UTC year
+    // month: 6 (u8) - UTC month 1-12
+    // day: 7 (u8) - UTC day 1-31
+    // hour: 8 (u8) - UTC hour 0-23
+    // min: 9 (u8) - UTC minute 0-59
+    // sec: 10 (u8) - UTC second 0-60
+    // valid: 11 (u8) - validity flags (bit 0: validDate, bit 1: validTime, bit 2: fullyResolved)
+    
+    let itow_ms = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let year = u16::from_le_bytes([payload[4], payload[5]]);
+    let month = payload[6];
+    let day = payload[7];
+    let hour = payload[8];
+    let min = payload[9];
+    let sec = payload[10];
+    let valid = payload[11];
+    
+    // Check if date and time are valid (bits 0 and 1 set)
+    if (valid & 0x03) != 0x03 {
+        return None;
+    }
+    
+    // Basic sanity checks
+    if !(1980..=2100).contains(&year) {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    
+    Some(crate::spoof_detector::GnssTime {
+        itow_ms,
+        year,
+        month,
+        day,
+        hour,
+        min,
+        sec,
+        system_time_ms,
+    })
+}
+
+/// Extract CNO (Carrier-to-Noise) values from NAV-SAT payload
+/// Returns Vec of CNO values (dB-Hz) for satellites with valid signal
+/// Used for detecting uniform high CNO (spoof indicator)
+pub fn extract_cno_from_nav_sat(payload: &[u8]) -> heapless::Vec<u8, 16> {
+    let mut cno_values: heapless::Vec<u8, 16> = heapless::Vec::new();
+    
+    // NAV-SAT structure:
+    // Header: 8 bytes (iTOW[4], version[1], numSvs[1], reserved[2])
+    // Per-satellite block: 12 bytes each
+    //   - gnssId[1], svId[1], cno[1], elev[1], azim[2], prRes[2], flags[4]
+    
+    if payload.len() < 8 {
+        return cno_values;
+    }
+    
+    let num_svs = payload[5] as usize;
+    
+    // Check payload size
+    let expected_size = 8 + num_svs * 12;
+    if payload.len() < expected_size {
+        return cno_values;
+    }
+    
+    // Extract CNO for each satellite with valid signal
+    for i in 0..num_svs.min(16) {
+        let offset = 8 + i * 12;
+        let cno = payload[offset + 2]; // CNO at offset 2 within satellite block
+        let flags = u32::from_le_bytes([
+            payload[offset + 8],
+            payload[offset + 9],
+            payload[offset + 10],
+            payload[offset + 11],
+        ]);
+        
+        // Check if satellite is used in solution (bit 3 of flags)
+        // Only consider satellites that are actually being used
+        let sv_used = (flags & 0x08) != 0;
+        
+        // Only include satellites with valid CNO (not 0) that are used
+        if cno > 0 && sv_used {
+            let _ = cno_values.push(cno);
+        }
+    }
+    
+    cno_values
 }
 
 /// PIO passthrough driver - copies input pin state to output pin

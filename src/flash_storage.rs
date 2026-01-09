@@ -67,6 +67,7 @@ pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLAS
 }
 
 /// Load mode from flash, returns None if no valid data
+#[allow(dead_code)]
 pub fn load_mode(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>) -> Option<u8> {
     let mut buf = [0u8; 8];
 

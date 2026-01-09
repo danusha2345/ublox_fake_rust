@@ -48,6 +48,113 @@ pub mod thresholds {
     /// Degrees to meters conversion factor at equator
     /// 1 degree ≈ 111.32 km at equator
     pub const DEG_TO_M: f32 = 111320.0;
+    
+    // ===== Time-based detection thresholds =====
+    
+    /// Maximum realistic GNSS time jump forward in seconds (30s)
+    /// GPS receivers should maintain continuous time
+    pub const MAX_TIME_JUMP_FORWARD_S: i64 = 30;
+    
+    /// Time jump backwards threshold (even 1s backwards is suspicious)
+    /// Real GNSS time should never go backwards
+    pub const TIME_BACKWARDS_THRESHOLD_S: i64 = 1;
+    
+    /// Tolerance for time projection match during recovery (±5s)
+    /// If spoofed time jumps back within this range of projected real time, likely recovery
+    pub const TIME_RECOVERY_TOLERANCE_S: i64 = 5;
+    
+    // ===== CNO (Carrier-to-Noise) detection thresholds =====
+    // Currently disabled but kept for future use
+    
+    /// Minimum CNO standard deviation (dB-Hz)
+    #[allow(dead_code)]
+    pub const MIN_CNO_STDDEV: f32 = 3.0;
+    
+    /// High CNO threshold (dB-Hz)
+    #[allow(dead_code)]
+    pub const HIGH_CNO_THRESHOLD: u8 = 45;
+    
+    /// Minimum satellites needed for CNO variance analysis
+    #[allow(dead_code)]
+    pub const MIN_SATS_FOR_CNO_CHECK: u8 = 4;
+    
+    // ===== System clock drift detection thresholds =====
+    
+    /// Maximum allowed drift between system clock and GNSS time (seconds)
+    /// If |system_time - gnss_time| > this, likely spoofing
+    pub const MAX_CLOCK_DRIFT_S: i64 = 10;
+    
+    /// Calibration period - how long to wait before trusting system clock (ms)
+    /// Need valid GNSS time for at least this long to calibrate
+    pub const CLOCK_CALIBRATION_MS: u32 = 5000;
+}
+
+/// GNSS time from NAV-PVT (UTC time with GPS week reference)
+#[derive(Clone, Copy, Debug)]
+pub struct GnssTime {
+    /// GPS time of week in milliseconds
+    #[allow(dead_code)]
+    pub itow_ms: u32,
+    /// UTC year (e.g., 2026)
+    pub year: u16,
+    /// UTC month (1-12)
+    pub month: u8,
+    /// UTC day (1-31)
+    pub day: u8,
+    /// UTC hour (0-23)
+    pub hour: u8,
+    /// UTC minute (0-59)
+    pub min: u8,
+    /// UTC second (0-60, 60 is for leap second)
+    pub sec: u8,
+    /// System monotonic time when this GNSS time was captured (ms)
+    pub system_time_ms: u32,
+}
+
+impl GnssTime {
+    /// Convert GNSS time to Unix timestamp (seconds since 1970-01-01 UTC)
+    /// Simplified calculation (ignores leap seconds for simplicity in embedded)
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_unix_timestamp(&self) -> i64 {
+        // Days in each month (non-leap year)
+        const DAYS_IN_MONTH: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        
+        // Calculate days since Unix epoch (1970-01-01)
+        let mut days: i64 = 0;
+        
+        // Add full years
+        for y in 1970..(self.year as i32) {
+            days += if is_leap_year(y) { 366 } else { 365 };
+        }
+        
+        // Add full months in current year
+        for &month_days in DAYS_IN_MONTH.iter().take(self.month as usize - 1) {
+            days += month_days as i64;
+        }
+        
+        // Add leap day if current year is leap and past February
+        if is_leap_year(self.year as i32) && self.month > 2 {
+            days += 1;
+        }
+        
+        // Add days in current month
+        days += (self.day - 1) as i64;
+        
+        // Convert to seconds and add time of day
+        days * 86400 + (self.hour as i64) * 3600 + (self.min as i64) * 60 + (self.sec as i64)
+    }
+    
+    /// Project GNSS time forward using elapsed system time
+    /// Returns projected Unix timestamp
+    pub fn project(&self, current_system_ms: u32) -> i64 {
+        let elapsed_ms = current_system_ms.wrapping_sub(self.system_time_ms);
+        self.to_unix_timestamp() + (elapsed_ms as i64 / 1000)
+    }
+}
+
+/// Check if year is a leap year
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// GPS fix type from NAV-PVT
@@ -83,7 +190,7 @@ impl FixType {
 }
 
 /// Position sample for analysis
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct Position {
     /// Latitude in 1e-7 degrees
     pub lat: i32,
@@ -97,11 +204,20 @@ pub struct Position {
     #[allow(dead_code)]
     pub fix_type: FixType,
     /// Horizontal accuracy estimate in mm (from NAV-PVT hAcc)
+    #[allow(dead_code)]
     pub h_acc_mm: u32,
     /// Number of satellites used
+    #[allow(dead_code)]
     pub num_sv: u8,
     /// PDOP * 100 (from NAV-DOP)
+    #[allow(dead_code)]
     pub pdop: u16,
+    /// GNSS time (optional, extracted from NAV-PVT)
+    pub gnss_time: Option<GnssTime>,
+    /// CNO values from satellites (up to 16 values, from NAV-SAT)
+    /// Used for detecting uniform high CNO (spoof indicator)
+    #[allow(dead_code)]
+    pub cno_values: heapless::Vec<u8, 16>,
 }
 
 /// Velocity state for EMA filtering
@@ -124,6 +240,9 @@ pub struct SpoofDetector {
 
     /// Previous position (for velocity calculation)
     prev: Option<Position>,
+    
+    /// Last known good GNSS time (before spoofing)
+    last_good_gnss_time: Option<GnssTime>,
 
     /// EMA-filtered velocity state
     velocity: VelocityState,
@@ -146,6 +265,20 @@ pub struct SpoofDetector {
     /// Circular buffer for pattern detection (last 10 positions)
     position_history: [Option<Position>; 10],
     history_idx: usize,
+    
+    // ===== System clock calibration =====
+    
+    /// System time (ms) when clock was calibrated with valid GNSS time
+    calibrated_at_system_ms: u32,
+    
+    /// GNSS Unix timestamp at calibration moment
+    calibrated_gnss_unix: i64,
+    
+    /// Whether system clock is calibrated
+    clock_calibrated: bool,
+    
+    /// How long we've had valid GNSS time (ms) for calibration
+    valid_gnss_duration_ms: u32,
 }
 
 /// Result of position analysis
@@ -166,6 +299,7 @@ impl SpoofDetector {
         Self {
             last_good: None,
             prev: None,
+            last_good_gnss_time: None,
             velocity: VelocityState {
                 vel_n: 0.0,
                 vel_e: 0.0,
@@ -177,8 +311,13 @@ impl SpoofDetector {
             anomaly_count: 0,
             normal_count: 0,
             total_anomalies: 0,
-            position_history: [None; 10],
+            position_history: [const { None }; 10],
             history_idx: 0,
+            // System clock calibration
+            calibrated_at_system_ms: 0,
+            calibrated_gnss_unix: 0,
+            clock_calibrated: false,
+            valid_gnss_duration_ms: 0,
         }
     }
 
@@ -206,11 +345,11 @@ impl SpoofDetector {
         // }
 
         // First sample - initialize
-        let prev = match self.prev {
-            Some(p) => p,
+        let prev = match &self.prev {
+            Some(p) => p.clone(),
             None => {
-                self.prev = Some(pos);
-                self.last_good = Some(pos);
+                self.prev = Some(pos.clone());
+                self.last_good = Some(pos.clone());
                 info!("Spoof detector initialized: lat={}, lon={}, alt={}mm",
                       pos.lat, pos.lon, pos.alt_mm);
                 return AnalysisResult::Initializing;
@@ -236,16 +375,62 @@ impl SpoofDetector {
         let dt_s = dt_ms as f32 / 1000.0;
         let analysis = self.calculate_movement(&prev, &pos, dt_s);
 
-        // Check for anomalies (including acceleration)
+        // NEW: Check GNSS time for anomalies (if available)
+        let mut time_spoof = false;
+        let mut time_recovery = false;
+        let mut clock_drift_spoof = false;
+        let mut clock_drift_recovery = false;
+        
+        if let Some(ref gnss_time) = pos.gnss_time {
+            // Check time jumps
+            let (is_spoof, is_recovery) = self.check_gnss_time(gnss_time, pos.time_ms);
+            time_spoof = is_spoof;
+            time_recovery = is_recovery;
+            
+            // Check system clock drift
+            let (drift_spoof, drift_recovery) = self.check_system_clock_drift(gnss_time, pos.time_ms);
+            clock_drift_spoof = drift_spoof;
+            clock_drift_recovery = drift_recovery;
+            
+            if time_spoof {
+                warn!("GNSS TIME anomaly detected");
+            }
+            if clock_drift_spoof {
+                warn!("SYSTEM CLOCK DRIFT detected - GNSS time doesn't match system clock");
+            }
+            if time_recovery || clock_drift_recovery {
+                info!("GNSS TIME recovery detected - time back to normal");
+            }
+        }
+        
+        // DISABLED: CNO anomaly check - too many false positives, keeping code for future use
+        // let cno_anomaly = self.check_cno_anomaly(&pos);
+        // if cno_anomaly {
+        //     warn!("CNO ANOMALY detected - uniform high signal strength across satellites");
+        // }
+
+        // Check for anomalies - SIMPLIFIED: only coordinate + time based checks
+        // Disabled: is_alt_anomaly, is_accel_anomaly, cno_anomaly
         let is_anomaly = analysis.is_teleport
             || analysis.is_speed_anomaly
-            || analysis.is_alt_anomaly
-            || analysis.is_accel_anomaly;
+            // || analysis.is_alt_anomaly    // DISABLED: altitude jumps
+            // || analysis.is_accel_anomaly  // DISABLED: acceleration
+            || time_spoof
+            || clock_drift_spoof;
+            // || cno_anomaly;               // DISABLED: CNO uniformity
 
-        // Check for signal quality anomalies (potential spoof indicator)
-        let signal_anomaly = self.check_signal_quality(&pos);
+        // NEW: Prioritize time-based recovery (stronger signal than coordinates)
+        if (time_recovery || clock_drift_recovery) && self.spoofed {
+            self.spoofed = false;
+            self.normal_count = 0;
+            self.anomaly_count = 0;
+            self.last_good = Some(pos.clone());
+            info!("Spoofing cleared by GNSS time/clock recovery");
+            self.prev = Some(pos);
+            return AnalysisResult::Normal;
+        }
 
-        if is_anomaly || signal_anomaly {
+        if is_anomaly {
             self.anomaly_count = self.anomaly_count.saturating_add(1);
             self.normal_count = 0;
             self.total_anomalies += 1;
@@ -265,10 +450,6 @@ impl SpoofDetector {
                 warn!("ACCELERATION anomaly: {} m/s² (max {})",
                       analysis.accel_ms2 as i32, thresholds::MAX_ACCEL_MS2 as i32);
             }
-            if signal_anomaly {
-                warn!("SIGNAL quality anomaly: sats={} acc={}mm pdop={}",
-                      pos.num_sv, pos.h_acc_mm, pos.pdop);
-            }
 
             // Confirm spoofing after consecutive anomalies
             if self.anomaly_count >= thresholds::SPOOF_CONFIRM_COUNT && !self.spoofed {
@@ -284,14 +465,14 @@ impl SpoofDetector {
             // Clear spoofing after enough normal samples
             if self.spoofed && self.normal_count >= thresholds::NORMAL_CONFIRM_COUNT {
                 // Additional check: are we back near last_good position?
-                if let Some(good) = self.last_good {
+                if let Some(ref good) = self.last_good {
                     let dist_from_good = Self::calc_distance(
                         good.lat, good.lon, pos.lat, pos.lon
                     );
 
                     if dist_from_good < thresholds::TELEPORT_M {
                         self.spoofed = false;
-                        self.last_good = Some(pos);
+                        self.last_good = Some(pos.clone());
                         info!("Spoofing cleared - back to normal position");
                     } else {
                         // Still far from last good position, might be legitimate travel
@@ -306,7 +487,7 @@ impl SpoofDetector {
 
             // Update last_good if not spoofed
             if !self.spoofed {
-                self.last_good = Some(pos);
+                self.last_good = Some(pos.clone());
             }
         }
 
@@ -375,7 +556,7 @@ impl SpoofDetector {
         self.prev_speed_ms = speed_ms;
 
         // Store in history buffer for pattern detection
-        self.position_history[self.history_idx] = Some(*curr);
+        self.position_history[self.history_idx] = Some(curr.clone());
         self.history_idx = (self.history_idx + 1) % 10;
 
         MovementAnalysis {
@@ -397,43 +578,161 @@ impl SpoofDetector {
     pub fn reset(&mut self) {
         self.last_good = None;
         self.prev = None;
+        self.last_good_gnss_time = None;
         self.velocity = VelocityState::default();
         self.prev_speed_ms = 0.0;
         self.spoofed = false;
         self.anomaly_count = 0;
         self.normal_count = 0;
-        self.position_history = [None; 10];
+        self.position_history = [const { None }; 10];
         self.history_idx = 0;
+        // Reset system clock calibration
+        self.calibrated_at_system_ms = 0;
+        self.calibrated_gnss_unix = 0;
+        self.clock_calibrated = false;
+        self.valid_gnss_duration_ms = 0;
         info!("Spoof detector reset");
     }
 
     /// Get last known good position (for comparison/display)
     #[allow(dead_code)]
     pub fn last_good_position(&self) -> Option<Position> {
-        self.last_good
+        self.last_good.clone()
     }
 
-    /// Check signal quality for spoofing indicators
-    /// Returns true if signal quality is suspiciously bad/good
-    fn check_signal_quality(&self, pos: &Position) -> bool {
-        // Suspicious: too few satellites with "perfect" accuracy
-        // Real GPS rarely has <5 sats with <1m accuracy
-        if pos.num_sv < 5 && pos.h_acc_mm < 1000 && pos.h_acc_mm > 0 {
+    /// Check GNSS time for anomalies (spoofing and recovery detection)
+    /// Returns (is_time_spoof, is_time_recovery)
+    fn check_gnss_time(&mut self, curr_time: &GnssTime, system_ms: u32) -> (bool, bool) {
+        let last_good = match self.last_good_gnss_time {
+            Some(t) => t,
+            None => {
+                // First time sample - store as reference
+                self.last_good_gnss_time = Some(*curr_time);
+                return (false, false);
+            }
+        };
+        
+        let curr_unix = curr_time.to_unix_timestamp();
+        let last_unix = last_good.to_unix_timestamp();
+        let time_diff = curr_unix - last_unix;
+        
+        // Check 1: Time jumped backwards (strong spoof indicator)
+        // Real GPS time should never go backwards
+        let time_backwards = time_diff < -thresholds::TIME_BACKWARDS_THRESHOLD_S;
+        
+        // Check 2: Time jumped forward too much (unrealistic)
+        // GPS should maintain continuous time within reasonable bounds
+        let time_forward_jump = time_diff > thresholds::MAX_TIME_JUMP_FORWARD_S;
+        
+        let is_spoof = time_backwards || time_forward_jump;
+        
+        // Check 3: If currently spoofed, check for recovery
+        // If GNSS time jumps back close to projected real time, likely recovered
+        let is_recovery = if self.spoofed {
+            // Project what real time should be now based on last good time
+            let projected_real = last_good.project(system_ms);
+            let diff_from_real = (curr_unix - projected_real).abs();
+            
+            // If current GNSS time is close to projected real time, likely recovered
+            diff_from_real <= thresholds::TIME_RECOVERY_TOLERANCE_S
+        } else {
+            false
+        };
+        
+        // Update last good GNSS time if not spoofed
+        if !is_spoof && !self.spoofed {
+            self.last_good_gnss_time = Some(*curr_time);
+        }
+        
+        (is_spoof, is_recovery)
+    }
+
+    /// Check CNO (Carrier-to-Noise) values for spoofing indicators
+    /// Spoofers often have uniform high CNO across all satellites
+    /// Returns true if CNO pattern is suspiciously uniform
+    /// NOTE: Currently disabled in analyze() but kept for future use
+    #[allow(dead_code)]
+    fn check_cno_anomaly(&self, pos: &Position) -> bool {
+        let cno_count = pos.cno_values.len();
+        
+        // Need enough satellites for meaningful analysis
+        if cno_count < thresholds::MIN_SATS_FOR_CNO_CHECK as usize {
+            return false;
+        }
+        
+        // Calculate mean CNO
+        let sum: u32 = pos.cno_values.iter().map(|&v| v as u32).sum();
+        let mean = sum as f32 / cno_count as f32;
+        
+        // Calculate standard deviation
+        let variance: f32 = pos.cno_values.iter()
+            .map(|&v| {
+                let diff = v as f32 - mean;
+                diff * diff
+            })
+            .sum::<f32>() / cno_count as f32;
+        let stddev = libm::sqrtf(variance);
+        
+        // Check 1: All satellites have suspiciously high CNO (>45 dB-Hz)
+        let all_high = pos.cno_values.iter().all(|&v| v > thresholds::HIGH_CNO_THRESHOLD);
+        
+        // Check 2: Very low variance with high mean (uniform high signal)
+        // Real satellites have varying signal strengths due to atmosphere, multipath, etc.
+        let uniform_high = stddev < thresholds::MIN_CNO_STDDEV && mean > 40.0;
+        
+        if all_high || uniform_high {
             return true;
         }
-
-        // Suspicious: way too many satellites (unlikely real scenario)
-        if pos.num_sv > 30 {
-            return true;
-        }
-
-        // Suspicious: perfect accuracy with high PDOP
-        // PDOP > 5 means poor geometry, should have worse accuracy
-        if pos.pdop > 500 && pos.h_acc_mm < 2000 && pos.h_acc_mm > 0 {
-            return true;
-        }
-
+        
         false
+    }
+    
+    /// Check and update system clock calibration
+    /// Uses GNSS time to calibrate internal clock, then detects drift during spoofing
+    /// Returns (is_drift_spoof, is_drift_recovery)
+    fn check_system_clock_drift(&mut self, gnss_time: &GnssTime, system_ms: u32) -> (bool, bool) {
+        let gnss_unix = gnss_time.to_unix_timestamp();
+        
+        // Phase 1: Calibration
+        // Need valid GNSS time for at least CLOCK_CALIBRATION_MS before trusting
+        if !self.clock_calibrated {
+            self.valid_gnss_duration_ms = self.valid_gnss_duration_ms.saturating_add(200); // ~5 Hz
+            
+            if self.valid_gnss_duration_ms >= thresholds::CLOCK_CALIBRATION_MS {
+                // Calibrate system clock
+                self.calibrated_at_system_ms = system_ms;
+                self.calibrated_gnss_unix = gnss_unix;
+                self.clock_calibrated = true;
+                info!("System clock calibrated with GNSS time");
+            }
+            return (false, false);
+        }
+        
+        // Phase 2: Detection
+        // Calculate expected GNSS time based on system clock elapsed time
+        let elapsed_system_ms = system_ms.wrapping_sub(self.calibrated_at_system_ms);
+        let expected_gnss_unix = self.calibrated_gnss_unix + (elapsed_system_ms as i64 / 1000);
+        
+        // Calculate drift
+        let drift_s = (gnss_unix - expected_gnss_unix).abs();
+        
+        // Check for spoofing: large drift indicates fake GNSS time
+        let is_drift_spoof = drift_s > thresholds::MAX_CLOCK_DRIFT_S;
+        
+        // Check for recovery: drift back to normal
+        let is_drift_recovery = if self.spoofed {
+            drift_s <= 3 // Within 3 seconds of expected time = recovered
+        } else {
+            false
+        };
+        
+        // If not spoofed, update calibration (keeps clock in sync)
+        if !is_drift_spoof && !self.spoofed {
+            self.calibrated_at_system_ms = system_ms;
+            self.calibrated_gnss_unix = gnss_unix;
+        }
+        
+        (is_drift_spoof, is_drift_recovery)
     }
 
     /// Detect linear interpolation patterns (common in spoofers)
@@ -443,7 +742,7 @@ impl SpoofDetector {
         // Need at least 5 positions in history
         let positions: heapless::Vec<Position, 10> = self.position_history
             .iter()
-            .filter_map(|p| *p)
+            .filter_map(|p| p.clone())
             .collect();
 
         if positions.len() < 5 {

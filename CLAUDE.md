@@ -130,12 +130,23 @@ Mode is persisted to flash and survives reboots. Button press cycles modes: Emul
 
 When in passthrough mode, the device parses incoming UBX frames and detects GPS spoofing:
 
-**Detection algorithms** (in `spoof_detector.rs`):
+**Active detection algorithms** (in `spoof_detector.rs`):
 - **Teleportation**: Position jump > 500m
 - **Speed anomaly**: Ground speed > 30 m/s (108 km/h)
-- **Altitude anomaly**: Altitude jump > 10m or vertical speed > 15 m/s
-- **Acceleration anomaly**: Speed change > 20 m/s² (2G)
-- **Signal quality**: Suspicious satellite count or accuracy values
+- **GNSS time jump backwards**: Time going backwards > 1 second
+- **GNSS time jump forwards**: Unrealistic jump > 30 seconds
+- **System clock drift**: GNSS time vs calibrated internal clock > 10 seconds
+
+**Disabled algorithms** (code kept for future use):
+- Altitude anomaly: Jump > 10m or vertical speed > 15 m/s
+- Acceleration anomaly: Speed change > 20 m/s² (2G)
+- CNO uniformity: All satellites with same high CNO (spoof indicator)
+
+**Time-based detection mechanism**:
+1. Calibrate system clock with GNSS time (first 5 seconds)
+2. Project expected GNSS time using monotonic system clock
+3. If incoming GNSS time drifts > 10s from projection → spoofing
+4. If drift returns to ≤ 3s → automatic recovery
 
 **On spoofing detected**:
 1. Save last good coordinates (2 seconds before spoofing started)
