@@ -131,18 +131,14 @@ static FIRST_CONFIG_MILLIS: AtomicU32 = AtomicU32::new(0);
 /// Global SEC-SIGN accumulator (accumulates sent messages)
 static SEC_SIGN_ACC: Mutex<CriticalSectionRawMutex, Option<SecSignAccumulator>> = Mutex::new(None);
 
-/// Request SEC-SIGN computation (Core0 -> Core1)
-static SEC_SIGN_REQUEST: Signal<CriticalSectionRawMutex, SecSignRequest> = Signal::new();
-
-/// SEC-SIGN result ready (Core1 -> Core0)
-static SEC_SIGN_RESULT: Signal<CriticalSectionRawMutex, SecSignResult> = Signal::new();
+// Channels for SEC-SIGN (Replaced Signal with Channel to prevent race conditions/deadlocks)
+static SEC_SIGN_REQUEST: Channel<CriticalSectionRawMutex, SecSignRequest, 2> = Channel::new();
+static SEC_SIGN_RESULT: Channel<CriticalSectionRawMutex, SecSignResult, 2> = Channel::new();
+static SEC_SIGN_DONE: Channel<CriticalSectionRawMutex, (), 2> = Channel::new();
 
 /// SEC-SIGN computation in progress - pause TX to avoid race condition
 /// When true: NAV/MON tasks skip sending, uart_tx_task waits for result
 static SEC_SIGN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-
-/// Signal when SEC-SIGN computation completes (replaces busy-wait yield_now loop)
-static SEC_SIGN_DONE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(2);
@@ -472,7 +468,7 @@ async fn sec_sign_compute_task() {
 
     loop {
         // Wait for request from Core0
-        let request = SEC_SIGN_REQUEST.wait().await;
+        let request = SEC_SIGN_REQUEST.receive().await;
 
         info!("Computing SEC-SIGN for {} packets", request.packet_count);
 
@@ -494,7 +490,7 @@ async fn sec_sign_compute_task() {
             packet_count: request.packet_count,
         };
 
-        SEC_SIGN_RESULT.signal(result);
+        let _ = SEC_SIGN_RESULT.try_send(result);
         info!("SEC-SIGN computation complete");
     }
 }
@@ -520,7 +516,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
             OperatingMode::Emulation => {
                 // Emulation: wait for TX_CHANNEL or SEC-SIGN result
                 match select3(
-                    SEC_SIGN_RESULT.wait(),
+                    SEC_SIGN_RESULT.receive(),
                     TX_CHANNEL.receive(),
                     GNSS_RX_CHANNEL.receive(), // Drain passthrough channel if any
                 ).await {
@@ -546,7 +542,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
                         // Clear flag and wake waiting tasks (NAV/MON)
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                        SEC_SIGN_DONE.signal(());
+                        let _ = SEC_SIGN_DONE.try_send(());
                     }
                     Either3::Second(msg) => {
                         // Regular emulation message
@@ -582,7 +578,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                 match embassy_time::with_timeout(
                     Duration::from_millis(100),
                     select(
-                        SEC_SIGN_RESULT.wait(),
+                        SEC_SIGN_RESULT.receive(),
                         GNSS_RX_CHANNEL.receive(),
                     )
                 ).await {
@@ -606,7 +602,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
                         }
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                        SEC_SIGN_DONE.signal(());
+                        let _ = SEC_SIGN_DONE.try_send(());
                     }
                     Ok(Either::Second(msg)) => {
                         // If SEC-SIGN is in progress, we MUST wait for it before sending this packet
@@ -614,7 +610,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         // AND prevents packet loss/reordering caused by re-queueing to channel
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
                             // Block and wait for signature
-                            let result = SEC_SIGN_RESULT.wait().await;
+                            let result = SEC_SIGN_RESULT.receive().await;
 
                             // --- Send Signature (Inline) ---
                             let sec_sign_msg = SecSign {
@@ -636,7 +632,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
                             // Clear flag and wake tasks
                             SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                            SEC_SIGN_DONE.signal(());
+                            let _ = SEC_SIGN_DONE.try_send(());
                             // -------------------------------
                         }
 
@@ -1344,7 +1340,7 @@ async fn nav_message_task() {
         // Wait for SEC-SIGN computation to complete using async Signal
         // This is more efficient than busy-wait yield_now loop
         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            SEC_SIGN_DONE.wait().await;
+            let _ = SEC_SIGN_DONE.receive().await;
         }
 
         // Get current message flags
@@ -1496,7 +1492,7 @@ async fn mon_message_task() {
         // Wait for SEC-SIGN computation to complete using async Signal
         // This is more efficient than busy-wait yield_now loop
         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            SEC_SIGN_DONE.wait().await;
+            let _ = SEC_SIGN_DONE.receive().await;
         }
 
         // Get current message flags
@@ -1609,7 +1605,7 @@ async fn sec_sign_timer_task() {
             packet_count: count,
         };
 
-        SEC_SIGN_REQUEST.signal(request);
+        let _ = SEC_SIGN_REQUEST.try_send(request);
         info!("SEC-SIGN requested for {} packets (TX paused)", count);
     }
 }
