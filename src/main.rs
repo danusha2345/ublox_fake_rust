@@ -196,7 +196,7 @@ pub static LAST_GOOD_LON: portable_atomic::AtomicI32 = portable_atomic::AtomicI3
 pub static LAST_GOOD_ALT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 
 /// Flash mutex type for mode persistence
-type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 4 * 1024 * 1024 }>>;
+type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { config::FLASH_SIZE_BYTES }>>;
 
 /// Flash for mode persistence (initialized once in main)
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
@@ -264,7 +264,7 @@ async fn main(spawner: Spawner) {
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
-    let flash = Flash::<_, Async, { 4 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
+    let flash = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
     // Load saved mode from flash
