@@ -62,6 +62,16 @@ bind_interrupts!(struct Irqs {
 });
 
 // ============================================================================
+// WS2812 LED Pin Configuration
+// ============================================================================
+
+/// WS2812 LED pin type alias - ИЗМЕНИТЬ ЗДЕСЬ для смены пина светодиода
+/// Примеры: PIN_16, PIN_17, PIN_25
+/// Соответствует config::pins::WS2812_LED
+type WS2812LedPin = embassy_rp::peripherals::PIN_16;
+
+
+// ============================================================================
 // UBX message sending macro
 // ============================================================================
 
@@ -169,7 +179,7 @@ static BAUDRATE_CHANGE: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
 
 /// Flash mutex type for mode persistence
-type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { 4 * 1024 * 1024 }>>;
+type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { config::FLASH_SIZE_BYTES }>>;
 
 /// Flash for mode persistence (initialized once in main)
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
@@ -220,6 +230,7 @@ async fn main(spawner: Spawner) {
 
         let mut pio0 = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut pio0.common);
+        // WS2812 LED пин настраивается через type alias WS2812LedPin (строка ~70)
         let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_16, &program);
 
         for _ in 0..3 {
@@ -235,7 +246,7 @@ async fn main(spawner: Spawner) {
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
-    let flash = Flash::<_, Async, { 4 * 1024 * 1024 }>::new(p.FLASH, p.DMA_CH0);
+    let flash = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
     // Load saved mode from flash
@@ -255,10 +266,12 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    // Initialize PIO0 for WS2812 LED (GPIO16 on RP2350-Core-A)
+    // Initialize PIO0 for WS2812 LED
+    // ВАЖНО: Пин настраивается через type alias WS2812LedPin (строка ~70)
+    // Измените только там: type WS2812LedPin = embassy_rp::peripherals::PIN_XX;
     let pio0 = Pio::new(p.PIO0, Irqs);
     let dma_ch1 = p.DMA_CH1;
-    let pin_16 = p.PIN_16;  // WS2812B on GPIO16
+    let ws2812_pin = p.PIN_16;  // соответствует WS2812LedPin
 
     // Mode button using Flex for E9 workaround (GPIO10=PWR, GPIO11=IN)
     let _btn_pwr = Output::new(p.PIN_10, Level::High);
@@ -273,7 +286,7 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                spawner.must_spawn(led_task(pio0, dma_ch1, pin_16));
+                spawner.must_spawn(led_task(pio0, dma_ch1, ws2812_pin));
                 spawner.must_spawn(sec_sign_compute_task());
                 spawner.must_spawn(mon_message_task());
             });
@@ -361,13 +374,13 @@ async fn main(spawner: Spawner) {
 // ============================================================================
 
 /// LED control task - WS2812B on PIO (runs on Core1)
-/// GPIO16 on RP2350-Core-A
+/// GPIO pin configured via type alias WS2812LedPin (see line ~70)
 /// Green = Emulation mode, Blue = Passthrough mode
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
-    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
+    pin: embassy_rp::Peri<'static, WS2812LedPin>,  // использует type alias
 ) {
     use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
     use smart_leds::RGB8;

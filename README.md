@@ -26,10 +26,12 @@
 
 - **MCU**: RP2350A (Spotpear RP2350-Core-A) или RP2040
 - **Flash**: 2 МБ
-- **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
-- **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
-- **LED**: WS2812B на GPIO25
-- **Кнопка**: GPIO7 (вход), GPIO6 (питание)
+- **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод по умолчанию)
+- **UART1**: TX=GPIO4 (не используется), RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
+- **LED**: WS2812B на GPIO16 (RP2350-Core-A)
+- **Кнопка**: GPIO11 (вход), GPIO10 (питание) — переключение режимов
+
+**Настройка пинов**: все GPIO пины можно изменить в файле [`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs) (модуль `pins`).
 
 ## Сборка и прошивка
 
@@ -281,12 +283,16 @@ LED индикация в режиме Emulation:
 
 ### Приватные ключи и тайминги
 
-| Модель | Константа | Период SEC-SIGN |
-|--------|-----------|-----------------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 секунды |
-| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды |
+| Модель | Константа | Период SEC-SIGN | Задержка до NAV |
+|--------|-----------|-----------------|-----------------|
+| DJI Air 3 (по умолчанию) | `PRIVATE_KEY_AIR3` | 4 секунды | 700 мс |
+| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400 мс |
 
-Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro)
+**Настройка модели дрона**: 
+- Изменить константу `DRONE_MODEL` в [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L158) (строка 158)
+- Значения: `0` = Air 3, `1` = Mavic 4 Pro
+- По умолчанию: `0` (DJI Air 3)
+- Приватные ключи хранятся в [`src/sec_sign.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/sec_sign.rs)
 
 ### CFG-0x41 (OTP / DJI Proprietary)
 
@@ -353,7 +359,60 @@ A4 20 01
 
 ## Конфигурация
 
-### config.rs
+### Настройка пинов GPIO ([`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs))
+
+```rust
+// UART0: к дрону/хосту
+pub const UART0_TX: u8 = 0;
+pub const UART0_RX: u8 = 1;
+
+// UART1: от внешнего GNSS модуля (passthrough source)
+pub const UART1_TX: u8 = 4;   // не используется, но резервируется
+pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
+
+// Mode button
+pub const MODE_BTN_PWR: u8 = 6;     // Устаревшее, используется GPIO10
+pub const MODE_BTN_INPUT: u8 = 7;   // Устаревшее, используется GPIO11
+
+// WS2812B LED (RP2350-Core-A: GPIO16)
+pub const WS2812_LED: u8 = 16;
+```
+
+> [!NOTE]
+> **Реальные пины в main.rs**: Кнопка использует GPIO10 (PWR) и GPIO11 (INPUT) из-за RP2350-E9 workaround
+
+> [!TIP]
+> **Изменение WS2812 LED пина**: Пин светодиода настраивается через **type alias** в одном месте!
+> 
+> Измените в [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L70) строку ~70:
+> ```rust
+> type WS2812LedPin = embassy_rp::peripherals::PIN_16;  // <- Измените PIN_XX
+> ```
+> Пример для GPIO25: `type WS2812LedPin = embassy_rp::peripherals::PIN_25;`
+
+### Настройка модели дрона ([`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L158))
+
+```rust
+/// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air 3 по умолчанию
+```
+
+**Изменить модель**: замените `0` на `1` для Mavic 4 Pro
+
+### Настройка размера flash памяти ([`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs#L8))
+
+```rust
+/// Flash memory size in bytes
+/// Изменить для плат с другим размером flash (например, 2MB = 2 * 1024 * 1024)
+pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB по умолчанию
+```
+
+**Важно**: При изменении размера памяти офсет для записи конфигурации во flash автоматически пересчитывается в [`src/flash_storage.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/flash_storage.rs)
+- Для 4MB: офсет = `0x3FE000` (сектор 1022 из 1024)
+- Для 2MB: офсет = `0x1FE000` (сектор 510 из 512)
+
+### Константы времени и координат ([`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs))
+
 
 ```rust
 // UART baudrate
@@ -367,9 +426,9 @@ pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;   // Air 3: каждые 4 сек
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
 
 // Координаты по умолчанию (автоматически конвертируются в ECEF)
-pub const LATITUDE: f64 = 25.7889186;
-pub const LONGITUDE: f64 = -80.1919471;
-pub const ALTITUDE_M: i32 = 101;
+pub const LATITUDE: f64 = 25.7860556;   // Flamingo Park, Miami Beach
+pub const LONGITUDE: f64 = -80.1380556;
+pub const ALTITUDE_M: i32 = 3;
 ```
 
 При изменении координат в `config.rs` автоматически обновляются все NAV сообщения:

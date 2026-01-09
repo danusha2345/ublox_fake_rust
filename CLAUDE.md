@@ -177,10 +177,27 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 ```
 
 ## Hardware Pins (RP2350A - Spotpear RP2350-Core-A)
-- UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
-- UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
-- WS2812B LED: GPIO25 (PIO0)
-- Mode button: GPIO7 (input), GPIO6 (power)
+
+**Current configuration** (defined in `src/config.rs` and `src/main.rs`):
+- UART0: TX=GPIO0, RX=GPIO1 (921600 baud default, к дрону/хосту)
+- UART1: TX=GPIO4 (unused), RX=GPIO5 (от внешнего GNSS для passthrough)
+- WS2812B LED: GPIO16 (PIO0) — RP2350-Core-A specific
+- Mode button: GPIO11 (input), GPIO10 (power) — RP2350-E9 workaround (Flex GPIO)
+
+**Where to change pins**: `src/config.rs` module `pins` (note: button pins also defined in `main.rs` line 264-265)
+
+**WS2812 LED pin configuration** (simplified via type alias):
+Change LED pin in ONE place - `src/main.rs` line ~70:
+```rust
+type WS2812LedPin = embassy_rp::peripherals::PIN_16;  // Change PIN_XX here
+```
+Example: for GPIO25 use `PIN_25`
+
+**Drone model selection** (affects SEC-SIGN timing and private key):
+- Location: `src/main.rs` line 158
+- Variable: `static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);`
+- Values: 0 = Air 3 (default), 1 = Mavic 4 Pro
+- Private keys: stored in `src/sec_sign.rs`
 
 ## Key Dependencies
 - `embassy-rp 0.9` - RP2040/RP2350 HAL
@@ -199,12 +216,25 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 
 | Drone Model | Constant | First Delay | SEC-SIGN Period |
 |-------------|----------|-------------|-----------------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | 1000ms | 4 seconds |
+| DJI Air 3 (default) | `PRIVATE_KEY_AIR3` | 1000ms | 4 seconds |
 | DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 650ms | 2 seconds |
 
-Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro)
+**Model selection**: 
+- File: `src/main.rs` line 158
+- Variable: `static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);`
+- Change value: 0 = Air 3, 1 = Mavic 4 Pro
+- Private keys location: `src/sec_sign.rs` (`PRIVATE_KEY_AIR3`, `PRIVATE_KEY_MAVIC4PRO`)
+
+**Flash memory size configuration**:
+- File: `src/config.rs` line 8
+- Constant: `pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024;`
+- Change for different boards (e.g., 2MB = `2 * 1024 * 1024`)
+- Flash offset auto-calculated in `src/flash_storage.rs`: `(FLASH_SIZE_BYTES - 2 * ERASE_SIZE)`
+  - 4MB → offset `0x3FE000` (sector 1022/1024)
+  - 2MB → offset `0x1FE000` (sector 510/512)
 
 **Implementation**: Pure Rust using `p192` crate primitives (no C dependencies)
+
 
 Algorithm:
 1. Accumulate all transmitted UBX messages in SHA256 hasher
