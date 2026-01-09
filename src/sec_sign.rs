@@ -101,6 +101,7 @@ impl Default for SecSignAccumulator {
 
 /// Compute the z value for ECDSA signing
 /// z = fold(SHA256(sha256_field || session_id))
+#[link_section = ".data"]
 pub fn compute_z(sha256_field: &[u8; 32], session_id: &[u8; 24]) -> [u8; 24] {
     // Concatenate sha256_field and session_id
     let mut to_sign = [0u8; 56];
@@ -132,6 +133,7 @@ pub struct Signature {
 /// Generate deterministic k using RFC6979 (simplified)
 /// k = HMAC-SHA256(private_key || z) mod n
 /// Returns None if no valid k found after 255 attempts (astronomically unlikely)
+#[link_section = ".data"]
 fn generate_k(private_key: &[u8; 24], z: &[u8; 24]) -> Option<Scalar> {
     // Simplified RFC6979: k = HMAC(key=d, data=z)
     let mut mac = HmacSha256::new_from_slice(private_key)
@@ -167,6 +169,7 @@ fn generate_k(private_key: &[u8; 24], z: &[u8; 24]) -> Option<Scalar> {
 impl Signature {
     /// Sign the z value using ECDSA SECP192R1
     /// Pure Rust implementation using p192 primitives
+    #[link_section = ".data"]
     pub fn sign(z: &[u8; 24], private_key: &[u8; 24]) -> Option<Self> {
         // Convert private key to Scalar
         let d = ct_option_to_option(Scalar::from_bytes(&(*private_key).into()))?;

@@ -765,7 +765,7 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     };
     use spoof_detector::{SpoofDetector, Position, AnalysisResult, FixType};
 
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 1024];
     
     // Lazy initialization of heavy structs to save stack initialization time/space until needed
     let mut parser: Option<UbxFrameParser> = None;
