@@ -114,8 +114,10 @@ impl UbxFrameParser {
                 self.payload_len = (self.buffer[4] as usize) | ((byte as usize) << 8);
                 self.payload_collected = 0;
 
-                // Sanity check: payload too large
-                if self.payload_len > 500 {
+                // Sanity check: payload too large for buffer
+                // Buffer is 1280, header is 6(sync+class+id+len), checksum is 2
+                // Max payload = 1280 - 8 = 1272
+                if self.payload_len > 1272 {
                     self.reset();
                     return None;
                 }
