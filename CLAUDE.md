@@ -243,6 +243,23 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 .wrap
 ```
 
+### Known Issue: Packet Loss During SEC-SIGN (Jan 2025)
+
+**Problem**: ~1% packet loss in Passthrough mode, occurring ~0.7s after each SEC-SIGN computation.
+
+**Root cause**: `SEC_SIGN_IN_PROGRESS` blocks TX while Core1 computes ECDSA signature. During this time, GNSS_RX_CHANNEL (depth=64) can overflow with incoming packets.
+
+**Fixed issue** (commit 6d0fd4f): Large RXM-RAWX packets (720+ bytes) were losing UBX headers because `take_non_ubx_data()` was called while parser was mid-frame, sending payload as non-UBX data.
+
+**Fix applied**:
+- Added `is_idle()` method to `UbxFrameParser`
+- Only call `take_non_ubx_data()` when parser is in WaitSync1 state
+- Increased `GNSS_RX_CHANNEL` depth from 32 to 64
+
+**Results**: RXM-RAWX loss reduced from 57.5% to <1%. Large packets now pass with headers intact.
+
+**Remaining**: ~1% loss during SEC-SIGN computation window (every 4 seconds).
+
 ## Hardware Pins (RP2350A - Spotpear RP2350-Core-A)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
 - UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
