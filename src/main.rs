@@ -114,8 +114,8 @@ static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 32>
 
 // RX channel for messages from real GNSS (priority high)
 // Increased buffer size to 1280 bytes for large UBX frames (RXM-RAWX with many satellites)
-// Depth 32 prevents burst drops (16 was insufficient)
-static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 32> = Channel::new();
+// Depth 64 prevents burst drops during SEC-SIGN computation (32 was insufficient)
+static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 64> = Channel::new();
 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
@@ -940,10 +940,14 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                         }
                     }
                     
-                    // NEW: Send accumulated non-UBX data (NMEA, RTCM, etc.)
-                    if let Some(non_ubx_data) = parser.take_non_ubx_data() {
-                        if GNSS_RX_CHANNEL.try_send(non_ubx_data).is_err() {
-                            debug!("GNSS RX channel full, non-UBX data dropped");
+                    // Send accumulated non-UBX data (NMEA, RTCM, etc.)
+                    // IMPORTANT: Only flush when parser is idle to avoid sending partial UBX payload
+                    // as non-UBX data (which caused RXM-RAWX header loss)
+                    if parser.is_idle() {
+                        if let Some(non_ubx_data) = parser.take_non_ubx_data() {
+                            if GNSS_RX_CHANNEL.try_send(non_ubx_data).is_err() {
+                                debug!("GNSS RX channel full, non-UBX data dropped");
+                            }
                         }
                     }
                 } else {

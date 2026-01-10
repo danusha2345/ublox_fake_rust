@@ -54,6 +54,12 @@ impl UbxFrameParser {
         }
     }
 
+    /// Check if parser is idle (waiting for sync byte)
+    /// Used to determine when it's safe to flush non-UBX buffer
+    pub fn is_idle(&self) -> bool {
+        self.state == ParseState::WaitSync1
+    }
+
     /// Reset parser state
     fn reset(&mut self) {
         self.len = 0;
