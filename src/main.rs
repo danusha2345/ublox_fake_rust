@@ -559,13 +559,11 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
 
                         // Accumulate for SEC-SIGN
-                        // Use try_lock to avoid blocking during SEC-SIGN hash capture
                         let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                         if !is_sec_sign {
-                            if let Ok(mut acc) = SEC_SIGN_ACC.try_lock() {
-                                if let Some(ref mut accumulator) = *acc {
-                                    accumulator.accumulate(&msg);
-                                }
+                            let mut acc = SEC_SIGN_ACC.lock().await;
+                            if let Some(ref mut accumulator) = *acc {
+                                accumulator.accumulate(&msg);
                             }
                         }
                     }
@@ -660,14 +658,12 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                     continue;
                                 }
                                 // Accumulate for next SEC-SIGN (skip SEC-SIGN messages)
-                                // Use try_lock to avoid any blocking
                                 let is_sec_sign = buffered_msg.len() >= 4
                                     && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
                                 if !is_sec_sign {
-                                    if let Ok(mut acc) = SEC_SIGN_ACC.try_lock() {
-                                        if let Some(ref mut accumulator) = *acc {
-                                            accumulator.accumulate(&buffered_msg);
-                                        }
+                                    let mut acc = SEC_SIGN_ACC.lock().await;
+                                    if let Some(ref mut accumulator) = *acc {
+                                        accumulator.accumulate(&buffered_msg);
                                     }
                                 }
                             }
@@ -681,14 +677,11 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
 
                         // Accumulate for our SEC-SIGN (skip SEC-SIGN messages themselves)
-                        // Use try_lock to avoid blocking - if sec_sign_timer_task holds lock,
-                        // this packet is post-hash-capture anyway and will be in next cycle
                         let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                         if !is_sec_sign {
-                            if let Ok(mut acc) = SEC_SIGN_ACC.try_lock() {
-                                if let Some(ref mut accumulator) = *acc {
-                                    accumulator.accumulate(&msg);
-                                }
+                            let mut acc = SEC_SIGN_ACC.lock().await;
+                            if let Some(ref mut accumulator) = *acc {
+                                accumulator.accumulate(&msg);
                             }
                         }
                     }
