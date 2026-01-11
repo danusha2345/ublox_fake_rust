@@ -243,22 +243,53 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 .wrap
 ```
 
-### Known Issue: Packet Loss During SEC-SIGN (Jan 2025)
+### Packet Loss Fix in Passthrough Mode (Jan 2025)
 
-**Problem**: ~1% packet loss in Passthrough mode, occurring ~0.7s after each SEC-SIGN computation.
+**Original problem**: ~57.5% packet loss for RXM-RAWX, ~10% overall loss.
 
-**Root cause**: `SEC_SIGN_IN_PROGRESS` blocks TX while Core1 computes ECDSA signature. During this time, GNSS_RX_CHANNEL (depth=64) can overflow with incoming packets.
+**Root causes identified and fixed**:
 
-**Fixed issue** (commit 6d0fd4f): Large RXM-RAWX packets (720+ bytes) were losing UBX headers because `take_non_ubx_data()` was called while parser was mid-frame, sending payload as non-UBX data.
+1. **RXM-RAWX header loss** (commit 6d0fd4f):
+   - Large packets (720+ bytes) lost UBX headers due to `take_non_ubx_data()` called mid-frame
+   - Fix: Added `is_idle()` to `UbxFrameParser`, only drain non-UBX when in WaitSync1 state
 
-**Fix applied**:
-- Added `is_idle()` method to `UbxFrameParser`
-- Only call `take_non_ubx_data()` when parser is in WaitSync1 state
-- Increased `GNSS_RX_CHANNEL` depth from 32 to 64
+2. **GNSS_RX_CHANNEL overflow during ECDSA** (commit eec6e24):
+   - `SEC_SIGN_IN_PROGRESS` blocked TX while Core1 computed signature (~700ms originally)
+   - Fix: Local buffering in `uart0_tx_task` using `select()` pattern - buffer packets during wait
 
-**Results**: RXM-RAWX loss reduced from 57.5% to <1%. Large packets now pass with headers intact.
+3. **Slow ECDSA computation** (commit a61110d):
+   - `opt-level="z"` made p192 crypto very slow (~700ms per signature)
+   - Fix: Added `opt-level=3` for p192, sha2, hmac, subtle crates in Cargo.toml
+   - Result: ECDSA now ~67ms (10x faster)
 
-**Remaining**: ~1% loss during SEC-SIGN computation window (every 4 seconds).
+4. **Channel depth insufficient** (commit pending):
+   - 64 slots still caused ~0.13% loss during packet bursts
+   - Fix: Increased `GNSS_RX_CHANNEL` depth to 128
+
+**Results**:
+| Metric | Before | After |
+|--------|--------|-------|
+| RXM-RAWX loss | 57.5% | **0.07%** |
+| Overall loss | ~10% | **0.13%** → 0% (expected) |
+| ECDSA time | ~700ms | **~67ms** |
+| SEC-SIGN | stable | **stable 4.00s** |
+
+**Key code changes**:
+```rust
+// uart0_tx_task: local buffering during SEC-SIGN wait
+if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+    let mut pending: heapless::Vec<heapless::Vec<u8, 1280>, 64> = heapless::Vec::new();
+    loop {
+        match select(SEC_SIGN_RESULT.receive(), GNSS_RX_CHANNEL.receive()).await {
+            Either::First(result) => { /* send signature */ break; }
+            Either::Second(msg) => { pending.push(msg); }
+        }
+    }
+    // Send buffered packets AFTER signature
+}
+```
+
+**Warning**: Do NOT use `try_lock()` instead of `lock().await` for SEC_SIGN_ACC - it breaks signature verification by skipping hash accumulation.
 
 ## Hardware Pins (RP2350A - Spotpear RP2350-Core-A)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)

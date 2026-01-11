@@ -114,8 +114,8 @@ static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 32>
 
 // RX channel for messages from real GNSS (priority high)
 // Increased buffer size to 1280 bytes for large UBX frames (RXM-RAWX with many satellites)
-// Depth 64 prevents burst drops during SEC-SIGN computation (32 was insufficient)
-static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 64> = Channel::new();
+// Depth 128 prevents burst drops during SEC-SIGN and packet bursts (64 caused ~0.13% loss)
+static GNSS_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 128> = Channel::new();
 
 /// Global message enable flags
 static MSG_FLAGS_STATE: Mutex<CriticalSectionRawMutex, MessageFlags> = Mutex::new(MessageFlags::new_default());
@@ -606,10 +606,10 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     }
                     Ok(Either::Second(msg)) => {
                         // If SEC-SIGN is in progress, buffer packets locally while waiting
-                        // This prevents GNSS_RX_CHANNEL overflow during ~700ms ECDSA computation
+                        // This prevents GNSS_RX_CHANNEL overflow during ~67ms ECDSA computation
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
                             // Local buffer for packets during signature wait
-                            // 64 slots should handle ~700ms of GNSS data at 921600 baud
+                            // 64 slots handles ~67ms of GNSS data at 921600 baud with margin
                             let mut pending: heapless::Vec<heapless::Vec<u8, 1280>, 64> = heapless::Vec::new();
                             let _ = pending.push(msg); // First packet goes to buffer
 
