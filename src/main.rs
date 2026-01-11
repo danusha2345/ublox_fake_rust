@@ -605,38 +605,72 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         let _ = SEC_SIGN_DONE.try_send(());
                     }
                     Ok(Either::Second(msg)) => {
-                        // If SEC-SIGN is in progress, we MUST wait for it before sending this packet
-                        // This prevents race conditions where packet is sent after hash capture but before signature
-                        // AND prevents packet loss/reordering caused by re-queueing to channel
+                        // If SEC-SIGN is in progress, buffer packets locally while waiting
+                        // This prevents GNSS_RX_CHANNEL overflow during ~700ms ECDSA computation
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-                            // Block and wait for signature
-                            let result = SEC_SIGN_RESULT.receive().await;
+                            // Local buffer for packets during signature wait
+                            // 64 slots should handle ~700ms of GNSS data at 921600 baud
+                            let mut pending: heapless::Vec<heapless::Vec<u8, 1280>, 64> = heapless::Vec::new();
+                            let _ = pending.push(msg); // First packet goes to buffer
 
-                            // --- Send Signature (Inline) ---
-                            let sec_sign_msg = SecSign {
-                                version: 0x01,
-                                reserved1: 0,
-                                msg_cnt: result.packet_count,
-                                sha256_hash: result.sha256_hash,
-                                session_id: result.session_id,
-                                signature_r: result.signature.r,
-                                signature_s: result.signature.s,
-                            };
+                            // Keep draining channel while waiting for signature (non-blocking!)
+                            loop {
+                                match select(
+                                    SEC_SIGN_RESULT.receive(),
+                                    GNSS_RX_CHANNEL.receive(),
+                                ).await {
+                                    Either::First(result) => {
+                                        // Signature ready - send it FIRST (before buffered packets)
+                                        let sec_sign_msg = SecSign {
+                                            version: 0x01,
+                                            reserved1: 0,
+                                            msg_cnt: result.packet_count,
+                                            sha256_hash: result.sha256_hash,
+                                            session_id: result.session_id,
+                                            signature_r: result.signature.r,
+                                            signature_s: result.signature.s,
+                                        };
 
-                            let mut buf = [0u8; 128];
-                            let len = sec_sign_msg.build(&mut buf);
-                            if len > 0 {
-                                if let Err(e) = tx.write_all(&buf[..len]).await {
-                                    error!("Passthrough SEC-SIGN TX error: {:?}", e);
+                                        let mut buf = [0u8; 128];
+                                        let len = sec_sign_msg.build(&mut buf);
+                                        if len > 0 {
+                                            if let Err(e) = tx.write_all(&buf[..len]).await {
+                                                error!("Passthrough SEC-SIGN TX error: {:?}", e);
+                                            }
+                                        }
+                                        SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                                        let _ = SEC_SIGN_DONE.try_send(());
+                                        break;
+                                    }
+                                    Either::Second(next_msg) => {
+                                        // Another packet arrived - buffer it
+                                        if pending.push(next_msg).is_err() {
+                                            warn!("Local buffer full during SEC-SIGN wait!");
+                                        }
+                                    }
                                 }
                             }
-                            // Clear flag and wake tasks
-                            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                            let _ = SEC_SIGN_DONE.try_send(());
-                            // -------------------------------
+
+                            // Now send all buffered packets AFTER the signature
+                            for buffered_msg in pending.into_iter() {
+                                if let Err(e) = tx.write_all(&buffered_msg).await {
+                                    error!("Passthrough TX error (buffered): {:?}", e);
+                                    continue;
+                                }
+                                // Accumulate for next SEC-SIGN (skip SEC-SIGN messages)
+                                let is_sec_sign = buffered_msg.len() >= 4
+                                    && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
+                                if !is_sec_sign {
+                                    let mut acc = SEC_SIGN_ACC.lock().await;
+                                    if let Some(ref mut accumulator) = *acc {
+                                        accumulator.accumulate(&buffered_msg);
+                                    }
+                                }
+                            }
+                            continue; // Skip normal msg handling (already processed)
                         }
 
-                        // Send and accumulate hash for SEC-SIGN
+                        // Normal path (no SEC-SIGN in progress): send immediately
                         if let Err(e) = tx.write_all(&msg).await {
                             error!("Passthrough TX error: {:?}", e);
                             continue;
