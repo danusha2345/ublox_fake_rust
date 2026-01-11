@@ -262,17 +262,19 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
    - Fix: Added `opt-level=3` for p192, sha2, hmac, subtle crates in Cargo.toml
    - Result: ECDSA now ~67ms (10x faster)
 
-4. **Channel depth insufficient** (commit pending):
+4. **Channel depth insufficient** (commit 50cf77b):
    - 64 slots still caused ~0.13% loss during packet bursts
    - Fix: Increased `GNSS_RX_CHANNEL` depth to 128
 
-**Results**:
+**Final test results** (307 seconds, 19547 packets):
 | Metric | Before | After |
 |--------|--------|-------|
 | RXM-RAWX loss | 57.5% | **0.07%** |
-| Overall loss | ~10% | **0.13%** → 0% (expected) |
+| Overall loss | ~10% | **0.03%** (6 packets) |
 | ECDSA time | ~700ms | **~67ms** |
-| SEC-SIGN | stable | **stable 4.00s** |
+| SEC-SIGN | unstable | **stable 4.00s** |
+
+Remaining 6 lost packets: MON-VER(1), NAV-SAT(1), NAV-STATUS(1), RXM-RAWX(1), RXM-SFRBX(2) - acceptable for Passthrough mode.
 
 **Key code changes**:
 ```rust
