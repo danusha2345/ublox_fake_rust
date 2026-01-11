@@ -70,6 +70,19 @@ lto = true
 opt-level = "z"       # Maximum size optimization (was "s")
 codegen-units = 1     # Better optimization, slower build
 
+# Speed-optimize crypto crates (ECDSA is ~700ms with "z", should be ~200-300ms with "3")
+[profile.release.package.p192]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.hmac]
+opt-level = 3
+
+[profile.release.package.subtle]
+opt-level = 3
+
 [[bin]]
 name = "ublox_fake"
 path = "src/main.rs"
