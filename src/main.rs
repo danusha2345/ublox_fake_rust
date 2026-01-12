@@ -858,11 +858,11 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             Ok(n) if n > 0 => {
                 // Minimal processing: just copy and send
                 let mut vec = heapless::Vec::<u8, 256>::new();
-                if vec.extend_from_slice(&buf[..n]).is_ok() {
-                    if RAW_RX_CHANNEL.try_send(vec).is_err() {
-                        let drops = DIAG_CHANNEL_DROPS.fetch_add(1, Ordering::Relaxed);
-                        warn!("RAW_RX_CHANNEL full! drops={}", drops + 1);
-                    }
+                if vec.extend_from_slice(&buf[..n]).is_ok()
+                    && RAW_RX_CHANNEL.try_send(vec).is_err()
+                {
+                    let drops = DIAG_CHANNEL_DROPS.fetch_add(1, Ordering::Relaxed);
+                    warn!("RAW_RX_CHANNEL full! drops={}", drops + 1);
                 }
             }
             Ok(_) => {}
