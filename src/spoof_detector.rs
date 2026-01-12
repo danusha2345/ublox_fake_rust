@@ -353,7 +353,12 @@ impl SpoofDetector {
         //     return AnalysisResult::Initializing;
         // }
 
-        // First sample - initialize
+        // Ignore positions without valid 3D fix - prevents false teleport on first fix
+        if !pos.fix_type.has_3d_fix() {
+            return AnalysisResult::Initializing;
+        }
+
+        // First sample - initialize (only with valid 3D fix)
         let prev = match &self.prev {
             Some(p) => p.clone(),
             None => {
