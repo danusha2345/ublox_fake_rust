@@ -1,7 +1,9 @@
-# u-blox GNSS M8/M10 Emulator (Rust/Embassy)
+# u-blox GNSS M10 Emulator (Rust/Embassy)
 
-Эмулятор GNSS приёмника u-blox серии M8/M10 на микроконтроллере RP2350 (совместим с RP2040).
+Эмулятор GNSS приёмника u-blox серии M10 на микроконтроллере RP2350.
 Написан на Rust с использованием асинхронного фреймворка Embassy.
+
+> **Примечание**: RP2040 больше не поддерживается — требуется ~221 KB RAM для буферов, что превышает доступные 264 KB.
 
 ## Назначение
 
@@ -25,7 +27,7 @@
 
 ## Аппаратные требования
 
-- **MCU**: RP2350A (Spotpear RP2350-Core-A) или RP2040
+- **MCU**: RP2350A (Spotpear RP2350-Core-A)
 - **Flash**: 2 МБ
 - **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
 - **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
@@ -40,9 +42,8 @@
 # Установка Rust (если не установлен)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Установка целевых платформ
+# Установка целевой платформы
 rustup target add thumbv8m.main-none-eabihf  # RP2350
-rustup target add thumbv6m-none-eabi          # RP2040
 
 # Установка probe-rs для прошивки через отладчик
 cargo install probe-rs-tools
@@ -56,11 +57,8 @@ cargo install elf2uf2-rs
 **ВАЖНО:** Всегда используйте Makefile для сборки UF2!
 
 ```bash
-# Сборка UF2 для RP2350 (рекомендуется)
+# Сборка UF2 для RP2350
 make rp2350
-
-# Сборка UF2 для RP2040
-make rp2040
 
 # Очистка
 make clean
@@ -68,7 +66,7 @@ make clean
 
 #### Почему Makefile, а не ручная конвертация?
 
-`elf2uf2-rs` по умолчанию генерирует UF2 с Family ID для RP2040 (`0xe48bff56`).
+`elf2uf2-rs` по умолчанию генерирует UF2 с неправильным Family ID.
 Для RP2350 требуется патчинг Family ID на `0xe48bff59`.
 
 Makefile автоматически:
@@ -97,7 +95,7 @@ cargo run --release
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         RP2350/RP2040                           │
+│                            RP2350                               │
 ├───────────────────────────────┬─────────────────────────────────┤
 │           CORE 0              │            CORE 1               │
 │      (Embassy Executor)       │       (Embassy Executor)        │

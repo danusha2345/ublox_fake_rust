@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-u-blox GNSS M8/M10 emulator written in Rust for RP2040/RP2350 microcontrollers. Uses Embassy async framework instead of FreeRTOS.
+u-blox GNSS M10 emulator written in Rust for RP2350 microcontrollers. Uses Embassy async framework instead of FreeRTOS.
+
+**Note**: RP2040 no longer supported — requires ~221 KB RAM for buffers, exceeding available 264 KB.
 
 **Original C version**: `../ublox_fake_unified/` - FreeRTOS based, for reference.
 
@@ -25,13 +27,12 @@ These version mismatches caused build failures - DO NOT change without testing:
 PATH="/home2/.cargo/bin:$PATH"
 
 # Required target
-rustup target add thumbv6m-none-eabi      # RP2040
 rustup target add thumbv8m.main-none-eabihf  # RP2350
 ```
 
 ## Required Files
 
-- `memory.x` - Linker script defining RP2040 memory layout (BOOT2, FLASH, RAM). Build fails without it!
+- `memory.x` - Linker script defining memory layout (BOOT2, FLASH, RAM). Build fails without it!
 - `.cargo/config.toml` - Target selection and linker flags
 
 ## Build Commands
@@ -41,9 +42,6 @@ rustup target add thumbv8m.main-none-eabihf  # RP2350
 ```bash
 # Build UF2 for RP2350 (ALWAYS use this!)
 make rp2350
-
-# Build UF2 for RP2040
-make rp2040
 
 # Flash and run (requires probe-rs)
 cargo run --release
@@ -330,7 +328,7 @@ rp_pac::UART1.uartifls().write(|w| {
 - Mode button: GPIO7 (input), GPIO6 (power)
 
 ## Key Dependencies
-- `embassy-rp 0.9` - RP2040/RP2350 HAL
+- `embassy-rp 0.9` - RP2350 HAL
 - `embedded-io-async 0.6` - Must match embassy-rp version exactly
 - `pio 0.3` - For `pio_asm!` macro (not 0.2)
 - `p192` + `sha2` - ECDSA SECP192R1 for SEC-SIGN
