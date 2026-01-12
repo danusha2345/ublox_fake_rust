@@ -361,6 +361,16 @@ async fn main(spawner: Spawner) {
         rx_buf1,
         uart1_config,
     );
+
+    // Reduce FIFO threshold from 7/8 (14 bytes) to 1/4 (4 bytes)
+    // This triggers interrupt 3.4x more often, reducing overrun risk
+    // Embassy-rp defaults to 7/8 which is too slow for 921600 baud
+    rp_pac::UART1.uartifls().write(|w| {
+        w.set_rxiflsel(0b001); // 1/4 full (4 bytes) - was 0b100 (14 bytes)
+        w.set_txiflsel(0b000); // TX unchanged
+    });
+    info!("UART1 RX FIFO threshold set to 1/4 (4 bytes)");
+
     let (_uart1_tx, uart1_rx) = uart1.split();
 
     // Initialize SEC-SIGN accumulator
