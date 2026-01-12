@@ -1,6 +1,6 @@
-# u-blox GNSS M8/M10 Emulator (Rust/Embassy)
+# u-blox GNSS M10 Emulator (Rust/Embassy)
 
-Эмулятор GNSS приёмника u-blox серии M8/M10 на микроконтроллере RP2350 (совместим с RP2040).
+Эмулятор GNSS приёмника u-blox серии M10 на микроконтроллере RP2350.
 Написан на Rust с использованием асинхронного фреймворка Embassy.
 
 ## Назначение
@@ -24,7 +24,7 @@
 
 ## Аппаратные требования
 
-- **MCU**: RP2350A (Spotpear RP2350-Core-A) или RP2040
+- **MCU**: RP2350A (Spotpear RP2350-Core-A)
 - **Flash**: 2 МБ
 - **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод по умолчанию)
 - **UART1**: TX=GPIO4 (не используется), RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
@@ -41,9 +41,8 @@
 # Установка Rust (если не установлен)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Установка целевых платформ
+# Установка целевой платформы
 rustup target add thumbv8m.main-none-eabihf  # RP2350
-rustup target add thumbv6m-none-eabi          # RP2040
 
 # Установка probe-rs для прошивки через отладчик
 cargo install probe-rs-tools
@@ -57,11 +56,8 @@ cargo install elf2uf2-rs
 **ВАЖНО:** Всегда используйте Makefile для сборки UF2!
 
 ```bash
-# Сборка UF2 для RP2350 (рекомендуется)
+# Сборка UF2 для RP2350
 make rp2350
-
-# Сборка UF2 для RP2040
-make rp2040
 
 # Очистка
 make clean
@@ -285,13 +281,13 @@ LED индикация в режиме Emulation:
 
 | Модель | Константа | Период SEC-SIGN | Задержка до NAV |
 |--------|-----------|-----------------|-----------------|
-| DJI Air 3 (по умолчанию) | `PRIVATE_KEY_AIR3` | 4 секунды | 700 мс |
-| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400 мс |
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 секунды | 700 мс |
+| DJI Mavic 4 Pro (по умолчанию) | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400 мс |
 
-**Настройка модели дрона**: 
-- Изменить константу `DRONE_MODEL` в [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L158) (строка 158)
+**Настройка модели дрона**:
+- Изменить константу `DRONE_MODEL` в [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L168) (строка 168)
 - Значения: `0` = Air 3, `1` = Mavic 4 Pro
-- По умолчанию: `0` (DJI Air 3)
+- По умолчанию: `1` (DJI Mavic 4 Pro)
 - Приватные ключи хранятся в [`src/sec_sign.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/sec_sign.rs)
 
 ### CFG-0x41 (OTP / DJI Proprietary)
@@ -390,14 +386,14 @@ pub const WS2812_LED: u8 = 16;
 > ```
 > Пример для GPIO25: `type WS2812LedPin = embassy_rp::peripherals::PIN_25;`
 
-### Настройка модели дрона ([`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L158))
+### Настройка модели дрона ([`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L168))
 
 ```rust
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air 3 по умолчанию
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro по умолчанию
 ```
 
-**Изменить модель**: замените `0` на `1` для Mavic 4 Pro
+**Изменить модель**: замените `1` на `0` для Air 3
 
 ### Настройка размера flash памяти ([`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs#L8))
 

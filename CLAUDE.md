@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-u-blox GNSS M8/M10 emulator written in Rust for RP2040/RP2350 microcontrollers. Uses Embassy async framework instead of FreeRTOS.
+u-blox GNSS M10 emulator written in Rust for RP2350 microcontroller. Uses Embassy async framework instead of FreeRTOS.
 
 **Original C version**: `../ublox_fake_unified/` - FreeRTOS based, for reference.
 
@@ -25,13 +25,12 @@ These version mismatches caused build failures - DO NOT change without testing:
 PATH="/home2/.cargo/bin:$PATH"
 
 # Required target
-rustup target add thumbv6m-none-eabi      # RP2040
 rustup target add thumbv8m.main-none-eabihf  # RP2350
 ```
 
 ## Required Files
 
-- `memory.x` - Linker script defining RP2040 memory layout (BOOT2, FLASH, RAM). Build fails without it!
+- `memory.x` - Linker script defining RP2350 memory layout (BOOT2, FLASH, RAM). Build fails without it!
 - `.cargo/config.toml` - Target selection and linker flags
 
 ## Build Commands
@@ -39,11 +38,8 @@ rustup target add thumbv8m.main-none-eabihf  # RP2350
 **CRITICAL: Always use Makefile to build UF2 files!**
 
 ```bash
-# Build UF2 for RP2350 (ALWAYS use this!)
+# Build UF2 for RP2350
 make rp2350
-
-# Build UF2 for RP2040
-make rp2040
 
 # Flash and run (requires probe-rs)
 cargo run --release
@@ -194,9 +190,9 @@ type WS2812LedPin = embassy_rp::peripherals::PIN_16;  // Change PIN_XX here
 Example: for GPIO25 use `PIN_25`
 
 **Drone model selection** (affects SEC-SIGN timing and private key):
-- Location: `src/main.rs` line 158
-- Variable: `static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);`
-- Values: 0 = Air 3 (default), 1 = Mavic 4 Pro
+- Location: `src/main.rs` line 168
+- Variable: `static DRONE_MODEL: AtomicU8 = AtomicU8::new(1);`
+- Values: 0 = Air 3, 1 = Mavic 4 Pro (default)
 - Private keys: stored in `src/sec_sign.rs`
 
 ## Key Dependencies
@@ -216,13 +212,13 @@ Example: for GPIO25 use `PIN_25`
 
 | Drone Model | Constant | First Delay | SEC-SIGN Period |
 |-------------|----------|-------------|-----------------|
-| DJI Air 3 (default) | `PRIVATE_KEY_AIR3` | 1000ms | 4 seconds |
-| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 650ms | 2 seconds |
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 1000ms | 4 seconds |
+| DJI Mavic 4 Pro (default) | `PRIVATE_KEY_MAVIC4PRO` | 650ms | 2 seconds |
 
-**Model selection**: 
-- File: `src/main.rs` line 158
-- Variable: `static DRONE_MODEL: AtomicU8 = AtomicU8::new(0);`
-- Change value: 0 = Air 3, 1 = Mavic 4 Pro
+**Model selection**:
+- File: `src/main.rs` line 168
+- Variable: `static DRONE_MODEL: AtomicU8 = AtomicU8::new(1);`
+- Change value: 0 = Air 3, 1 = Mavic 4 Pro (default)
 - Private keys location: `src/sec_sign.rs` (`PRIVATE_KEY_AIR3`, `PRIVATE_KEY_MAVIC4PRO`)
 
 **Flash memory size configuration**:

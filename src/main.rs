@@ -165,7 +165,7 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air 3
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro (default)
 
 /// Timestamp when message output started (for 20s invalid satellites timer)
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
@@ -743,28 +743,28 @@ mod valset_keys {
 fn update_flag_from_valset_key(flags: &mut MessageFlags, key: u32, val: u32) {
     let enabled = val > 0;
     match key {
-        valset_keys::NAV_PVT => flags.nav_pvt = enabled,
-        valset_keys::NAV_SVINFO => flags.nav_svinfo = enabled,
-        valset_keys::NAV_SAT => flags.nav_sat = enabled,
-        valset_keys::NAV_STATUS => flags.nav_status = enabled,
-        valset_keys::NAV_POSECEF => flags.nav_posecef = enabled,
-        valset_keys::NAV_POSLLH => flags.nav_posllh = enabled,
-        valset_keys::NAV_HPPOSECEF => flags.nav_hpposecef = enabled,
-        valset_keys::NAV_DOP => flags.nav_dop = enabled,
-        valset_keys::NAV_VELECEF => flags.nav_velecef = enabled,
-        valset_keys::NAV_VELNED => flags.nav_velned = enabled,
-        valset_keys::NAV_TIMEGPS => flags.nav_timegps = enabled,
-        valset_keys::NAV_TIMEUTC => flags.nav_timeutc = enabled,
-        valset_keys::NAV_TIMELS => flags.nav_timels = enabled,
-        valset_keys::NAV_CLOCK => flags.nav_clock = enabled,
-        valset_keys::NAV_AOPSTATUS => flags.nav_aopstatus = enabled,
-        valset_keys::NAV_COV => flags.nav_cov = enabled,
-        valset_keys::NAV_EOE => flags.nav_eoe = enabled,
-        valset_keys::TIM_TP => flags.tim_tp = enabled,
-        valset_keys::MON_HW => flags.mon_hw = enabled,
-        valset_keys::RXM_RAWX => flags.rxm_rawx = enabled,
-        valset_keys::MON_COMMS => flags.mon_comms = enabled,
-        valset_keys::MON_RF => flags.mon_rf = enabled,
+        valset_keys::NAV_PVT => { flags.nav_pvt = enabled; info!("MSG: NAV-PVT={}", enabled); }
+        valset_keys::NAV_SVINFO => { flags.nav_svinfo = enabled; info!("MSG: NAV-SVINFO={}", enabled); }
+        valset_keys::NAV_SAT => { flags.nav_sat = enabled; info!("MSG: NAV-SAT={}", enabled); }
+        valset_keys::NAV_STATUS => { flags.nav_status = enabled; info!("MSG: NAV-STATUS={}", enabled); }
+        valset_keys::NAV_POSECEF => { flags.nav_posecef = enabled; info!("MSG: NAV-POSECEF={}", enabled); }
+        valset_keys::NAV_POSLLH => { flags.nav_posllh = enabled; info!("MSG: NAV-POSLLH={}", enabled); }
+        valset_keys::NAV_HPPOSECEF => { flags.nav_hpposecef = enabled; info!("MSG: NAV-HPPOSECEF={}", enabled); }
+        valset_keys::NAV_DOP => { flags.nav_dop = enabled; info!("MSG: NAV-DOP={}", enabled); }
+        valset_keys::NAV_VELECEF => { flags.nav_velecef = enabled; info!("MSG: NAV-VELECEF={}", enabled); }
+        valset_keys::NAV_VELNED => { flags.nav_velned = enabled; info!("MSG: NAV-VELNED={}", enabled); }
+        valset_keys::NAV_TIMEGPS => { flags.nav_timegps = enabled; info!("MSG: NAV-TIMEGPS={}", enabled); }
+        valset_keys::NAV_TIMEUTC => { flags.nav_timeutc = enabled; info!("MSG: NAV-TIMEUTC={}", enabled); }
+        valset_keys::NAV_TIMELS => { flags.nav_timels = enabled; info!("MSG: NAV-TIMELS={}", enabled); }
+        valset_keys::NAV_CLOCK => { flags.nav_clock = enabled; info!("MSG: NAV-CLOCK={}", enabled); }
+        valset_keys::NAV_AOPSTATUS => { flags.nav_aopstatus = enabled; info!("MSG: NAV-AOPSTATUS={}", enabled); }
+        valset_keys::NAV_COV => { flags.nav_cov = enabled; info!("MSG: NAV-COV={}", enabled); }
+        valset_keys::NAV_EOE => { flags.nav_eoe = enabled; info!("MSG: NAV-EOE={}", enabled); }
+        valset_keys::TIM_TP => { flags.tim_tp = enabled; info!("MSG: TIM-TP={}", enabled); }
+        valset_keys::MON_HW => { flags.mon_hw = enabled; info!("MSG: MON-HW={}", enabled); }
+        valset_keys::RXM_RAWX => { flags.rxm_rawx = enabled; info!("MSG: RXM-RAWX={}", enabled); }
+        valset_keys::MON_COMMS => { flags.mon_comms = enabled; info!("MSG: MON-COMMS={}", enabled); }
+        valset_keys::MON_RF => { flags.mon_rf = enabled; info!("MSG: MON-RF={}", enabled); }
         _ => {}
     }
 }
@@ -976,6 +976,20 @@ async fn nav_message_task() {
     OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
     SATELLITES_INVALID.store(false, Ordering::Release);
     info!("NAV message output started ({}ms after first config)", config_to_nav_delay);
+
+    // Log active flags at startup
+    {
+        let flags = MSG_FLAGS_STATE.lock().await;
+        let active_count = [
+            flags.nav_pvt, flags.nav_posecef, flags.nav_posllh, flags.nav_status,
+            flags.nav_dop, flags.nav_sol, flags.nav_velned, flags.nav_velecef,
+            flags.nav_timeutc, flags.nav_timegps, flags.nav_timels, flags.nav_clock,
+            flags.nav_sat, flags.nav_svinfo, flags.nav_cov, flags.nav_hpposecef,
+            flags.nav_aopstatus, flags.nav_eoe, flags.tim_tp,
+        ].iter().filter(|&&x| x).count();
+        info!("NAV flags: {} active (pvt={}, sat={}, status={}, dop={}, eoe={})",
+              active_count, flags.nav_pvt, flags.nav_sat, flags.nav_status, flags.nav_dop, flags.nav_eoe);
+    }
 
     // Use absolute timestamps to prevent timing drift
     // Timer::after() would cause drift because it waits AFTER processing completes

@@ -101,16 +101,16 @@ type WS2812LedPin = embassy_rp::peripherals::PIN_16; // ← Изменить PIN
 
 ### 3. Модель дрона (SEC-SIGN ключ)
 
-**Файл**: [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L158) (строка 158)
+**Файл**: [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L168) (строка 168)
 
 ```rust
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // 0 = Air 3, 1 = Mavic 4 Pro
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // 0 = Air 3, 1 = Mavic 4 Pro
 ```
 
 | Модель | Значение | Период SEC-SIGN | Задержка NAV |
 |--------|----------|-----------------|--------------|
-| DJI Air 3 (по умолчанию) | `0` | 4 секунды | 700 мс |
-| DJI Mavic 4 Pro | `1` | 2 секунды | 400 мс |
+| DJI Air 3 | `0` | 4 секунды | 700 мс |
+| DJI Mavic 4 Pro (по умолчанию) | `1` | 2 секунды | 400 мс |
 
 ### 4. Координаты по умолчанию
 
@@ -122,4 +122,4 @@ pub const LONGITUDE: f64 = -80.1380556;
 pub const ALTITUDE_M: i32 = 3;
 ```
 
-**После изменения**: пересобрать проект → `make rp2350` или `make rp2040`
+**После изменения**: пересобрать проект → `make rp2350`
