@@ -12,9 +12,10 @@ use defmt::*;
 
 /// Spoofing detection thresholds
 pub mod thresholds {
-    /// Teleportation threshold in meters (jump > 500m = spoof)
-    /// Reduced from 1km for better sensitivity
-    pub const TELEPORT_M: f32 = 500.0;
+    /// Teleportation threshold in meters (jump > 2km = spoof)
+    /// Increased from 500m to reduce false positives during GPS re-acquisition
+    /// Time-based detection catches smaller coordinate jumps via clock drift
+    pub const TELEPORT_M: f32 = 2000.0;
 
     /// Altitude jump threshold in meters (> 10m instant jump = spoof)
     /// Increased from 5m to reduce false positives from GPS noise
@@ -87,6 +88,10 @@ pub mod thresholds {
     /// Calibration period - how long to wait before trusting system clock (ms)
     /// Need valid GNSS time for at least this long to calibrate
     pub const CLOCK_CALIBRATION_MS: u32 = 5000;
+
+    /// Warmup samples after recovery to ignore coordinate jumps during GPS re-acquisition
+    /// GPS needs time to stabilize after re-acquiring satellites
+    pub const RECOVERY_WARMUP_COUNT: u8 = 10;  // ~2 seconds at 5 Hz
 }
 
 /// GNSS time from NAV-PVT (UTC time with GPS week reference)
@@ -283,6 +288,10 @@ pub struct SpoofDetector {
     /// Warmup sample counter - ignore first N positions to avoid false positives
     /// on startup when GNSS time and coordinates are first established
     warmup_samples: u8,
+
+    /// Recovery warmup counter - ignore coordinate anomalies after spoofing ends
+    /// to allow GPS to stabilize during re-acquisition
+    recovery_warmup_samples: u8,
 }
 
 /// Result of position analysis
@@ -327,6 +336,8 @@ impl SpoofDetector {
             valid_gnss_duration_ms: 0,
             // Warmup counter
             warmup_samples: 0,
+            // Recovery warmup counter (starts at max to disable until first recovery)
+            recovery_warmup_samples: thresholds::RECOVERY_WARMUP_COUNT,
         }
     }
 
@@ -433,35 +444,55 @@ impl SpoofDetector {
             }
         }
 
+        // Recovery warmup - ignore coordinate anomalies after spoofing ends
+        // to allow GPS to stabilize during re-acquisition
+        let in_recovery_warmup = self.recovery_warmup_samples < thresholds::RECOVERY_WARMUP_COUNT;
+        if in_recovery_warmup && !self.spoofed {
+            self.recovery_warmup_samples += 1;
+            if self.recovery_warmup_samples == thresholds::RECOVERY_WARMUP_COUNT {
+                info!("Recovery warmup complete - coordinate checks re-enabled");
+            }
+        }
+
         // Check for anomalies - SIMPLIFIED: only coordinate + time based checks
-        // 
+        //
         // WARMUP LOGIC:
         // - Coordinate-based checks (teleport, speed) work IMMEDIATELY
         //   because if drone "moves" from first position, it's likely spoofing
         // - Time-based checks (time_spoof, clock_drift) are DELAYED during warmup
         //   because GNSS time needs calibration first (5 seconds)
+        // - During RECOVERY warmup, coordinate anomalies are ignored to prevent
+        //   false positives from GPS re-acquisition jitter
         //
         // Disabled: is_alt_anomaly, is_accel_anomaly, cno_anomaly
-        
-        // Coordinate anomalies - always active (detect movement from start)
+
+        // Coordinate anomalies - disabled during recovery warmup
         let coord_anomaly = analysis.is_teleport || analysis.is_speed_anomaly;
-        
+        let coord_anomaly_effective = if in_recovery_warmup && !self.spoofed {
+            false  // Ignore coordinate jumps during GPS re-acquisition
+        } else {
+            coord_anomaly
+        };
+
         // Time anomalies - only after warmup (need calibration first)
+        // Note: Time checks remain active during recovery warmup!
         let time_anomaly = if in_warmup {
-            false  // Ignore time anomalies during warmup
+            false  // Ignore time anomalies during startup warmup
         } else {
             time_spoof || clock_drift_spoof
         };
-        
-        let is_anomaly = coord_anomaly || time_anomaly;
+
+        let is_anomaly = coord_anomaly_effective || time_anomaly;
 
         // NEW: Prioritize time-based recovery (stronger signal than coordinates)
         if (time_recovery || clock_drift_recovery) && self.spoofed {
             self.spoofed = false;
             self.normal_count = 0;
             self.anomaly_count = 0;
-            self.last_good = Some(pos.clone());
-            info!("Spoofing cleared by GNSS time/clock recovery");
+            // DO NOT update last_good here - keep the original good position!
+            // Start recovery warmup to ignore coordinate jumps during GPS re-acquisition
+            self.recovery_warmup_samples = 0;
+            info!("Spoofing cleared by GNSS time/clock recovery - starting recovery warmup");
             self.prev = Some(pos);
             return AnalysisResult::Normal;
         }
@@ -509,7 +540,8 @@ impl SpoofDetector {
                     if dist_from_good < thresholds::TELEPORT_M {
                         self.spoofed = false;
                         self.last_good = Some(pos.clone());
-                        info!("Spoofing cleared - back to normal position");
+                        self.recovery_warmup_samples = 0;  // Start recovery warmup
+                        info!("Spoofing cleared - back to normal position, starting recovery warmup");
                     } else {
                         // Still far from last good position, might be legitimate travel
                         // or spoofing stopped at fake position
@@ -629,6 +661,8 @@ impl SpoofDetector {
         self.valid_gnss_duration_ms = 0;
         // Reset warmup counter
         self.warmup_samples = 0;
+        // Reset recovery warmup (start at max to disable until first recovery)
+        self.recovery_warmup_samples = thresholds::RECOVERY_WARMUP_COUNT;
         info!("Spoof detector reset");
     }
 

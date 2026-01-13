@@ -129,7 +129,7 @@ Mode is persisted to flash and survives reboots. Button press cycles modes: Emul
 When in passthrough mode, the device parses incoming UBX frames and detects GPS spoofing:
 
 **Active detection algorithms** (in `spoof_detector.rs`):
-- **Teleportation**: Position jump > 500m
+- **Teleportation**: Position jump > 2km (increased from 500m to reduce false positives during GPS re-acquisition)
 - **Speed anomaly**: Ground speed > 30 m/s (108 km/h)
 - **GNSS time jump backwards**: Time going backwards > 1 second
 - **GNSS time jump forwards**: Unrealistic jump > 30 seconds
@@ -158,9 +158,13 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
    - Synchronized with real GNSS timing
 
 **Recovery**:
-- 5 seconds of clean (non-spoofed) data required
+- Time-based recovery: Immediate when GNSS time returns to normal
+- Coordinate-based recovery: 5 seconds of clean data + position within 2km of last good
+- **Recovery warmup** (10 samples, ~2 seconds): After recovery, coordinate anomalies are ignored to prevent false positives from GPS re-acquisition jitter. Time-based checks remain active during warmup.
 - Reset SEC_SIGN_ACC hash accumulator
 - Restore normal passthrough (original SEC-SIGN passed through)
+
+**Bug fix (Jan 2025)**: Fixed false positive triggering during GPS re-acquisition after spoofing ends. Previously, `last_good` was overwritten during time recovery, making detector vulnerable to coordinate jumps. Now `last_good` is preserved and recovery warmup ignores coordinate anomalies.
 
 **Global state** (atomics in `main.rs`):
 - `SPOOF_DETECTED: AtomicBool` - spoofing active flag
