@@ -484,6 +484,44 @@ impl SpoofDetector {
 
         let is_anomaly = coord_anomaly_effective || time_anomaly;
 
+        // DEBUG: Детальное логирование состояния детектора
+        debug!("SPOOF_DBG: spoofed={} anom_cnt={} norm_cnt={} warmup={}/{} rec_warmup={}/{}",
+            self.spoofed as u8,
+            self.anomaly_count,
+            self.normal_count,
+            self.warmup_samples,
+            Self::WARMUP_SAMPLES,
+            self.recovery_warmup_samples,
+            thresholds::RECOVERY_WARMUP_COUNT
+        );
+
+        debug!("SPOOF_DBG: coord={} coord_eff={} time_sp={} time_rec={} drift_sp={} drift_rec={}",
+            coord_anomaly as u8,
+            coord_anomaly_effective as u8,
+            time_spoof as u8,
+            time_recovery as u8,
+            clock_drift_spoof as u8,
+            clock_drift_recovery as u8
+        );
+
+        debug!("SPOOF_DBG: dist={}m speed={}m/s teleport={} speed_anom={}",
+            analysis.distance_m as i32,
+            analysis.speed_ms as i32,
+            analysis.is_teleport as u8,
+            analysis.is_speed_anomaly as u8
+        );
+
+        // DEBUG: Log current position and last_good for comparison
+        debug!("POS_DBG: curr lat={} lon={} alt={}mm",
+            pos.lat, pos.lon, pos.alt_mm);
+        if let Some(ref good) = self.last_good {
+            let dist_from_good = Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon);
+            debug!("POS_DBG: good lat={} lon={} dist_from_good={}m",
+                good.lat, good.lon, dist_from_good as i32);
+        } else {
+            debug!("POS_DBG: last_good=None");
+        }
+
         // NEW: Prioritize time-based recovery (stronger signal than coordinates)
         if (time_recovery || clock_drift_recovery) && self.spoofed {
             self.spoofed = false;
@@ -700,22 +738,26 @@ impl SpoofDetector {
         
         // Check 3: If currently spoofed, check for recovery
         // If GNSS time jumps back close to projected real time, likely recovered
-        let is_recovery = if self.spoofed {
+        let (is_recovery, diff_from_real) = if self.spoofed {
             // Project what real time should be now based on last good time
             let projected_real = last_good.project(system_ms);
-            let diff_from_real = (curr_unix - projected_real).abs();
-            
+            let diff = (curr_unix - projected_real).abs();
+
             // If current GNSS time is close to projected real time, likely recovered
-            diff_from_real <= thresholds::TIME_RECOVERY_TOLERANCE_S
+            (diff <= thresholds::TIME_RECOVERY_TOLERANCE_S, diff)
         } else {
-            false
+            (false, 0)
         };
-        
+
+        // DEBUG: Log time check details
+        debug!("TIME_DBG: curr={} last={} diff={} diff_from_proj={} spoof={} rec={}",
+            curr_unix, last_unix, time_diff, diff_from_real, is_spoof as u8, is_recovery as u8);
+
         // Update last good GNSS time if not spoofed
         if !is_spoof && !self.spoofed {
             self.last_good_gnss_time = Some(*curr_time);
         }
-        
+
         (is_spoof, is_recovery)
     }
 
@@ -787,7 +829,11 @@ impl SpoofDetector {
         
         // Calculate drift
         let drift_s = (gnss_unix - expected_gnss_unix).abs();
-        
+
+        // DEBUG: Log clock drift check details
+        debug!("DRIFT_DBG: gnss={} expected={} drift={}s calib={} spoofed={}",
+            gnss_unix, expected_gnss_unix, drift_s, self.clock_calibrated as u8, self.spoofed as u8);
+
         // Check for spoofing: large drift indicates fake GNSS time
         let is_drift_spoof = drift_s > thresholds::MAX_CLOCK_DRIFT_S;
         
