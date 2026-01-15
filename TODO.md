@@ -24,7 +24,7 @@
     - **Result**: 100% packet reliability (0 overruns in 5-minute test)
 
 ## Current Active Detection Algorithms
-1. ✅ Teleportation (>500m position jump)
+1. ✅ Teleportation (>2000m position jump)
 2. ✅ Speed anomaly (>30 m/s)
 3. ✅ GNSS time jumps (backwards/forward)
 4. ✅ System clock drift (calibrated internal clock vs GNSS time)
@@ -34,6 +34,6 @@
 
 ## Future Improvements
 - [ ] Test NMEA passthrough with real u-blox module
-- [ ] Test time-based detection with simulated spoofing
+- [x] Test time-based detection with simulated spoofing (tested Jan 2025)
 - [ ] Add signal-level anti-jam detection (AGC analysis)
 - [ ] Implement carrier-phase divergence detection
