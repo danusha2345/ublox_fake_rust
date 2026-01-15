@@ -164,7 +164,7 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 - Reset SEC_SIGN_ACC hash accumulator
 - Restore normal passthrough (original SEC-SIGN passed through)
 
-**Bug fix (Jan 2025)**: Fixed false positive triggering during GPS re-acquisition after spoofing ends. Previously, `last_good` was overwritten during time recovery, making detector vulnerable to coordinate jumps. Now `last_good` is preserved and recovery warmup ignores coordinate anomalies.
+**Bug fix (Jan 2026)**: Fixed false positive triggering during GPS re-acquisition after spoofing ends. Previously, `last_good` was overwritten during time recovery, making detector vulnerable to coordinate jumps. Now `last_good` is preserved and recovery warmup ignores coordinate anomalies.
 
 **Global state** (atomics in `main.rs`):
 - `SPOOF_DETECTED: AtomicBool` - spoofing active flag
@@ -245,7 +245,7 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 .wrap
 ```
 
-### Packet Loss Fix in Passthrough Mode (Jan 2025)
+### Packet Loss Fix in Passthrough Mode (Jan 2026)
 
 **Original problem**: ~57.5% packet loss for RXM-RAWX, ~10% overall loss.
 
@@ -295,7 +295,7 @@ if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
 
 **Warning**: Do NOT use `try_lock()` instead of `lock().await` for SEC_SIGN_ACC - it breaks signature verification by skipping hash accumulation.
 
-### UART Overrun Fix (Jan 2025) — 100% RELIABILITY ACHIEVED
+### UART Overrun Fix (Jan 2026) — 100% RELIABILITY ACHIEVED
 
 **Problem diagnosed**: 0.02-0.05% packet loss from UART hardware overrun (NOT software channels).
 

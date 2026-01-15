@@ -18,7 +18,7 @@
 
 ## 3. Bug Fixes ✅ DONE
 - [x] **SEC-SIGN not enabled in Passthrough**: Fixed by removing `MSG_OUTPUT_STARTED` wait condition for Passthrough mode
-- [x] **Hash Mismatch / Packet Drops**: **FIXED** (Jan 2025)
+- [x] **Hash Mismatch / Packet Drops**: **FIXED** (Jan 2026)
     - Root causes: RXM-RAWX header loss, ECDSA blocking, slow crypto, channel overflow, UART FIFO overrun
     - Fixes: `is_idle()` check, `select()` buffering, crypto opt-level=3, channel depth 128, FIFO threshold 1/4
     - **Result**: 100% packet reliability (0 overruns in 5-minute test)
@@ -34,6 +34,6 @@
 
 ## Future Improvements
 - [ ] Test NMEA passthrough with real u-blox module
-- [x] Test time-based detection with simulated spoofing (tested Jan 2025)
+- [x] Test time-based detection with simulated spoofing (tested Jan 2026)
 - [ ] Add signal-level anti-jam detection (AGC analysis)
 - [ ] Implement carrier-phase divergence detection
