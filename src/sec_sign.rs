@@ -3,28 +3,26 @@
 //! Implements ECDSA SECP192R1 signature for u-blox authentication
 //! Pure Rust implementation using p192 primitives
 
-use sha2::{Digest, Sha256};
-use p192::{ProjectivePoint, Scalar};
-use p192::elliptic_curve::group::GroupEncoding;
-use subtle::CtOption;
-use hmac::{Hmac, Mac};
 use crate::config::DroneModel;
+use hmac::{Hmac, Mac};
+use p192::elliptic_curve::group::GroupEncoding;
+use p192::{ProjectivePoint, Scalar};
+use sha2::{Digest, Sha256};
+use subtle::CtOption;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// SEC-SIGN private key for DJI Air 3 (SECP192R1 - 24 bytes)
 /// WARNING: Hardcoded for development. Production should use secure storage.
 pub const PRIVATE_KEY_AIR3: [u8; 24] = [
-    0xea, 0xa5, 0xc0, 0x11, 0x1e, 0x18, 0xdb, 0xd1,
-    0x7a, 0xdb, 0x3d, 0xc9, 0x39, 0x4b, 0xfb, 0x45,
+    0xea, 0xa5, 0xc0, 0x11, 0x1e, 0x18, 0xdb, 0xd1, 0x7a, 0xdb, 0x3d, 0xc9, 0x39, 0x4b, 0xfb, 0x45,
     0x1f, 0x9d, 0x5e, 0x83, 0xf9, 0x38, 0x22, 0xc7,
 ];
 
 /// SEC-SIGN private key for DJI Mavic 4 Pro (SECP192R1 - 24 bytes)
 /// WARNING: Hardcoded for development. Production should use secure storage.
 pub const PRIVATE_KEY_MAVIC4PRO: [u8; 24] = [
-    0x90, 0x89, 0xa2, 0x18, 0x14, 0xa6, 0x2f, 0xc3,
-    0x3a, 0xf5, 0xd6, 0xeb, 0x61, 0x16, 0x1c, 0xe1,
+    0x90, 0x89, 0xa2, 0x18, 0x14, 0xa6, 0x2f, 0xc3, 0x3a, 0xf5, 0xd6, 0xeb, 0x61, 0x16, 0x1c, 0xe1,
     0x86, 0x36, 0xf5, 0x48, 0xd0, 0x71, 0xd6, 0x9f,
 ];
 
@@ -101,6 +99,7 @@ impl Default for SecSignAccumulator {
 
 /// Compute the z value for ECDSA signing
 /// z = fold(SHA256(sha256_field || session_id))
+#[inline(always)]
 #[link_section = ".data"]
 pub fn compute_z(sha256_field: &[u8; 32], session_id: &[u8; 24]) -> [u8; 24] {
     // Concatenate sha256_field and session_id
@@ -133,11 +132,11 @@ pub struct Signature {
 /// Generate deterministic k using RFC6979 (simplified)
 /// k = HMAC-SHA256(private_key || z) mod n
 /// Returns None if no valid k found after 255 attempts (astronomically unlikely)
+#[inline(always)]
 #[link_section = ".data"]
 fn generate_k(private_key: &[u8; 24], z: &[u8; 24]) -> Option<Scalar> {
     // Simplified RFC6979: k = HMAC(key=d, data=z)
-    let mut mac = HmacSha256::new_from_slice(private_key)
-        .expect("HMAC key length is valid");
+    let mut mac = HmacSha256::new_from_slice(private_key).expect("HMAC key length is valid");
     mac.update(z);
 
     // Add counter for retry mechanism (RFC6979 style)
@@ -248,6 +247,7 @@ pub struct SecSignResult {
 }
 
 /// Helper to convert CtOption to Option
+#[inline(always)]
 fn ct_option_to_option<T>(ct: CtOption<T>) -> Option<T> {
     if bool::from(ct.is_some()) {
         Some(ct.unwrap())

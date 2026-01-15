@@ -259,10 +259,13 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
    - `SEC_SIGN_IN_PROGRESS` blocked TX while Core1 computed signature (~700ms originally)
    - Fix: Local buffering in `uart0_tx_task` using `select()` pattern - buffer packets during wait
 
-3. **Slow ECDSA computation** (commit a61110d):
+3. **Slow ECDSA computation** (commit a61110d, extended Jan 2026):
    - `opt-level="z"` made p192 crypto very slow (~700ms per signature)
-   - Fix: Added `opt-level=3` for p192, sha2, hmac, subtle crates in Cargo.toml
-   - Result: ECDSA now ~67ms (10x faster)
+   - Fix: Added `opt-level=3` for crypto crates in Cargo.toml:
+     - p192, sha2, hmac, subtle (original)
+     - crypto-bigint, elliptic-curve, primeorder, ff, group, digest, block-buffer (Jan 2026)
+   - Added `#[inline(always)]` to `compute_z()`, `generate_k()`, `ct_option_to_option()`
+   - Result: ECDSA ~55-60ms (was ~67ms, originally ~700ms)
 
 4. **Channel depth insufficient** (commit 50cf77b):
    - 64 slots still caused ~0.13% loss during packet bursts
@@ -273,7 +276,7 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 |--------|--------|-------|
 | RXM-RAWX loss | 57.5% | **0.07%** |
 | Overall loss | ~10% | **0.03%** (6 packets) |
-| ECDSA time | ~700ms | **~67ms** |
+| ECDSA time | ~700ms | **~55-60ms** |
 | SEC-SIGN | unstable | **stable 4.00s** |
 
 Remaining 6 lost packets: MON-VER(1), NAV-SAT(1), NAV-STATUS(1), RXM-RAWX(1), RXM-SFRBX(2) - acceptable for Passthrough mode.
