@@ -59,6 +59,16 @@ pub mod timers {
     pub const SATELLITES_INVALID_AFTER_MS: u64 = 20_000;
 }
 
+/// Константы для логики кнопки переключения режимов
+pub mod button {
+    /// Максимальное время между нажатиями для серии (мс)
+    pub const MULTI_CLICK_TIMEOUT_MS: u64 = 500;
+    /// Время debounce (мс)
+    pub const DEBOUNCE_MS: u64 = 50;
+    /// Период опроса кнопки (мс)
+    pub const POLL_PERIOD_MS: u64 = 20;
+}
+
 /// Default coordinates (configurable)
 pub mod default_position {
     pub const LATITUDE: f64 = 25.7889186;

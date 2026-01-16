@@ -1693,100 +1693,120 @@ async fn sec_sign_timer_task() {
 }
 
 /// Mode button task - hot-switches mode without reboot
-/// Uses pure polling and implements RP2350-E9 Errata Workaround (Input Latch-up fix)
-/// Cycle: Emulation -> Passthrough -> PassthroughRaw -> Emulation
+/// Выбор режима по количеству коротких нажатий:
+/// 1 нажатие → Emulation (зелёный), 2 → Passthrough (синий), 3 → PassthroughRaw (фиолетовый)
+/// Использует RP2350-E9 Errata Workaround (Input Latch-up fix)
 #[embassy_executor::task]
 async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) {
-    // Initial setup
+    use config::button::*;
+    use embassy_time::Instant;
+
+    // Инициализация GPIO
     flex.set_as_input();
     flex.set_pull(Pull::Down);
     
-    // Wait 1s at startup to ignore power-on noise
+    // Ждём 1с при старте для игнорирования power-on noise
     Timer::after(Duration::from_millis(1000)).await;
 
+    let mut click_count: u8 = 0;
+    let mut last_click_time: Option<Instant> = None;
     let mut was_high = false;
 
     loop {
-        Timer::after(Duration::from_millis(20)).await;
+        Timer::after(Duration::from_millis(POLL_PERIOD_MS)).await;
         
         let is_high = flex.is_high();
 
+        // Проверка таймаута серии нажатий
+        if click_count > 0 {
+            if let Some(last_time) = last_click_time {
+                if last_time.elapsed().as_millis() >= MULTI_CLICK_TIMEOUT_MS {
+                    // Таймаут - применяем режим по количеству нажатий
+                    apply_mode_by_clicks(click_count, flash_mutex).await;
+                    click_count = 0;
+                    last_click_time = None;
+                }
+            }
+        }
+
+        // Обнаружение нажатия (0 → 1)
         if is_high && !was_high {
-             // 0 -> 1 transition
-             info!("button_task: edge detected (0->1), debouncing");
-             Timer::after(Duration::from_millis(50)).await;
-             
-             if flex.is_high() {
-                 info!("button_task: confirmed pressed, switching mode");
+            info!("button_task: edge detected (0->1), debouncing");
+            Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+            
+            if flex.is_high() {
+                click_count = click_count.saturating_add(1).min(3);
+                last_click_time = Some(Instant::now());
+                info!("button_task: click #{}", click_count);
 
-                 let current = OperatingMode::load();
-                 let new_mode = match current {
-                    OperatingMode::Emulation => OperatingMode::Passthrough,
-                    OperatingMode::Passthrough => OperatingMode::PassthroughRaw,
-                    OperatingMode::PassthroughRaw => OperatingMode::Emulation,
-                 };
-
-                 // Hot-switch: just change MODE atomically
-                 new_mode.store();
-                 info!("HOT-SWITCH: {:?} -> {:?}", current, new_mode);
-
-                 // Reset 20s timer when switching to Emulation
-                 if new_mode == OperatingMode::Emulation {
-                     OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
-                     SATELLITES_INVALID.store(false, Ordering::Release);
-                     info!("Reset satellite validity timer (mode switch)");
-                 }
-
-                 // Clear spoof flag when switching to PassthroughRaw
-                 if new_mode == OperatingMode::PassthroughRaw {
-                     SPOOF_DETECTED.store(false, Ordering::Release);
-                     SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
-                     info!("Cleared spoof detection state (entering raw passthrough)");
-                 }
-
-                 // Save to flash
-                 {
-                    let mut flash = flash_mutex.lock().await;
-                    if flash_storage::save_mode(&mut flash, new_mode as u8).await {
-                        info!("Mode saved to flash");
-                    } else {
-                        warn!("Failed to save mode to flash");
+                // Ждём отпускания кнопки с E9 workaround
+                info!("button_task: waiting for release...");
+                let mut high_count = 0;
+                loop {
+                    if !flex.is_high() {
+                        info!("button_task: released!");
+                        break;
                     }
-                 }
+                    Timer::after(Duration::from_millis(50)).await;
+                    high_count += 1;
 
-                 // Wait for release with Errata RP2350-E9 Workaround
-                 info!("button_task: waiting for release...");
-                 
-                 let mut high_count = 0;
-                 
-                 loop {
-                     if !flex.is_high() {
-                         info!("button_task: released!");
-                         break; // Released!
-                     }
-                     
-                     Timer::after(Duration::from_millis(50)).await;
-                     high_count += 1;
-                     
-                     // Every 250ms (5 * 50ms), try to discharge the pin
-                     if high_count % 5 == 0 {
-                         info!("button_task: still HIGH (2.4V latch?), attempting E9 discharge kick...");
-                         
-                         // Workaround: Drive LOW briefly to discharge latch-up
-                         flex.set_as_output();
-                         flex.set_low();
-                         Timer::after(Duration::from_micros(50)).await;
-                         
-                         // Restore Input Pull-Down
-                         flex.set_as_input();
-                         flex.set_pull(Pull::Down);
-                         
-                         // Short settling time
-                         Timer::after(Duration::from_micros(50)).await;
-                     }
-                 }
-             }
+                    // E9 discharge kick каждые ~250мс (5 * 50мс)
+                    if high_count % 5 == 0 {
+                        info!("button_task: still HIGH (2.4V latch?), attempting E9 discharge kick...");
+                        flex.set_as_output();
+                        flex.set_low();
+                        Timer::after(Duration::from_micros(50)).await;
+                        flex.set_as_input();
+                        flex.set_pull(Pull::Down);
+                        Timer::after(Duration::from_micros(50)).await;
+                    }
+                }
+            }
         }
         was_high = is_high;
+    }
+}
+
+/// Применяет режим по количеству нажатий кнопки
+async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex) {
+    let new_mode = match click_count {
+        1 => OperatingMode::Emulation,
+        2 => OperatingMode::Passthrough,
+        3 => OperatingMode::PassthroughRaw,
+        _ => return, // 0 нажатий - нечего делать
+    };
+
+    let current = OperatingMode::load();
+    if current == new_mode {
+        info!("Mode unchanged: {:?} (clicks={})", new_mode, click_count);
+        return;
+    }
+
+    // Применяем режим
+    new_mode.store();
+    info!("HOT-SWITCH: {:?} -> {:?} (clicks={})", current, new_mode, click_count);
+
+    // Reset таймера спутников при переключении в Emulation
+    if new_mode == OperatingMode::Emulation {
+        OUTPUT_START_MILLIS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Release);
+        SATELLITES_INVALID.store(false, Ordering::Release);
+        info!("Reset satellite validity timer (mode switch)");
+    }
+
+    // Сброс флагов спуфинга при переключении в PassthroughRaw
+    if new_mode == OperatingMode::PassthroughRaw {
+        SPOOF_DETECTED.store(false, Ordering::Release);
+        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+        info!("Cleared spoof detection state (entering raw passthrough)");
+    }
+
+    // Сохраняем во flash
+    {
+        let mut flash = flash_mutex.lock().await;
+        if flash_storage::save_mode(&mut flash, new_mode as u8).await {
+            info!("Mode saved to flash");
+        } else {
+            warn!("Failed to save mode to flash");
+        }
     }
 }

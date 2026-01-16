@@ -75,7 +75,7 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 | `uart1_rx_task` | async | Receives data from external GNSS (passthrough input) |
 | `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (uses Timer::at for drift-free timing) |
 | `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1, waits via SEC_SIGN_DONE Signal |
-| `button_task` | async | Mode cycle on GPIO button press |
+| `button_task` | async | Mode selection by click count (1/2/3 clicks → Emulation/Passthrough/Raw) |
 
 ### Core1 Tasks
 | Task | Rate | Purpose |
@@ -122,7 +122,12 @@ Uses WGS84 ellipsoid parameters for LLH→ECEF conversion.
 - **Passthrough** (1): Forwards data from real GNSS module with spoof detection (LED blue, blinking red on spoof)
 - **PassthroughRaw** (2): Raw passthrough without spoof detection - pure transparent forwarding (LED purple)
 
-Mode is persisted to flash and survives reboots. Button press cycles modes: Emulation → Passthrough → PassthroughRaw → Emulation (hot-switch, no reboot).
+Mode is persisted to flash and survives reboots. Button selects mode by click count:
+- **1 click** → Emulation (green LED)
+- **2 clicks** → Passthrough (blue LED)
+- **3 clicks** → PassthroughRaw (purple LED)
+
+Timeout between clicks: 500ms. Hot-switch without reboot.
 
 ### Spoof Detection in Passthrough Mode
 
