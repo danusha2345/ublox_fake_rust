@@ -206,6 +206,10 @@ pub static LAST_GOOD_LON: portable_atomic::AtomicI32 = portable_atomic::AtomicI3
 /// Last known good altitude before spoofing (mm)
 pub static LAST_GOOD_ALT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 
+/// Флаг для сброса спуф-детектора при смене режима (предотвращает ложные телепорты)
+/// Устанавливается при переключении в Passthrough, сбрасывается в gnss_processing_task
+pub static SPOOF_DETECTOR_RESET: AtomicBool = AtomicBool::new(false);
+
 /// Flash mutex type for mode persistence
 type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { config::FLASH_SIZE_BYTES }>>;
 
@@ -916,6 +920,17 @@ async fn gnss_processing_task() {
                 detector = Some(SpoofDetector::new());
                 pos_buffer = Some(PositionBuffer::new());
                 info!("Initialized SpoofDetector and Parser for Passthrough mode");
+            }
+
+            // Проверяем флаг сброса детектора (при переключении режимов)
+            if SPOOF_DETECTOR_RESET.swap(false, Ordering::AcqRel) {
+                if let Some(ref mut d) = detector {
+                    d.reset();
+                    info!("SpoofDetector reset by mode switch (SPOOF_DETECTOR_RESET)");
+                }
+                // Также сбрасываем глобальные флаги спуфинга
+                SPOOF_DETECTED.store(false, Ordering::Release);
+                SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
             }
 
             let parser = parser.as_mut().unwrap();
@@ -1798,6 +1813,16 @@ async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex)
         SPOOF_DETECTED.store(false, Ordering::Release);
         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
         info!("Cleared spoof detection state (entering raw passthrough)");
+    }
+
+    // Сброс спуф-детектора при переключении в Passthrough
+    // Это предотвращает ложную детекцию "телепорта" при переходе из Emulation
+    // (координаты эмуляции отличаются от реальных GNSS координат)
+    if new_mode == OperatingMode::Passthrough {
+        SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
+        SPOOF_DETECTED.store(false, Ordering::Release);
+        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+        info!("SPOOF_DETECTOR_RESET set (entering passthrough, prevents false teleport)");
     }
 
     // Сохраняем во flash

@@ -171,6 +171,8 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 
 **Bug fix (Jan 2026)**: Fixed false positive triggering during GPS re-acquisition after spoofing ends. Previously, `last_good` was overwritten during time recovery, making detector vulnerable to coordinate jumps. Now `last_good` is preserved and recovery warmup ignores coordinate anomalies.
 
+**Bug fix (Jan 2026 #2)**: Fixed false teleport detection when switching from Emulation to Passthrough mode. Added `SPOOF_DETECTOR_RESET` atomic flag that triggers detector reset via `apply_mode_by_clicks()`. This prevents the detector from seeing emulation coordinates as the previous position when real GNSS data starts arriving.
+
 **Global state** (atomics in `main.rs`):
 - `SPOOF_DETECTED: AtomicBool` - spoofing active flag
 - `SPOOF_RECOVERY_START_MS: AtomicU32` - recovery timer start
