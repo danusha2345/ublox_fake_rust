@@ -638,12 +638,12 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     }
                     Ok(Either::Second(msg)) => {
                         // If SEC-SIGN is in progress, buffer packets locally while waiting
-                        // This prevents GNSS_RX_CHANNEL overflow during ~67ms ECDSA computation
+                        // This prevents GNSS_RX_CHANNEL overflow during ~59ms ECDSA computation
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
                             let wait_start = embassy_time::Instant::now();
 
                             // Local buffer for packets during signature wait
-                            // 64 slots handles ~67ms of GNSS data at 921600 baud with margin
+                            // 64 slots handles ~59ms of GNSS data at 921600 baud with margin
                             let mut pending: heapless::Vec<heapless::Vec<u8, 1280>, 64> = heapless::Vec::new();
                             let _ = pending.push(msg); // First packet goes to buffer
 

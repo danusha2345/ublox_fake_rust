@@ -272,7 +272,7 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
      - p192, sha2, hmac, subtle (original)
      - crypto-bigint, elliptic-curve, primeorder, ff, group, digest, block-buffer (Jan 2026)
    - Added `#[inline(always)]` to `compute_z()`, `generate_k()`, `ct_option_to_option()`
-   - Result: ECDSA ~55-60ms (was ~67ms, originally ~700ms)
+   - Result: ECDSA ~59ms (was ~67ms, originally ~700ms)
 
 4. **Channel depth insufficient** (commit 50cf77b):
    - 64 slots still caused ~0.13% loss during packet bursts
@@ -283,7 +283,7 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 |--------|--------|-------|
 | RXM-RAWX loss | 57.5% | **0.07%** |
 | Overall loss | ~10% | **0.03%** (6 packets) |
-| ECDSA time | ~700ms | **~55-60ms** |
+| ECDSA time | ~700ms | **~59ms** |
 | SEC-SIGN | unstable | **stable 4.00s** |
 
 Remaining 6 lost packets: MON-VER(1), NAV-SAT(1), NAV-STATUS(1), RXM-RAWX(1), RXM-SFRBX(2) - acceptable for Passthrough mode.
