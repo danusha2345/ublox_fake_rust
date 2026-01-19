@@ -62,7 +62,8 @@ pub mod timers {
 /// Константы для логики кнопки переключения режимов
 pub mod button {
     /// Максимальное время между нажатиями для серии (мс)
-    pub const MULTI_CLICK_TIMEOUT_MS: u64 = 500;
+    /// 800мс даёт достаточно времени для 3 кликов (было 500мс - слишком мало)
+    pub const MULTI_CLICK_TIMEOUT_MS: u64 = 800;
     /// Время debounce (мс)
     pub const DEBOUNCE_MS: u64 = 50;
     /// Период опроса кнопки (мс)

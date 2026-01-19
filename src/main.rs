@@ -1751,12 +1751,12 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
             
             if flex.is_high() {
                 click_count = click_count.saturating_add(1).min(3);
-                last_click_time = Some(Instant::now());
                 info!("button_task: click #{}", click_count);
 
-                // Ждём отпускания кнопки с E9 workaround
+                // Ждём отпускания кнопки с E9 workaround и защитой от зависания
                 info!("button_task: waiting for release...");
-                let mut high_count = 0;
+                let mut high_count: u32 = 0;
+                const MAX_RELEASE_WAIT: u32 = 40; // 40 * 50ms = 2 секунды максимум
                 loop {
                     if !flex.is_high() {
                         info!("button_task: released!");
@@ -1764,6 +1764,12 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
                     }
                     Timer::after(Duration::from_millis(50)).await;
                     high_count += 1;
+
+                    // Защита от зависания - максимум 2 секунды ожидания
+                    if high_count >= MAX_RELEASE_WAIT {
+                        warn!("button_task: release wait timeout (2s), forcing exit");
+                        break;
+                    }
 
                     // E9 discharge kick каждые ~250мс (5 * 50мс)
                     if high_count % 5 == 0 {
@@ -1776,6 +1782,10 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
                         Timer::after(Duration::from_micros(50)).await;
                     }
                 }
+
+                // Таймаут отсчитываем от момента ОТПУСКАНИЯ кнопки,
+                // чтобы E9 workaround не съедал время на следующий клик
+                last_click_time = Some(Instant::now());
             }
         }
         was_high = is_high;
