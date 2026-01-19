@@ -698,13 +698,16 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                     continue;
                                 }
                                 DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                                // Accumulate for next SEC-SIGN (skip SEC-SIGN messages)
-                                let is_sec_sign = buffered_msg.len() >= 4
-                                    && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
-                                if !is_sec_sign {
-                                    let mut acc = SEC_SIGN_ACC.lock().await;
-                                    if let Some(ref mut accumulator) = *acc {
-                                        accumulator.accumulate(&buffered_msg);
+                                // Accumulate for next SEC-SIGN only if still spoofing
+                                // (spoofing may have ended while waiting for ECDSA)
+                                if SPOOF_DETECTED.load(Ordering::Acquire) {
+                                    let is_sec_sign = buffered_msg.len() >= 4
+                                        && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
+                                    if !is_sec_sign {
+                                        let mut acc = SEC_SIGN_ACC.lock().await;
+                                        if let Some(ref mut accumulator) = *acc {
+                                            accumulator.accumulate(&buffered_msg);
+                                        }
                                     }
                                 }
                             }
@@ -718,12 +721,15 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
                         DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
-                        // Accumulate for our SEC-SIGN (skip SEC-SIGN messages themselves)
-                        let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-                        if !is_sec_sign {
-                            let mut acc = SEC_SIGN_ACC.lock().await;
-                            if let Some(ref mut accumulator) = *acc {
-                                accumulator.accumulate(&msg);
+                        // Accumulate hash only when spoofing (we generate our own SEC-SIGN)
+                        // Without spoofing, original SEC-SIGN passes through - no accumulation needed
+                        if SPOOF_DETECTED.load(Ordering::Acquire) {
+                            let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
+                            if !is_sec_sign {
+                                let mut acc = SEC_SIGN_ACC.lock().await;
+                                if let Some(ref mut accumulator) = *acc {
+                                    accumulator.accumulate(&msg);
+                                }
                             }
                         }
                     }
@@ -1027,9 +1033,15 @@ async fn gnss_processing_task() {
                         recalc_checksum(&mut frame);
                     }
 
-                    // Filter out original SEC-SIGN in Passthrough - we generate our own
+                    // Filter SEC-SIGN in Passthrough based on spoof state:
+                    // - Without spoofing: pass through original SEC-SIGN from real GNSS
+                    // - With spoofing: filter out (NAV modified, we generate our own)
                     if class == 0x27 && id == 0x04 {
-                        continue;
+                        if SPOOF_DETECTED.load(Ordering::Acquire) {
+                            // Spoofing active - filter original SEC-SIGN, our timer generates replacement
+                            continue;
+                        }
+                        // No spoofing - let original SEC-SIGN pass through
                     }
 
                     // Send frame to TX channel
@@ -1677,7 +1689,11 @@ async fn sec_sign_timer_task() {
         if mode == OperatingMode::PassthroughRaw {
             continue;  // SEC-SIGN timer skipped in Raw mode
         }
-        // Works for Emulation and Passthrough (with/without spoofing)
+        // In Passthrough without spoofing, original SEC-SIGN passes through - no need to generate
+        if mode == OperatingMode::Passthrough && !SPOOF_DETECTED.load(Ordering::Acquire) {
+            continue;
+        }
+        // Works for Emulation and Passthrough (with spoofing only)
 
         // CRITICAL: Pause TX before capturing hash to prevent race condition
         // Any packets sent after hash capture but before SEC-SIGN TX would not
