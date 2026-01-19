@@ -643,8 +643,8 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             let wait_start = embassy_time::Instant::now();
 
                             // Local buffer for packets during signature wait
-                            // 64 slots handles ~59ms of GNSS data at 921600 baud with margin
-                            let mut pending: heapless::Vec<heapless::Vec<u8, 1280>, 64> = heapless::Vec::new();
+                            // 72 slots handles ~66ms of GNSS data (vs ~59ms ECDSA), covers high satellite count (32+ sats)
+                            let mut pending: heapless::Vec<heapless::Vec<u8, 1280>, 72> = heapless::Vec::new();
                             let _ = pending.push(msg); // First packet goes to buffer
 
                             // Keep draining channel while waiting for signature (non-blocking!)
