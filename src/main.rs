@@ -228,7 +228,8 @@ pub enum OperatingMode {
     #[default]
     Emulation = 0,
     Passthrough = 1,
-    PassthroughRaw = 2,  // Passthrough without spoof detection
+    PassthroughRaw = 2,     // Passthrough without spoof detection
+    PassthroughOffset = 3,  // Passthrough with coordinate offset (spoof detection enabled)
 }
 
 impl OperatingMode {
@@ -236,7 +237,8 @@ impl OperatingMode {
         match MODE.load(Ordering::Acquire) {
             0 => Self::Emulation,
             1 => Self::Passthrough,
-            _ => Self::PassthroughRaw,
+            2 => Self::PassthroughRaw,
+            _ => Self::PassthroughOffset,
         }
     }
 
@@ -289,7 +291,8 @@ async fn main(spawner: Spawner) {
             let mode = match mode_byte {
                 0 => OperatingMode::Emulation,
                 1 => OperatingMode::Passthrough,
-                _ => OperatingMode::PassthroughRaw,
+                2 => OperatingMode::PassthroughRaw,
+                _ => OperatingMode::PassthroughOffset,
             };
             mode.store();
             info!("Loaded mode {} from flash: {:?}", mode_byte, mode);
@@ -471,6 +474,24 @@ async fn led_task(
                     RGB8::new(0, 0, 0)    // Off
                 }
             }
+            OperatingMode::PassthroughOffset => {
+                // Passthrough with coordinate offset: white (blink), red if spoofing
+                if spoof_detected {
+                    // Fast blinking red (same as regular Passthrough)
+                    if blink_counter.is_multiple_of(2) {
+                        RGB8::new(50, 0, 0)  // Red ON
+                    } else {
+                        RGB8::new(0, 0, 0)   // OFF
+                    }
+                } else {
+                    // Normal: white (blink every 5 ticks = 500ms)
+                    if blink_counter % 5 < 3 {
+                        RGB8::new(20, 20, 20)  // White
+                    } else {
+                        RGB8::new(0, 0, 0)     // Off
+                    }
+                }
+            }
             OperatingMode::Emulation => {
                 // Slow blink (500ms cycle)
                 if blink_counter % 5 < 3 {
@@ -604,8 +625,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     }
                 }
             }
-            OperatingMode::Passthrough => {
+            OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
                 // Passthrough mode with SEC-SIGN generation (both Spoof and Normal)
+                // PassthroughOffset has same TX logic, offset is applied in gnss_processing_task
                 // Use timeout to limit blocking time to 100ms for mode switching check
                 match embassy_time::with_timeout(
                     Duration::from_millis(100),
@@ -698,9 +720,12 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                     continue;
                                 }
                                 DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                                // Accumulate for next SEC-SIGN only if still spoofing
+                                // Accumulate for next SEC-SIGN if spoofing OR PassthroughOffset
                                 // (spoofing may have ended while waiting for ECDSA)
-                                if SPOOF_DETECTED.load(Ordering::Acquire) {
+                                let buf_mode = OperatingMode::load();
+                                let need_accumulate = SPOOF_DETECTED.load(Ordering::Acquire)
+                                    || buf_mode == OperatingMode::PassthroughOffset;
+                                if need_accumulate {
                                     let is_sec_sign = buffered_msg.len() >= 4
                                         && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
                                     if !is_sec_sign {
@@ -721,9 +746,14 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
                         DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
 
-                        // Accumulate hash only when spoofing (we generate our own SEC-SIGN)
-                        // Without spoofing, original SEC-SIGN passes through - no accumulation needed
-                        if SPOOF_DETECTED.load(Ordering::Acquire) {
+                        // Accumulate hash when spoofing OR in PassthroughOffset mode
+                        // - Spoofing: NAV modified, we generate our own SEC-SIGN
+                        // - PassthroughOffset: coordinates modified, original SEC-SIGN invalid
+                        // Without spoofing in normal Passthrough: original SEC-SIGN passes through
+                        let current_mode = OperatingMode::load();
+                        let need_own_sec_sign = SPOOF_DETECTED.load(Ordering::Acquire)
+                            || current_mode == OperatingMode::PassthroughOffset;
+                        if need_own_sec_sign {
                             let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                             if !is_sec_sign {
                                 let mut acc = SEC_SIGN_ACC.lock().await;
@@ -891,6 +921,8 @@ async fn gnss_processing_task() {
         UbxFrameParser, PositionBuffer, extract_position_from_pvt, extract_gnss_time_from_pvt,
         extract_cno_from_nav_sat,
         modify_nav_pvt, modify_nav_sol, modify_nav_status, modify_nav_sat, modify_nav_svinfo,
+        apply_offset_nav_pvt, apply_offset_nav_posllh, apply_offset_nav_posecef,
+        apply_offset_nav_hpposecef, apply_offset_nav_sol,
         recalc_checksum,
     };
     use spoof_detector::{SpoofDetector, Position, AnalysisResult, FixType};
@@ -919,13 +951,15 @@ async fn gnss_processing_task() {
                     DIAG_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-        } else if mode == OperatingMode::Passthrough {
-            // Initialize parsers if first time entering Passthrough
+        } else if mode == OperatingMode::Passthrough || mode == OperatingMode::PassthroughOffset {
+            // Initialize parsers if first time entering Passthrough/PassthroughOffset
+            let apply_offset = mode == OperatingMode::PassthroughOffset;
+
             if parser.is_none() {
                 parser = Some(UbxFrameParser::new());
                 detector = Some(SpoofDetector::new());
                 pos_buffer = Some(PositionBuffer::new());
-                info!("Initialized SpoofDetector and Parser for Passthrough mode");
+                info!("Initialized SpoofDetector and Parser for Passthrough mode (offset={})", apply_offset);
             }
 
             // Проверяем флаг сброса детектора (при переключении режимов)
@@ -1021,7 +1055,8 @@ async fn gnss_processing_task() {
                     }
 
                     // Modify ALL NAV messages if spoofing detected
-                    if class == 0x01 && SPOOF_DETECTED.load(Ordering::Acquire) {
+                    let is_spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
+                    if class == 0x01 && is_spoofed {
                         match id {
                             0x07 => modify_nav_pvt(&mut frame),
                             0x06 => modify_nav_sol(&mut frame),
@@ -1033,15 +1068,33 @@ async fn gnss_processing_task() {
                         recalc_checksum(&mut frame);
                     }
 
-                    // Filter SEC-SIGN in Passthrough based on spoof state:
-                    // - Without spoofing: pass through original SEC-SIGN from real GNSS
-                    // - With spoofing: filter out (NAV modified, we generate our own)
+                    // Apply coordinate offset in PassthroughOffset mode (AFTER spoof detection)
+                    // Note: spoof detection uses original coordinates, offset is applied to output only
+                    if apply_offset && class == 0x01 && !is_spoofed {
+                        match id {
+                            0x07 => { apply_offset_nav_pvt(&mut frame); recalc_checksum(&mut frame); }
+                            0x02 => { apply_offset_nav_posllh(&mut frame); recalc_checksum(&mut frame); }
+                            0x01 => { apply_offset_nav_posecef(&mut frame); recalc_checksum(&mut frame); }
+                            0x13 => { apply_offset_nav_hpposecef(&mut frame); recalc_checksum(&mut frame); }
+                            0x06 => { apply_offset_nav_sol(&mut frame); recalc_checksum(&mut frame); }
+                            _ => {}
+                        }
+                    }
+
+                    // Filter SEC-SIGN in Passthrough/PassthroughOffset:
+                    // - PassthroughOffset: ALWAYS filter (coordinates modified, original SEC-SIGN invalid)
+                    // - Passthrough + spoofing: filter (NAV modified, we generate our own)
+                    // - Passthrough without spoofing: pass through original SEC-SIGN from real GNSS
                     if class == 0x27 && id == 0x04 {
+                        if apply_offset {
+                            // PassthroughOffset - always filter, we generate our own SEC-SIGN
+                            continue;
+                        }
                         if SPOOF_DETECTED.load(Ordering::Acquire) {
                             // Spoofing active - filter original SEC-SIGN, our timer generates replacement
                             continue;
                         }
-                        // No spoofing - let original SEC-SIGN pass through
+                        // No spoofing in normal Passthrough - let original SEC-SIGN pass through
                     }
 
                     // Send frame to TX channel
@@ -1766,7 +1819,7 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
             Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
             
             if flex.is_high() {
-                click_count = click_count.saturating_add(1).min(3);
+                click_count = click_count.saturating_add(1).min(4);
                 info!("button_task: click #{}", click_count);
 
                 // Ждём отпускания кнопки с E9 workaround и защитой от зависания
@@ -1809,11 +1862,13 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
 }
 
 /// Применяет режим по количеству нажатий кнопки
+/// 1 клик → Emulation, 2 → Passthrough, 3 → PassthroughRaw, 4 → PassthroughOffset
 async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex) {
     let new_mode = match click_count {
         1 => OperatingMode::Emulation,
         2 => OperatingMode::Passthrough,
         3 => OperatingMode::PassthroughRaw,
+        4 => OperatingMode::PassthroughOffset,
         _ => return, // 0 нажатий - нечего делать
     };
 
@@ -1841,14 +1896,14 @@ async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex)
         info!("Cleared spoof detection state (entering raw passthrough)");
     }
 
-    // Сброс спуф-детектора при переключении в Passthrough
+    // Сброс спуф-детектора при переключении в Passthrough или PassthroughOffset
     // Это предотвращает ложную детекцию "телепорта" при переходе из Emulation
     // (координаты эмуляции отличаются от реальных GNSS координат)
-    if new_mode == OperatingMode::Passthrough {
+    if new_mode == OperatingMode::Passthrough || new_mode == OperatingMode::PassthroughOffset {
         SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
         SPOOF_DETECTED.store(false, Ordering::Release);
         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
-        info!("SPOOF_DETECTOR_RESET set (entering passthrough, prevents false teleport)");
+        info!("SPOOF_DETECTOR_RESET set (entering passthrough mode, prevents false teleport)");
     }
 
     // Сохраняем во flash

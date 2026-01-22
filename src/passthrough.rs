@@ -351,6 +351,139 @@ pub fn modify_nav_svinfo(frame: &mut [u8]) {
     }
 }
 
+// ============================================================================
+// Coordinate Offset Functions for PassthroughOffset mode
+// Transforms: Saint Petersburg (59.9343°N, 30.3351°E) → Rachel, Nevada (37.6469°N, 115.7444°W)
+// ============================================================================
+
+use crate::config::coordinate_offset::{LAT_OFFSET_1E7, LON_OFFSET_1E7, ALT_OFFSET_MM};
+
+/// Pre-computed ECEF offset in centimeters
+/// Saint Petersburg ECEF: X=2825884m, Y=1671063m, Z=5479661m
+/// Rachel, Nevada ECEF:   X=-2072755m, Y=-4627963m, Z=3885879m
+const ECEF_OFFSET_X_CM: i32 = -489_863_900;  // (-2072755 - 2825884) * 100
+const ECEF_OFFSET_Y_CM: i32 = -629_902_600;  // (-4627963 - 1671063) * 100
+const ECEF_OFFSET_Z_CM: i32 = -159_378_200;  // (3885879 - 5479661) * 100
+
+/// Apply coordinate offset to NAV-PVT (0x01 0x07)
+/// Payload: 92 bytes
+/// Offsets: lon=24-27 (i32), lat=28-31 (i32), height=32-35 (i32), hMSL=36-39 (i32)
+pub fn apply_offset_nav_pvt(frame: &mut [u8]) {
+    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(92) + ck(2) = 100 bytes
+    if frame.len() < 100 {
+        return;
+    }
+
+    // Read current values
+    let lon = i32::from_le_bytes([frame[6 + 24], frame[6 + 25], frame[6 + 26], frame[6 + 27]]);
+    let lat = i32::from_le_bytes([frame[6 + 28], frame[6 + 29], frame[6 + 30], frame[6 + 31]]);
+    let height = i32::from_le_bytes([frame[6 + 32], frame[6 + 33], frame[6 + 34], frame[6 + 35]]);
+    let h_msl = i32::from_le_bytes([frame[6 + 36], frame[6 + 37], frame[6 + 38], frame[6 + 39]]);
+
+    // Apply offsets (saturating to prevent overflow)
+    let new_lon = lon.saturating_add(LON_OFFSET_1E7);
+    let new_lat = lat.saturating_add(LAT_OFFSET_1E7);
+    let new_height = height.saturating_add(ALT_OFFSET_MM);
+    let new_h_msl = h_msl.saturating_add(ALT_OFFSET_MM);
+
+    // Write back
+    frame[6 + 24..6 + 28].copy_from_slice(&new_lon.to_le_bytes());
+    frame[6 + 28..6 + 32].copy_from_slice(&new_lat.to_le_bytes());
+    frame[6 + 32..6 + 36].copy_from_slice(&new_height.to_le_bytes());
+    frame[6 + 36..6 + 40].copy_from_slice(&new_h_msl.to_le_bytes());
+}
+
+/// Apply coordinate offset to NAV-POSLLH (0x01 0x02)
+/// Payload: 28 bytes
+/// Offsets: lon=4-7 (i32), lat=8-11 (i32), height=12-15 (i32), hMSL=16-19 (i32)
+pub fn apply_offset_nav_posllh(frame: &mut [u8]) {
+    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(28) + ck(2) = 36 bytes
+    if frame.len() < 36 {
+        return;
+    }
+
+    let lon = i32::from_le_bytes([frame[6 + 4], frame[6 + 5], frame[6 + 6], frame[6 + 7]]);
+    let lat = i32::from_le_bytes([frame[6 + 8], frame[6 + 9], frame[6 + 10], frame[6 + 11]]);
+    let height = i32::from_le_bytes([frame[6 + 12], frame[6 + 13], frame[6 + 14], frame[6 + 15]]);
+    let h_msl = i32::from_le_bytes([frame[6 + 16], frame[6 + 17], frame[6 + 18], frame[6 + 19]]);
+
+    let new_lon = lon.saturating_add(LON_OFFSET_1E7);
+    let new_lat = lat.saturating_add(LAT_OFFSET_1E7);
+    let new_height = height.saturating_add(ALT_OFFSET_MM);
+    let new_h_msl = h_msl.saturating_add(ALT_OFFSET_MM);
+
+    frame[6 + 4..6 + 8].copy_from_slice(&new_lon.to_le_bytes());
+    frame[6 + 8..6 + 12].copy_from_slice(&new_lat.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&new_height.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&new_h_msl.to_le_bytes());
+}
+
+/// Apply coordinate offset to NAV-POSECEF (0x01 0x01)
+/// Payload: 20 bytes
+/// Offsets: ecefX=4-7 (i32 cm), ecefY=8-11 (i32 cm), ecefZ=12-15 (i32 cm)
+pub fn apply_offset_nav_posecef(frame: &mut [u8]) {
+    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(20) + ck(2) = 28 bytes
+    if frame.len() < 28 {
+        return;
+    }
+
+    let ecef_x = i32::from_le_bytes([frame[6 + 4], frame[6 + 5], frame[6 + 6], frame[6 + 7]]);
+    let ecef_y = i32::from_le_bytes([frame[6 + 8], frame[6 + 9], frame[6 + 10], frame[6 + 11]]);
+    let ecef_z = i32::from_le_bytes([frame[6 + 12], frame[6 + 13], frame[6 + 14], frame[6 + 15]]);
+
+    let new_x = ecef_x.saturating_add(ECEF_OFFSET_X_CM);
+    let new_y = ecef_y.saturating_add(ECEF_OFFSET_Y_CM);
+    let new_z = ecef_z.saturating_add(ECEF_OFFSET_Z_CM);
+
+    frame[6 + 4..6 + 8].copy_from_slice(&new_x.to_le_bytes());
+    frame[6 + 8..6 + 12].copy_from_slice(&new_y.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&new_z.to_le_bytes());
+}
+
+/// Apply coordinate offset to NAV-HPPOSECEF (0x01 0x13)
+/// Payload: 28 bytes
+/// Offsets: ecefX=8-11 (i32 cm), ecefY=12-15 (i32 cm), ecefZ=16-19 (i32 cm)
+pub fn apply_offset_nav_hpposecef(frame: &mut [u8]) {
+    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(28) + ck(2) = 36 bytes
+    if frame.len() < 36 {
+        return;
+    }
+
+    let ecef_x = i32::from_le_bytes([frame[6 + 8], frame[6 + 9], frame[6 + 10], frame[6 + 11]]);
+    let ecef_y = i32::from_le_bytes([frame[6 + 12], frame[6 + 13], frame[6 + 14], frame[6 + 15]]);
+    let ecef_z = i32::from_le_bytes([frame[6 + 16], frame[6 + 17], frame[6 + 18], frame[6 + 19]]);
+
+    let new_x = ecef_x.saturating_add(ECEF_OFFSET_X_CM);
+    let new_y = ecef_y.saturating_add(ECEF_OFFSET_Y_CM);
+    let new_z = ecef_z.saturating_add(ECEF_OFFSET_Z_CM);
+
+    frame[6 + 8..6 + 12].copy_from_slice(&new_x.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&new_y.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&new_z.to_le_bytes());
+}
+
+/// Apply coordinate offset to NAV-SOL (0x01 0x06)
+/// Payload: 52 bytes
+/// Offsets: ecefX=12-15 (i32 cm), ecefY=16-19 (i32 cm), ecefZ=20-23 (i32 cm)
+pub fn apply_offset_nav_sol(frame: &mut [u8]) {
+    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(52) + ck(2) = 60 bytes
+    if frame.len() < 60 {
+        return;
+    }
+
+    let ecef_x = i32::from_le_bytes([frame[6 + 12], frame[6 + 13], frame[6 + 14], frame[6 + 15]]);
+    let ecef_y = i32::from_le_bytes([frame[6 + 16], frame[6 + 17], frame[6 + 18], frame[6 + 19]]);
+    let ecef_z = i32::from_le_bytes([frame[6 + 20], frame[6 + 21], frame[6 + 22], frame[6 + 23]]);
+
+    let new_x = ecef_x.saturating_add(ECEF_OFFSET_X_CM);
+    let new_y = ecef_y.saturating_add(ECEF_OFFSET_Y_CM);
+    let new_z = ecef_z.saturating_add(ECEF_OFFSET_Z_CM);
+
+    frame[6 + 12..6 + 16].copy_from_slice(&new_x.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&new_y.to_le_bytes());
+    frame[6 + 20..6 + 24].copy_from_slice(&new_z.to_le_bytes());
+}
+
 /// Extract position data from NAV-PVT payload
 /// Returns (lat, lon, alt, h_acc, speed, num_sv)
 pub fn extract_position_from_pvt(payload: &[u8]) -> Option<(i32, i32, i32, u32, i32, u8)> {

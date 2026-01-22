@@ -121,13 +121,39 @@ Uses WGS84 ellipsoid parameters for LLH→ECEF conversion.
 - **Emulation** (0): Generates fake GNSS data with SEC-SIGN authentication (LED green→yellow)
 - **Passthrough** (1): Forwards data from real GNSS module with spoof detection (LED blue, blinking red on spoof)
 - **PassthroughRaw** (2): Raw passthrough without spoof detection - pure transparent forwarding (LED purple)
+- **PassthroughOffset** (3): Passthrough with coordinate offset + spoof detection (LED white, blinking red on spoof)
 
 Mode is persisted to flash and survives reboots. Button selects mode by click count:
 - **1 click** → Emulation (green LED)
 - **2 clicks** → Passthrough (blue LED)
 - **3 clicks** → PassthroughRaw (purple LED)
+- **4 clicks** → PassthroughOffset (white LED)
 
-Timeout between clicks: 500ms. Hot-switch without reboot.
+Timeout between clicks: 800ms. Hot-switch without reboot.
+
+### PassthroughOffset Mode
+
+PassthroughOffset works like Passthrough (spoof detection enabled), but applies a fixed coordinate offset to all NAV messages. The offset transforms coordinates from one region to another.
+
+**Current offset**: Saint Petersburg (59.9343°N, 30.3351°E) → Rachel, Nevada (37.6469°N, 115.7444°W)
+
+**Offset values** (in `config.rs`):
+- LAT_OFFSET_1E7 = -222,874,000 (1e-7 degrees)
+- LON_OFFSET_1E7 = -1,460,795,000 (1e-7 degrees)
+- ECEF offset: pre-computed approximate values
+
+**Modified NAV messages**:
+| Message | Offsets applied |
+|---------|----------------|
+| NAV-PVT (0x07) | lon, lat, height, hMSL |
+| NAV-POSLLH (0x02) | lon, lat, height, hMSL |
+| NAV-POSECEF (0x01) | ecefX, ecefY, ecefZ |
+| NAV-HPPOSECEF (0x13) | ecefX, ecefY, ecefZ |
+| NAV-SOL (0x06) | ecefX, ecefY, ecefZ |
+
+**Important**: Spoof detection analyzes original (unmodified) coordinates. Offset is applied only to output.
+
+**SEC-SIGN handling**: Since coordinates are modified, the original SEC-SIGN from external GNSS is invalid. In PassthroughOffset mode, we **always** generate our own SEC-SIGN (hash accumulation enabled, original SEC-SIGN filtered). This differs from normal Passthrough where original SEC-SIGN passes through when no spoofing is detected.
 
 ### Spoof Detection in Passthrough Mode
 

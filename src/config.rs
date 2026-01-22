@@ -77,6 +77,17 @@ pub mod default_position {
     pub const ALTITUDE_M: i32 = 101;
 }
 
+/// Coordinate offset for PassthroughOffset mode
+/// Transforms: Saint Petersburg (59.9343°N, 30.3351°E) → Rachel, Nevada (37.6469°N, 115.7444°W)
+pub mod coordinate_offset {
+    /// Latitude offset in 1e-7 degrees: (37.6469 - 59.9343) × 1e7
+    pub const LAT_OFFSET_1E7: i32 = -222_874_000;
+    /// Longitude offset in 1e-7 degrees: (-115.7444 - 30.3351) × 1e7
+    pub const LON_OFFSET_1E7: i32 = -1_460_795_000;
+    /// Altitude offset in mm (no change)
+    pub const ALT_OFFSET_MM: i32 = 0;
+}
+
 /// UBX protocol version emulation
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum UbloxVersion {
