@@ -32,8 +32,34 @@
 6. ❌ Acceleration anomaly (DISABLED - kept in code)
 7. ❌ CNO uniformity (DISABLED - kept in code)
 
+## 🐛 Known Bug: SEC-UNIQID Race Condition (Jan 2026)
+
+**Problem**: When Mavic 4 Pro connects, auto-detection triggers at CFG-VALSET, but SEC-UNIQID is sent BEFORE that (in response to SEC-UNIQID poll). Result: Mavic 4 receives Air 3's chip ID.
+
+**Symptom**: Auto-detection shows "Mavic 4 Pro", SEC-SIGN uses correct key, but signatures rejected by drone.
+
+**Timeline**:
+1. Mavic sends SEC-UNIQID poll → We respond with **Air 3 chip ID** (wrong!)
+2. Mavic sends CFG-VALGET → SAW_CFG_VALGET = true
+3. Mavic sends CFG-VALSET → **Detection triggers** → DRONE_MODEL = Mavic4Pro (too late)
+4. SEC-SIGN computed with Mavic 4 key → Signature OK, but drone already has wrong ID
+
+**Workaround**: Set `DRONE_MODEL` default to Mavic 4 Pro in `main.rs:172`
+
+**Fix (TODO)**: Detect Mavic 4 Pro immediately on SEC-UNIQID poll (Air 3 never sends this):
+```rust
+ubx::UbxCommand::SecUniqidPoll => {
+    if !DRONE_DETECTED.load(Ordering::Acquire) {
+        DRONE_MODEL.store(1, Ordering::Release);  // Mavic 4 Pro
+        DRONE_DETECTED.store(true, Ordering::Release);
+    }
+    // ... send correct SEC-UNIQID
+}
+```
+
 ## Future Improvements
 - [ ] Test NMEA passthrough with real u-blox module
 - [x] Test time-based detection with simulated spoofing (tested Jan 2026)
 - [ ] Add signal-level anti-jam detection (AGC analysis)
 - [ ] Implement carrier-phase divergence detection
+- [ ] **Fix SEC-UNIQID auto-detection race condition**

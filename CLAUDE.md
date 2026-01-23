@@ -208,6 +208,8 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 
 **Bug fix (Jan 2026 #2)**: Fixed false teleport detection when switching from Emulation to Passthrough mode. Added `SPOOF_DETECTOR_RESET` atomic flag that triggers detector reset via `apply_mode_by_clicks()`. This prevents the detector from seeing emulation coordinates as the previous position when real GNSS data starts arriving.
 
+**Known bug (Jan 2026)**: SEC-UNIQID race condition in drone auto-detection. When Mavic 4 Pro connects, it sends SEC-UNIQID poll BEFORE CFG-VALSET, but auto-detection triggers on CFG-VALSET. Result: Mavic 4 receives Air 3's chip ID (`0xE0 0x95 0x65 0x0F 0x2A` instead of `0xEB 0xB9 0x91 0x0F 0x2B`), causing signature rejection. **Workaround**: Set default `DRONE_MODEL` to Mavic4Pro in `main.rs:172`.
+
 **Global state** (atomics in `main.rs`):
 - `SPOOF_DETECTED: AtomicBool` - spoofing active flag
 - `SPOOF_RECOVERY_START_MS: AtomicU32` - recovery timer start
