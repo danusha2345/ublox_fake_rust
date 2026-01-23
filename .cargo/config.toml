@@ -2,7 +2,12 @@
 runner = "probe-rs run --chip RP2040"
 
 [target.thumbv8m.main-none-eabihf]
+# Default runner for RP2350/RP2354 family
+# Override with CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER env var
 runner = "probe-rs run --chip RP2350"
+
+# For RP2354 with internal flash, use:
+# CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo run --release
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 rustflags = [
@@ -19,3 +24,8 @@ DEFMT_LOG = "debug"
 [alias]
 rb = "run --bin ublox_fake --release"
 rp2350 = "build --release --features rp2350 --target thumbv8m.main-none-eabihf"
+rp2354 = "build --release --features rp2350 --target thumbv8m.main-none-eabihf"
+
+# Flash aliases (use make flash-rp2354 for RP2354)
+# cargo rb        - run on default (RP2350)
+# make flash-rp2354 - flash RP2354 via probe-rs

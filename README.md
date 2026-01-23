@@ -27,7 +27,9 @@
 
 ## Аппаратные требования
 
-- **MCU**: RP2350A (Spotpear RP2350-Core-A)
+- **MCU**: RP2350A / RP2354A (Spotpear RP2350-Core-A или аналогичные)
+  - RP2350A: внешняя QSPI flash
+  - RP2354A: 2 МБ встроенной flash (рекомендуется)
 - **Flash**: 2 МБ
 - **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
 - **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
@@ -57,8 +59,11 @@ cargo install elf2uf2-rs
 **ВАЖНО:** Всегда используйте Makefile для сборки UF2!
 
 ```bash
-# Сборка UF2 для RP2350
+# Сборка UF2 для RP2350 (внешняя QSPI flash)
 make rp2350
+
+# Сборка UF2 для RP2354 (встроенная 2MB flash)
+make rp2354
 
 # Очистка
 make clean
@@ -81,12 +86,15 @@ Makefile автоматически:
 ```bash
 # Способ 1: UF2 через BOOTSEL (без отладчика)
 # 1. Зажать кнопку BOOT и подключить USB
-# 2. Скопировать ublox_fake_rp2350.uf2 на появившийся диск RPI-RP2
+# 2. Скопировать ublox_fake_rp2350.uf2 (или rp2354) на появившийся диск RPI-RP2
 
 # Способ 2: Через probe-rs (требуется отладочный адаптер)
-make flash
-# или
-cargo run --release
+make flash          # RP2350 (по умолчанию)
+make flash-rp2354   # RP2354 (встроенная flash)
+
+# или напрямую
+cargo run --release                                                              # RP2350
+CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo run --release  # RP2354
 ```
 
 ## Архитектура

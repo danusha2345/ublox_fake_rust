@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-u-blox GNSS M10 emulator written in Rust for RP2350 microcontrollers. Uses Embassy async framework instead of FreeRTOS.
+u-blox GNSS M10 emulator written in Rust for RP2350/RP2354 microcontrollers. Uses Embassy async framework instead of FreeRTOS.
 
 **Note**: RP2040 no longer supported — requires ~221 KB RAM for buffers, exceeding available 264 KB.
 
@@ -40,22 +40,30 @@ rustup target add thumbv8m.main-none-eabihf  # RP2350
 **CRITICAL: Always use Makefile to build UF2 files!**
 
 ```bash
-# Build UF2 for RP2350 (ALWAYS use this!)
+# Build UF2 for RP2350 (external QSPI flash)
 make rp2350
 
-# Flash and run (requires probe-rs)
-cargo run --release
-make flash
+# Build UF2 for RP2354 (2MB internal flash)
+make rp2354
+
+# Flash via probe-rs
+make flash          # RP2350 (default)
+make flash-rp2354   # RP2354
+
+# Or directly
+cargo run --release                                                              # RP2350
+CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo run --release  # RP2354
 ```
 
 **WARNING:** Do NOT use manual uf2conv.py or objcopy commands!
-The Makefile uses `elf2uf2-rs` (takes addresses from ELF sections) + patches Family ID for RP2350.
+The Makefile uses `elf2uf2-rs` (takes addresses from ELF sections) + patches Family ID for RP2350/RP2354.
 Manual conversion with objcopy loses address info and creates broken firmware.
 
 ```bash
 # Aliases defined in .cargo/config.toml:
 cargo rb        # run release binary
 cargo rp2350    # build for RP2350 (ELF only, no UF2)
+cargo rp2354    # build for RP2354 (ELF only, no UF2)
 ```
 
 ## Architecture

@@ -1,6 +1,6 @@
 # Makefile for ublox_fake firmware
 
-.PHONY: all clean rp2040 rp2350 rp2354 flash
+.PHONY: all clean rp2040 rp2350 rp2354 flash flash-rp2354
 
 # Default target
 all: rp2350
@@ -42,9 +42,13 @@ rp2354:
 	$(call PATCH_UF2_FAMILY,/tmp/temp.uf2,ublox_fake_rp2354.uf2)
 	@echo "Built: ublox_fake_rp2354.uf2 (RP2354A with 2MB internal flash)"
 
-# Flash via probe-rs
+# Flash via probe-rs (default RP2350)
 flash:
 	cargo run --release
+
+# Flash RP2354 via probe-rs (2MB internal flash variant)
+flash-rp2354:
+	CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo run --release
 
 clean:
 	cargo clean
