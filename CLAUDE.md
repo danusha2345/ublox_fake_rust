@@ -88,7 +88,8 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 ### Core1 Tasks
 | Task | Rate | Purpose |
 |------|------|---------|
-| `led_task` | 500ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, red=spoof) |
+| `led_task` (RP2350) | 100ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, red=spoof) |
+| `simple_led_task` (RP2354) | 50ms | Simple GPIO LED blink code (1-4 blinks = mode number, fast blink = spoof) |
 | `sec_sign_compute_task` | async | ECDSA signature computation (CPU intensive) |
 | `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS |
 
@@ -380,8 +381,19 @@ rp_pac::UART1.uartifls().write(|w| {
 ### RP2354A (`--features rp2354`)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud)
 - UART1: RX=GPIO5 (passthrough)
-- WS2812B LED: отключен (нет подключения)
+- Simple GPIO LED: GPIO11 (анод), GPIO12 (катод/земля) — blink code индикация
 - Mode button: GPIO14 (input), GPIO13 (power)
+
+### Simple LED Blink Code (RP2354)
+Количество вспышек = номер режима (цикл ~1.5 сек):
+| Режим | Вспышек | Паттерн |
+|-------|---------|---------|
+| Emulation (1) | 1 | 50ms ON, 1400ms OFF |
+| Passthrough (2) | 2 | 50ms ON, 150ms OFF, 50ms ON, 1200ms OFF |
+| PassthroughRaw (3) | 3 | 3× (50ms ON, 150ms OFF), затем пауза |
+| PassthroughOffset (4) | 4 | 4× (50ms ON, 150ms OFF), затем пауза |
+
+При спуфинге (Passthrough/PassthroughOffset): быстрое мигание 50ms ON / 50ms OFF.
 
 ## Key Dependencies
 - `embassy-rp 0.9` - RP2350 HAL

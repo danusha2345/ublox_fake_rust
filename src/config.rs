@@ -51,9 +51,14 @@ pub mod pins {
     pub const MODE_BTN_PWR: u8 = 13;
     pub const MODE_BTN_INPUT: u8 = 14;
 
-    // WS2812B LED - временно отключен для RP2354
+    // WS2812B LED - отключен для RP2354
     pub const WS2812_LED: u8 = 16;  // не используется
     pub const HAS_WS2812_LED: bool = false;
+
+    // Simple GPIO LED для RP2354
+    // Схема: GPIO11 (анод +) --- LED --- GPIO12 (катод -, земля)
+    pub const SIMPLE_LED_ANODE: u8 = 11;   // управляющий пин (HIGH = включен)
+    pub const SIMPLE_LED_CATHODE: u8 = 12; // земля (постоянно LOW)
 
     // Legacy alias
     pub const UART_TX: u8 = UART0_TX;

@@ -300,9 +300,9 @@ async fn main(spawner: Spawner) {
             mode.store();
             info!("Loaded mode {} from flash: {:?}", mode_byte, mode);
         } else {
-            // No saved mode, default to Emulation
-            info!("No saved mode, defaulting to Emulation");
-            OperatingMode::Emulation.store();
+            // No saved mode, default to Passthrough
+            info!("No saved mode, defaulting to Passthrough");
+            OperatingMode::Passthrough.store();
         }
     };
 
@@ -326,6 +326,12 @@ async fn main(spawner: Spawner) {
     let _btn_pwr = Output::new(p.PIN_13, Level::High);
     #[cfg(feature = "rp2354")]
     let btn_flex = Flex::new(p.PIN_14);
+
+    // Simple GPIO LED for RP2354: GPIO11 (anode), GPIO12 (cathode/ground)
+    #[cfg(feature = "rp2354")]
+    let led_anode = Output::new(p.PIN_11, Level::Low); // LED выключен при старте
+    #[cfg(feature = "rp2354")]
+    let _led_cathode = Output::new(p.PIN_12, Level::Low); // Постоянно LOW (земля)
 
     // Spawn Core1 for LED (if available), SEC-SIGN computation, and MON messages
     // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
@@ -352,7 +358,7 @@ async fn main(spawner: Spawner) {
         move || {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
-                // No LED on RP2354
+                spawner.must_spawn(simple_led_task(led_anode));
                 spawner.must_spawn(sec_sign_compute_task());
                 spawner.must_spawn(mon_message_task());
             });
@@ -541,6 +547,66 @@ async fn led_task(
 
         let _ = ws.write(&[color]).await;
         ticker.next().await;
+    }
+}
+
+/// Simple GPIO LED task for RP2354 (runs on Core1)
+/// GPIO11 = anode (+), GPIO12 = cathode (ground, always LOW)
+/// Blink code pattern: количество вспышек = номер режима
+/// - Режим 1 (Emulation):        1 вспышка  (50ms ON, длинная пауза)
+/// - Режим 2 (Passthrough):      2 вспышки  (50ms ON, 150ms OFF, 50ms ON, длинная пауза)
+/// - Режим 3 (PassthroughRaw):   3 вспышки
+/// - Режим 4 (PassthroughOffset): 4 вспышки
+/// При спуфинге: быстрое непрерывное мигание (50ms ON, 50ms OFF)
+#[cfg(feature = "rp2354")]
+#[embassy_executor::task]
+async fn simple_led_task(mut led: Output<'static>) {
+    // Тик 50мс, цикл ~1.5 секунды = 30 тиков
+    let mut ticker = Ticker::every(Duration::from_millis(50));
+    let mut tick: u8 = 0;
+
+    loop {
+        ticker.next().await;
+        tick = if tick >= 29 { 0 } else { tick + 1 };
+
+        let mode = OperatingMode::load();
+        let spoof_detected = SPOOF_DETECTED.load(Ordering::Acquire);
+
+        // При спуфинге — быстрое мигание независимо от режима
+        if spoof_detected && matches!(mode, OperatingMode::Passthrough | OperatingMode::PassthroughOffset) {
+            // 50ms ON, 50ms OFF (каждый тик переключаем)
+            if tick.is_multiple_of(2) {
+                led.set_high();
+            } else {
+                led.set_low();
+            }
+            continue;
+        }
+
+        // Количество вспышек = номер режима (1-4)
+        let blink_count: u8 = match mode {
+            OperatingMode::Emulation => 1,
+            OperatingMode::Passthrough => 2,
+            OperatingMode::PassthroughRaw => 3,
+            OperatingMode::PassthroughOffset => 4,
+        };
+
+        // Паттерн: 50ms ON, 150ms OFF между вспышками
+        // Каждая вспышка = 1 тик ON (50ms) + 3 тика OFF (150ms) = 4 тика (200ms)
+        // Всего на N вспышек нужно N*4 тиков, остаток цикла — длинная пауза
+        let blink_phase_end = blink_count * 4;
+        let on = if tick < blink_phase_end {
+            // Внутри фазы вспышек: ON только на первом тике каждого 4-тикового цикла
+            tick.is_multiple_of(4)
+        } else {
+            false
+        };
+
+        if on {
+            led.set_high();
+        } else {
+            led.set_low();
+        }
     }
 }
 
@@ -1874,7 +1940,7 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
                     }
 
                     // E9 discharge kick каждые ~250мс (5 * 50мс)
-                    if high_count % 5 == 0 {
+                    if high_count.is_multiple_of(5) {
                         info!("button_task: still HIGH (2.4V latch?), attempting E9 discharge kick...");
                         flex.set_as_output();
                         flex.set_low();
