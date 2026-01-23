@@ -59,6 +59,7 @@ rp-pac = { version = "7", features = ["rp235x"] }
 default = ["rp2350"]
 rp2040 = ["embassy-rp/rp2040"]
 rp2350 = ["embassy-rp/rp235xa", "embassy-rp/imagedef-secure-exe"]
+rp2354 = ["rp2350"]  # RP2354 uses same HAL as RP2350, different pin config
 
 [profile.dev]
 debug = 2

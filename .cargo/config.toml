@@ -24,7 +24,7 @@ DEFMT_LOG = "debug"
 [alias]
 rb = "run --bin ublox_fake --release"
 rp2350 = "build --release --features rp2350 --target thumbv8m.main-none-eabihf"
-rp2354 = "build --release --features rp2350 --target thumbv8m.main-none-eabihf"
+rp2354 = "build --release --no-default-features --features rp2354 --target thumbv8m.main-none-eabihf"
 
 # Flash aliases (use make flash-rp2354 for RP2354)
 # cargo rb        - run on default (RP2350)

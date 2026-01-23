@@ -369,11 +369,19 @@ rp_pac::UART1.uartifls().write(|w| {
 - PIO UART: embassy-rp 0.9 has `PioUartRxProgram`, 32-byte FIFO possible
 - DMA Ring Buffer + Watchdog Timer: 100% guaranteed but complex (see plan file)
 
-## Hardware Pins (RP2350A - Spotpear RP2350-Core-A)
+## Hardware Pins
+
+### RP2350A (default)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
 - UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
-- WS2812B LED: GPIO25 (PIO0)
-- Mode button: GPIO7 (input), GPIO6 (power)
+- WS2812B LED: GPIO16 (PIO0)
+- Mode button: GPIO11 (input), GPIO10 (power)
+
+### RP2354A (`--features rp2354`)
+- UART0: TX=GPIO0, RX=GPIO1 (921600 baud)
+- UART1: RX=GPIO5 (passthrough)
+- WS2812B LED: отключен (нет подключения)
+- Mode button: GPIO14 (input), GPIO13 (power)
 
 ## Key Dependencies
 - `embassy-rp 0.9` - RP2350 HAL

@@ -27,6 +27,7 @@ use embassy_rp::flash::{Async, Flash};
 use embassy_rp::gpio::{Flex, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
+#[cfg(not(feature = "rp2354"))]
 use embassy_rp::pio::Pio;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -258,7 +259,8 @@ async fn main(spawner: Spawner) {
     // Initialize coordinate conversion (LLH -> ECEF) from config
     coordinates::init();
 
-    // ===== MINIMAL WS2812 TEST - blink 3 times at startup =====
+    // ===== MINIMAL WS2812 TEST - blink 3 times at startup (only for boards with LED) =====
+    #[cfg(not(feature = "rp2354"))]
     {
         use embassy_rp::pio::Pio;
         use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
@@ -277,7 +279,8 @@ async fn main(spawner: Spawner) {
     }
     // ===== END TEST =====
 
-    // Re-init peripherals (PIO0 was consumed by test)
+    // Re-init peripherals (PIO0 was consumed by test) - only needed when LED test runs
+    #[cfg(not(feature = "rp2354"))]
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
@@ -303,18 +306,32 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    // Initialize PIO0 for WS2812 LED (GPIO16 on RP2350-Tiny)
+    // Initialize PIO0 for WS2812 LED (only for boards with LED)
+    #[cfg(not(feature = "rp2354"))]
     let pio0 = Pio::new(p.PIO0, Irqs);
+    #[cfg(not(feature = "rp2354"))]
     let dma_ch1 = p.DMA_CH1;
-    let led_pin = p.PIN_16;  // WS2812B on GPIO16 (RP2350-Tiny)
+    #[cfg(not(feature = "rp2354"))]
+    let led_pin = p.PIN_16;  // WS2812B on GPIO16
 
-    // Mode button using Flex for E9 workaround (GPIO10=PWR, GPIO11=IN)
+    // Mode button using Flex for E9 workaround
+    // RP2350: GPIO10=PWR, GPIO11=INPUT
+    // RP2354: GPIO13=PWR, GPIO14=INPUT
+    #[cfg(not(feature = "rp2354"))]
     let _btn_pwr = Output::new(p.PIN_10, Level::High);
+    #[cfg(not(feature = "rp2354"))]
     let btn_flex = Flex::new(p.PIN_11);
 
-    // Spawn Core1 for LED, SEC-SIGN computation, and MON messages
+    #[cfg(feature = "rp2354")]
+    let _btn_pwr = Output::new(p.PIN_13, Level::High);
+    #[cfg(feature = "rp2354")]
+    let btn_flex = Flex::new(p.PIN_14);
+
+    // Spawn Core1 for LED (if available), SEC-SIGN computation, and MON messages
     // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
+
+    #[cfg(not(feature = "rp2354"))]
     spawn_core1(
         p.CORE1,
         unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
@@ -322,6 +339,20 @@ async fn main(spawner: Spawner) {
             let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
             executor1.run(|spawner: embassy_executor::Spawner| {
                 spawner.must_spawn(led_task(pio0, dma_ch1, led_pin));
+                spawner.must_spawn(sec_sign_compute_task());
+                spawner.must_spawn(mon_message_task());
+            });
+        },
+    );
+
+    #[cfg(feature = "rp2354")]
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) },
+        move || {
+            let executor1 = EXECUTOR1.init(embassy_executor::Executor::new());
+            executor1.run(|spawner: embassy_executor::Spawner| {
+                // No LED on RP2354
                 spawner.must_spawn(sec_sign_compute_task());
                 spawner.must_spawn(mon_message_task());
             });
@@ -426,6 +457,8 @@ async fn main(spawner: Spawner) {
 /// GPIO16 on RP2350-Tiny
 /// Green = Emulation mode, Blue = Passthrough mode
 /// Blinking Red = Spoofing detected (in passthrough mode)
+/// Note: Not available on RP2354 (no LED connected)
+#[cfg(not(feature = "rp2354"))]
 #[embassy_executor::task]
 async fn led_task(
     mut pio: Pio<'static, PIO0>,

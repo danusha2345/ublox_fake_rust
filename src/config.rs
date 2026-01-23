@@ -9,8 +9,11 @@ pub const DEFAULT_BAUDRATE: u32 = 921600;
 /// Изменить для плат с другим размером flash (например, 2MB = 2 * 1024 * 1024)
 pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB по умолчанию
 
-/// GPIO pin assignments for RP2350A (Spotpear RP2350-Core-A)
+/// GPIO pin assignments
+#[cfg(not(feature = "rp2354"))]
 pub mod pins {
+    // RP2350A (Spotpear RP2350-Core-A)
+
     // UART0: к дрону/хосту
     pub const UART0_TX: u8 = 0;
     pub const UART0_RX: u8 = 1;
@@ -19,12 +22,38 @@ pub mod pins {
     pub const UART1_TX: u8 = 4;   // не используется, но резервируем
     pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
 
-    // Mode button (перенесено с GPIO5/6)
-    pub const MODE_BTN_PWR: u8 = 6;
-    pub const MODE_BTN_INPUT: u8 = 7;
+    // Mode button (RP2350: GPIO10=PWR, GPIO11=INPUT)
+    pub const MODE_BTN_PWR: u8 = 10;
+    pub const MODE_BTN_INPUT: u8 = 11;
 
-    // WS2812B LED (RP2350-Core-A: GPIO25)
+    // WS2812B LED
     pub const WS2812_LED: u8 = 16;
+    pub const HAS_WS2812_LED: bool = true;
+
+    // Legacy alias
+    pub const UART_TX: u8 = UART0_TX;
+    pub const UART_RX: u8 = UART0_RX;
+}
+
+#[cfg(feature = "rp2354")]
+pub mod pins {
+    // RP2354A - отдельная конфигурация пинов
+
+    // UART0: к дрону/хосту
+    pub const UART0_TX: u8 = 0;
+    pub const UART0_RX: u8 = 1;
+
+    // UART1: от внешнего GNSS модуля (passthrough source)
+    pub const UART1_TX: u8 = 4;   // не используется, но резервируем
+    pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
+
+    // Mode button (RP2354: GPIO13/14)
+    pub const MODE_BTN_PWR: u8 = 13;
+    pub const MODE_BTN_INPUT: u8 = 14;
+
+    // WS2812B LED - временно отключен для RP2354
+    pub const WS2812_LED: u8 = 16;  // не используется
+    pub const HAS_WS2812_LED: bool = false;
 
     // Legacy alias
     pub const UART_TX: u8 = UART0_TX;
