@@ -32,7 +32,9 @@
   - RP2354A: 2 МБ встроенной flash (рекомендуется)
 - **Flash**: 2 МБ
 - **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
-- **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
+- **Passthrough вход**:
+  - **RP2350**: UART1 RX=GPIO5 (hardware UART)
+  - **RP2354**: PIO UART RX=GPIO4 (PIO эмуляция, т.к. GPIO5/9 не выведены)
 - **LED RP2350**: WS2812B на GPIO16 (цветовая индикация)
 - **LED RP2354**: Simple GPIO LED на GPIO11/GPIO12 (blink code индикация)
 - **Кнопка**: GPIO11 (вход), GPIO10 (питание) — для RP2350; GPIO14/GPIO13 — для RP2354
@@ -190,7 +192,9 @@ LED индикация в режиме Emulation:
 ### Passthrough (LED синий / моргающий красный)
 
 Ретрансляция данных от реального GNSS с защитой от спуфинга:
-- Вход: UART1 RX (GPIO5) от реального GNSS
+- Вход:
+  - **RP2350**: UART1 RX (GPIO5, hardware UART)
+  - **RP2354**: PIO UART RX (GPIO4, PIO эмуляция)
 - Выход: UART0 TX (GPIO0) к хосту
 - UBX команды от хоста обрабатываются (настройки сохраняются)
 - **100% надёжность передачи** (FIFO threshold optimization, tested 5 min @ 921600 baud)
@@ -235,7 +239,9 @@ LED индикация в режиме Emulation:
 ### PassthroughRaw (LED пурпурный)
 
 Полностью прозрачная ретрансляция данных без какой-либо обработки:
-- Вход: UART1 RX (GPIO5) от реального GNSS
+- Вход:
+  - **RP2350**: UART1 RX (GPIO5, hardware UART)
+  - **RP2354**: PIO UART RX (GPIO4, PIO эмуляция)
 - Выход: UART0 TX (GPIO0) к хосту
 - **Без парсинга UBX фреймов**
 - **Без детекции спуфинга**

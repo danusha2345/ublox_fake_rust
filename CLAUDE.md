@@ -80,7 +80,8 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 |------|------|---------|
 | `uart0_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates SHA256 for SEC-SIGN |
 | `uart0_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
-| `uart1_rx_task` | async | Receives data from external GNSS (passthrough input) |
+| `uart1_rx_task` (RP2350) | async | Receives data from external GNSS via hardware UART1 (GPIO5) |
+| `pio_uart_rx_task` (RP2354) | async | Receives data from external GNSS via PIO UART (GPIO4) |
 | `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (uses Timer::at for drift-free timing) |
 | `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1, waits via SEC_SIGN_DONE Signal |
 | `button_task` | async | Mode selection by click count (1/2/3 clicks → Emulation/Passthrough/Raw) |
@@ -374,15 +375,17 @@ rp_pac::UART1.uartifls().write(|w| {
 
 ### RP2350A (default)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
-- UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
+- UART1: RX=GPIO5 (от внешнего GNSS для passthrough, hardware UART)
 - WS2812B LED: GPIO16 (PIO0)
 - Mode button: GPIO11 (input), GPIO10 (power)
 
 ### RP2354A (`--features rp2354`)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud)
-- UART1: RX=GPIO5 (passthrough)
+- **PIO UART RX: GPIO4** (от внешнего GNSS для passthrough, PIO эмуляция)
 - Simple GPIO LED: GPIO11 (анод), GPIO12 (катод/земля) — blink code индикация
 - Mode button: GPIO14 (input), GPIO13 (power)
+
+**Примечание**: RP2354 использует PIO UART вместо hardware UART1, т.к. GPIO5 и GPIO9 (единственные пины с UART1 RX) не выведены на плате.
 
 ### Simple LED Blink Code (RP2354)
 Количество вспышек = номер режима (цикл ~1.5 сек):

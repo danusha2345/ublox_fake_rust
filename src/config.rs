@@ -38,16 +38,18 @@ pub mod pins {
 #[cfg(feature = "rp2354")]
 pub mod pins {
     // RP2354A - отдельная конфигурация пинов
+    // ВАЖНО: GPIO5,9 не выведены на плату — аппаратный UART1 RX невозможен!
+    // Выведенные пины: GPIO0, 1, 4, 10, 11, 12, 13, 14, 17, 18
 
     // UART0: к дрону/хосту
     pub const UART0_TX: u8 = 0;
     pub const UART0_RX: u8 = 1;
 
-    // UART1: от внешнего GNSS модуля (passthrough source)
-    pub const UART1_TX: u8 = 4;   // не используется, но резервируем
-    pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
+    // PIO UART RX для passthrough (вместо аппаратного UART1)
+    // Используем PIO для эмуляции UART на произвольном GPIO
+    pub const PIO_UART_RX: u8 = 4;  // вход от внешнего GNSS
 
-    // Mode button (RP2354: GPIO13/14)
+    // Mode button
     pub const MODE_BTN_PWR: u8 = 13;
     pub const MODE_BTN_INPUT: u8 = 14;
 

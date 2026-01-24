@@ -26,10 +26,14 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Async, Flash};
 use embassy_rp::gpio::{Flex, Level, Output, Pull};
 use embassy_rp::multicore::{spawn_core1, Stack};
-use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
 #[cfg(not(feature = "rp2354"))]
+use embassy_rp::peripherals::{FLASH, PIO0, UART0, UART1};
+#[cfg(feature = "rp2354")]
+use embassy_rp::peripherals::{FLASH, PIO0, UART0};
 use embassy_rp::pio::Pio;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+#[cfg(feature = "rp2354")]
+use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
@@ -57,9 +61,17 @@ use ubx::{
 };
 
 // Interrupt bindings
+#[cfg(not(feature = "rp2354"))]
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     UART1_IRQ => BufferedInterruptHandler<UART1>;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+});
+
+#[cfg(feature = "rp2354")]
+bind_interrupts!(struct Irqs {
+    UART0_IRQ => BufferedInterruptHandler<UART0>;
+    // UART1 не используется — PIO UART вместо него
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
 
@@ -168,8 +180,8 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-/// Default is Air 3, will be auto-detected from drone commands
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air 3 (default)
+/// Default is Mavic 4 Pro, will be auto-detected from drone commands
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro (default)
 
 /// Auto-detection state flags
 /// Set to true once drone model is detected (prevents re-detection)
@@ -300,9 +312,9 @@ async fn main(spawner: Spawner) {
             mode.store();
             info!("Loaded mode {} from flash: {:?}", mode_byte, mode);
         } else {
-            // No saved mode, default to Passthrough
-            info!("No saved mode, defaulting to Passthrough");
-            OperatingMode::Passthrough.store();
+            // No saved mode, default to PassthroughOffset
+            info!("No saved mode, defaulting to PassthroughOffset");
+            OperatingMode::PassthroughOffset.store();
         }
     };
 
@@ -366,6 +378,89 @@ async fn main(spawner: Spawner) {
     );
 
     // ========================================================================
+    // КРИТИЧНО для RP2354: настроить PAD регистры ДО создания BufferedUart!
+    // На RP2354 GPIO по умолчанию изолированы (ISO=1), embassy-rp не знает об этом
+    // ========================================================================
+    #[cfg(feature = "rp2354")]
+    {
+        // Вывод информации о чипе
+        let chip_id = rp_pac::SYSINFO.chip_id().read();
+        let gitref = rp_pac::SYSINFO.gitref_rp2350().read();
+        info!("RP2354 chip: revision={} part=0x{:04X} manufacturer=0x{:03X} gitref=0x{:08X}",
+              chip_id.revision(), chip_id.part(), chip_id.manufacturer(), gitref);
+
+        info!("RP2354: Pre-configuring GPIO pads BEFORE UART init...");
+
+        // GPIO0 (UART0 TX) - отключаем изоляцию
+        rp_pac::PADS_BANK0.gpio(0).write(|w| {
+            w.set_iso(false);     // КРИТИЧНО: отключить изоляцию
+            w.set_pue(false);     // Без pull-up
+            w.set_pde(false);     // Без pull-down
+            w.set_ie(true);       // Input enable
+            w.set_od(false);      // Output disable off
+            w.set_slewfast(false);
+            w.set_schmitt(true);  // Шмитт-триггер для чистого сигнала
+            w.set_drive(rp_pac::pads::vals::Drive::_4M_A);
+        });
+
+        // GPIO1 (UART0 RX) - отключаем изоляцию, настраиваем как вход
+        rp_pac::PADS_BANK0.gpio(1).write(|w| {
+            w.set_iso(false);
+            w.set_pue(false);
+            w.set_pde(false);  // Без pull (внешнее устройство управляет линией)
+            w.set_ie(true);
+            w.set_od(false);
+            w.set_slewfast(false);
+            w.set_schmitt(true);
+            w.set_drive(rp_pac::pads::vals::Drive::_4M_A);
+        });
+
+        // GPIO4 (UART1 TX, не используется но инициализируем)
+        rp_pac::PADS_BANK0.gpio(4).write(|w| {
+            w.set_iso(false);
+            w.set_pue(false);
+            w.set_pde(false);
+            w.set_ie(true);
+            w.set_od(false);
+            w.set_slewfast(false);
+            w.set_schmitt(true);
+            w.set_drive(rp_pac::pads::vals::Drive::_4M_A);
+        });
+
+        // GPIO13 (UART1 RX) - отключаем изоляцию
+        // Примечание: GPIO5 не выведен на плату RP2354, используем GPIO13
+        rp_pac::PADS_BANK0.gpio(13).write(|w| {
+            w.set_iso(false);
+            w.set_pue(false);
+            w.set_pde(false);  // Без pull-down (внешнее устройство управляет линией)
+            w.set_ie(true);
+            w.set_od(false);
+            w.set_slewfast(false);
+            w.set_schmitt(true);
+            w.set_drive(rp_pac::pads::vals::Drive::_4M_A);
+        });
+
+        // Небольшая задержка для стабилизации
+        cortex_m::asm::delay(100);
+
+        // Диагностика PAD
+        let gpio0 = rp_pac::PADS_BANK0.gpio(0).read();
+        let gpio1 = rp_pac::PADS_BANK0.gpio(1).read();
+        let gpio13 = rp_pac::PADS_BANK0.gpio(13).read();
+        info!("GPIO0 PRE-UART: iso={} pue={} pde={} ie={}", gpio0.iso(), gpio0.pue(), gpio0.pde(), gpio0.ie());
+        info!("GPIO1 PRE-UART: iso={} pue={} pde={} ie={}", gpio1.iso(), gpio1.pue(), gpio1.pde(), gpio1.ie());
+        info!("GPIO13 PRE-UART: iso={} pue={} pde={} ie={}", gpio13.iso(), gpio13.pue(), gpio13.pde(), gpio13.ie());
+
+        // Диагностика IO_BANK0 (funcsel)
+        let io0 = rp_pac::IO_BANK0.gpio(0).ctrl().read();
+        let io1 = rp_pac::IO_BANK0.gpio(1).ctrl().read();
+        let io13 = rp_pac::IO_BANK0.gpio(13).ctrl().read();
+        info!("GPIO0 IO_BANK0: funcsel={}", io0.funcsel());
+        info!("GPIO1 IO_BANK0: funcsel={}", io1.funcsel());
+        info!("GPIO13 IO_BANK0: funcsel={}", io13.funcsel());
+    }
+
+    // ========================================================================
     // UART0: Communication with drone/host (TX=GPIO0, RX=GPIO1)
     // ========================================================================
     static TX_BUF0: StaticCell<[u8; 2048]> = StaticCell::new();
@@ -387,35 +482,91 @@ async fn main(spawner: Spawner) {
     let (uart0_tx, uart0_rx) = uart0.split();
 
     // ========================================================================
-    // UART1: External GNSS module input (RX=GPIO5)
+    // UART1: External GNSS module input (RP2350 only)
+    // RP2354 использует PIO UART т.к. GPIO5/9 не выведены на плату
     // ========================================================================
-    static TX_BUF1: StaticCell<[u8; 128]> = StaticCell::new();
-    static RX_BUF1: StaticCell<[u8; 4096]> = StaticCell::new();
-    let tx_buf1 = &mut TX_BUF1.init([0; 128])[..];
-    let rx_buf1 = &mut RX_BUF1.init([0; 4096])[..];
+    #[cfg(not(feature = "rp2354"))]
+    let uart1_rx = {
+        static TX_BUF1: StaticCell<[u8; 128]> = StaticCell::new();
+        static RX_BUF1: StaticCell<[u8; 4096]> = StaticCell::new();
+        let tx_buf1 = &mut TX_BUF1.init([0; 128])[..];
+        let rx_buf1 = &mut RX_BUF1.init([0; 4096])[..];
 
-    let mut uart1_config = UartConfig::default();
-    uart1_config.baudrate = DEFAULT_BAUDRATE;
-    let uart1 = BufferedUart::new(
-        p.UART1,
-        p.PIN_4, // TX (not used, but required)
-        p.PIN_5, // RX from external GNSS
-        Irqs,
-        tx_buf1,
-        rx_buf1,
-        uart1_config,
-    );
+        let mut uart1_config = UartConfig::default();
+        uart1_config.baudrate = DEFAULT_BAUDRATE;
 
-    // Reduce FIFO threshold from 7/8 (14 bytes) to 1/4 (4 bytes)
-    // This triggers interrupt 3.4x more often, reducing overrun risk
-    // Embassy-rp defaults to 7/8 which is too slow for 921600 baud
-    rp_pac::UART1.uartifls().write(|w| {
-        w.set_rxiflsel(0b001); // 1/4 full (4 bytes) - was 0b100 (14 bytes)
-        w.set_txiflsel(0b000); // TX unchanged
-    });
-    info!("UART1 RX FIFO threshold set to 1/4 (4 bytes)");
+        let uart1 = BufferedUart::new(
+            p.UART1,
+            p.PIN_4, // TX (not used, but required)
+            p.PIN_5, // RX from external GNSS
+            Irqs,
+            tx_buf1,
+            rx_buf1,
+            uart1_config,
+        );
 
-    let (_uart1_tx, uart1_rx) = uart1.split();
+        // Reduce FIFO threshold from 7/8 (14 bytes) to 1/4 (4 bytes)
+        // This triggers interrupt 3.4x more often, reducing overrun risk
+        rp_pac::UART1.uartifls().write(|w| {
+            w.set_rxiflsel(0b001); // 1/4 full (4 bytes)
+            w.set_txiflsel(0b000); // TX unchanged
+        });
+        info!("UART1 RX FIFO threshold set to 1/4 (4 bytes)");
+
+        let gpio1_pad = rp_pac::PADS_BANK0.gpio(1).read();
+        let gpio5_pad = rp_pac::PADS_BANK0.gpio(5).read();
+        info!("GPIO1 pad: pue={} pde={} ie={}", gpio1_pad.pue(), gpio1_pad.pde(), gpio1_pad.ie());
+        info!("GPIO5 pad: pue={} pde={} ie={}", gpio5_pad.pue(), gpio5_pad.pde(), gpio5_pad.ie());
+
+        rp_pac::PADS_BANK0.gpio(1).modify(|w| {
+            w.set_pue(false);
+            w.set_pde(false);
+        });
+        rp_pac::PADS_BANK0.gpio(5).modify(|w| {
+            w.set_pue(false);
+            w.set_pde(false);
+        });
+
+        let (_uart1_tx, uart1_rx) = uart1.split();
+        uart1_rx
+    };
+
+    // ========================================================================
+    // PIO UART RX: External GNSS module input (RP2354 only)
+    // GPIO4 — произвольный пин через PIO эмуляцию UART
+    // ========================================================================
+    #[cfg(feature = "rp2354")]
+    let pio_uart_rx = {
+        let pio0 = Pio::new(p.PIO0, Irqs);
+        let mut pio_common = pio0.common;
+        let pio_sm0 = pio0.sm0;
+
+        let rx_program = PioUartRxProgram::new(&mut pio_common);
+        let pio_rx = PioUartRx::new(
+            DEFAULT_BAUDRATE,
+            &mut pio_common,
+            pio_sm0,
+            p.PIN_4,  // Passthrough RX from external GNSS
+            &rx_program,
+        );
+
+        info!("PIO UART RX initialized on GPIO4 at {} baud", DEFAULT_BAUDRATE);
+        pio_rx
+    };
+
+    // Диагностика PAD для RP2354
+    #[cfg(feature = "rp2354")]
+    {
+        let gpio0_pad = rp_pac::PADS_BANK0.gpio(0).read();
+        let gpio1_pad = rp_pac::PADS_BANK0.gpio(1).read();
+        let gpio4_pad = rp_pac::PADS_BANK0.gpio(4).read();
+        info!("GPIO0 POST-UART: iso={} pue={} pde={} ie={}",
+              gpio0_pad.iso(), gpio0_pad.pue(), gpio0_pad.pde(), gpio0_pad.ie());
+        info!("GPIO1 POST-UART: iso={} pue={} pde={} ie={}",
+              gpio1_pad.iso(), gpio1_pad.pue(), gpio1_pad.pde(), gpio1_pad.ie());
+        info!("GPIO4 POST-PIO: iso={} pue={} pde={} ie={}",
+              gpio4_pad.iso(), gpio4_pad.pue(), gpio4_pad.pde(), gpio4_pad.ie());
+    }
 
     // Initialize SEC-SIGN accumulator
     {
@@ -432,8 +583,14 @@ async fn main(spawner: Spawner) {
     // Core communication tasks (always running)
     spawner.must_spawn(uart0_tx_task(uart0_tx));
     spawner.must_spawn(uart0_rx_task(uart0_rx));
+
+    // Passthrough RX: Hardware UART1 для RP2350, PIO UART для RP2354
+    #[cfg(not(feature = "rp2354"))]
     spawner.must_spawn(uart1_rx_task(uart1_rx));
-    spawner.must_spawn(gnss_processing_task()); // Separated from uart1_rx to prevent overrun
+    #[cfg(feature = "rp2354")]
+    spawner.must_spawn(pio_uart_rx_task(pio_uart_rx));
+
+    spawner.must_spawn(gnss_processing_task()); // Separated from RX to prevent overrun
 
     // Emulation tasks (check MODE internally, skip work in passthrough)
     // Note: mon_message_task runs on Core1 for load balancing
@@ -986,6 +1143,8 @@ async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 
 /// UART1 RX task - FAST path, only reads and forwards to RAW_RX_CHANNEL
 /// Processing is done in gnss_processing_task to minimize overrun risk
+/// RP2350 only - uses hardware UART1 on GPIO5
+#[cfg(not(feature = "rp2354"))]
 #[embassy_executor::task]
 async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
     let mut buf = [0u8; 256]; // Smaller buffer = more frequent reads = less overrun
@@ -1007,6 +1166,38 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
             Ok(_) => {}
             Err(e) => {
                 error!("UART1 RX error: {:?}", e);
+            }
+        }
+    }
+}
+
+/// PIO UART RX task - FAST path using PIO-emulated UART
+/// Processing is done in gnss_processing_task to minimize overrun risk
+/// RP2354 only - uses PIO UART on GPIO4 (hardware UART1 pins not available)
+#[cfg(feature = "rp2354")]
+#[embassy_executor::task]
+async fn pio_uart_rx_task(mut pio_rx: PioUartRx<'static, PIO0, 0>) {
+    use embedded_io_async::Read;
+
+    let mut buf = [0u8; 256];
+
+    info!("PIO UART RX task ready (GPIO4)");
+
+    loop {
+        match pio_rx.read(&mut buf).await {
+            Ok(n) if n > 0 => {
+                // Minimal processing: just copy and send
+                let mut vec = heapless::Vec::<u8, 256>::new();
+                if vec.extend_from_slice(&buf[..n]).is_ok()
+                    && RAW_RX_CHANNEL.try_send(vec).is_err()
+                {
+                    let drops = DIAG_CHANNEL_DROPS.fetch_add(1, Ordering::Relaxed);
+                    warn!("RAW_RX_CHANNEL full! drops={}", drops + 1);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                // PioUartRx::read returns Infallible
             }
         }
     }
