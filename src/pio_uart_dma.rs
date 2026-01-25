@@ -70,6 +70,24 @@ impl<'d, PIO: Instance, const SM: usize, DMA: Channel> PioUartRxDma<'d, PIO, SM,
         let pin = common.make_pio_pin(pin.into());
         sm.set_pin_dirs(Direction::In, &[&pin]);
 
+        // RP2354: GPIO по умолчанию изолированы (ISO=1), embassy-rp не знает об этом
+        // КРИТИЧНО: отключить изоляцию и настроить PAD для входного сигнала
+        #[cfg(feature = "rp2354")]
+        {
+            let pin_num = pin.pin() as usize;
+            rp_pac::PADS_BANK0.gpio(pin_num).write(|w| {
+                w.set_iso(false);     // КРИТИЧНО: отключить изоляцию
+                w.set_pue(false);     // Без pull-up (внешнее устройство управляет линией)
+                w.set_pde(false);     // Без pull-down
+                w.set_ie(true);       // Input enable
+                w.set_od(false);      // Output disable off
+                w.set_slewfast(false);
+                w.set_schmitt(true);  // Шмитт-триггер для чистого сигнала
+                w.set_drive(rp_pac::pads::vals::Drive::_4M_A);
+            });
+            info!("GPIO{} PAD configured: iso=false ie=true schmitt=true", pin_num);
+        }
+
         // Configure state machine
         let mut cfg = Config::default();
 
