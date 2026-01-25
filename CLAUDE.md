@@ -106,6 +106,7 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 - `src/passthrough.rs` - UBX frame parser, position buffer, NAV modification for spoof detection
 - `src/spoof_detector.rs` - GPS spoofing detection algorithms (teleportation, speed, altitude, acceleration)
 - `src/flash_storage.rs` - Flash persistence for operating mode
+- `src/pio_uart_dma.rs` - Fast-polling PIO UART RX for RP2354 (see below)
 
 ### Coordinate System
 
@@ -397,6 +398,31 @@ rp_pac::UART1.uartifls().write(|w| {
 | PassthroughOffset (4) | 4 | 4× (50ms ON, 150ms OFF), затем пауза |
 
 При спуфинге (Passthrough/PassthroughOffset): быстрое мигание 50ms ON / 50ms OFF.
+
+### PIO UART Fast-Polling Fix (Jan 2026)
+
+**Проблема**: 53% потерь NAV пакетов и 75% потерь SEC-SIGN в режиме Passthrough на RP2354.
+
+**Причина**: Стандартный `PioUartRx` из embassy-rp читает по одному байту через `wait_pull()`, что слишком медленно на 921600 бод. PIO FIFO (8 слов с join) переполняется за ~86µs.
+
+**Решение** (`src/pio_uart_dma.rs`):
+- Кастомный PIO UART RX драйвер с методом `try_read_available()`
+- Fast-polling: тесный цикл без блокирующих await вытаскивает все данные из FIFO
+- При пустом FIFO — короткий yield или 50µs пауза (не даёт FIFO переполниться)
+
+```rust
+// Polling approach: ~10µs между итерациями, FIFO заполняется за ~86µs = 8x запас
+loop {
+    let n = pio_rx.try_read_available(&mut buf);
+    if n > 0 {
+        // Отправить данные в RAW_RX_CHANNEL
+    } else {
+        embassy_futures::yield_now().await; // или Timer::after(50µs)
+    }
+}
+```
+
+**Дополнительно**: Добавлен TX_CHANNEL в select3 для Passthrough режима — теперь poll-ответы (MON-VER, SEC-UNIQID, CFG-0x41) корректно отправляются.
 
 ## Key Dependencies
 - `embassy-rp 0.9` - RP2350 HAL
