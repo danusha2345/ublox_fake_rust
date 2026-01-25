@@ -1208,9 +1208,9 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 async fn pio_uart_rx_task(mut pio_rx: PioUartRxDma<'static, PIO0, 0, DMA_CH1>) {
     // Buffer for fast FIFO drain
     let mut buf = [0u8; 64];  // Max 8 words from FIFO per iteration
-    let mut empty_count: u8 = 0;
+    let mut empty_count: u32 = 0;
 
-    info!("PIO UART RX fast-poll task ready (GPIO4)");
+    info!("PIO UART RX fast-poll task ready (GPIO4, 921600 baud tight loop)");
 
     loop {
         // Fast poll: read all available data from FIFO
@@ -1227,17 +1227,29 @@ async fn pio_uart_rx_task(mut pio_rx: PioUartRxDma<'static, PIO0, 0, DMA_CH1>) {
                     warn!("RAW_RX_CHANNEL full! drops={}", drops + 1);
                 }
             }
+            // NO yield here - immediately check for more data!
         } else {
-            // FIFO empty - yield to other tasks, but not for too long
+            // FIFO empty - but at 921600 baud, FIFO fills in ~87µs (8 bytes)
+            // We need to poll VERY fast to avoid overflow
             empty_count = empty_count.saturating_add(1);
 
-            if empty_count < 10 {
-                // Short yield - just allow other tasks to run briefly
-                embassy_futures::yield_now().await;
+            if empty_count < 100 {
+                // Tight loop with minimal delay (~10 cycles = ~83ns @ 120MHz)
+                // This allows ~1000 polls before FIFO fills
+                cortex_m::asm::nop();
+                cortex_m::asm::nop();
+                cortex_m::asm::nop();
+                cortex_m::asm::nop();
+            } else if empty_count < 1000 {
+                // Short busy-wait (~100 cycles = ~833ns)
+                for _ in 0..10 {
+                    cortex_m::asm::nop();
+                }
             } else {
-                // Longer pause when no data for a while (save CPU)
-                Timer::after(Duration::from_micros(50)).await;
-                // But don't wait too long - FIFO fills in ~86µs
+                // Only yield after extended idle period (no data for ~1ms)
+                // This saves CPU when no GNSS data is being received
+                embassy_futures::yield_now().await;
+                empty_count = 100; // Don't reset to 0, stay in short-wait mode
             }
         }
     }
