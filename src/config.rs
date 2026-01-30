@@ -112,9 +112,9 @@ pub mod button {
 
 /// Default coordinates (configurable)
 pub mod default_position {
-    pub const LATITUDE: f64 = 25.7889186;
-    pub const LONGITUDE: f64 = -80.1919471;
-    pub const ALTITUDE_M: i32 = 101;
+    pub const LATITUDE: f64 = 37.6469;
+    pub const LONGITUDE: f64 = -115.7444;
+    pub const ALTITUDE_M: i32 = 100;
 }
 
 /// Coordinate offset for PassthroughOffset mode

@@ -167,9 +167,9 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 /// Time reference (0=UTC, 1=GPS, 2=GLONASS, etc.) - stored but not used
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
-/// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-/// Default is Air 3, will be auto-detected from drone commands
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air 3 (default)
+/// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro, 2 = Air3S)
+/// Default is Air 3S. Auto-detection skipped when Air 3S is set manually.
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(2); // Air 3S (default)
 
 /// Auto-detection state flags
 /// Set to true once drone model is detected (prevents re-detection)
@@ -1473,17 +1473,23 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // Auto-detect drone model on first CFG-VALSET
             // If we haven't detected yet, decide based on what we saw before
             if !DRONE_DETECTED.load(Ordering::Acquire) {
-                let saw_uniqid = SAW_SEC_UNIQID.load(Ordering::Acquire);
-                let saw_valget = SAW_CFG_VALGET.load(Ordering::Acquire);
-
-                if saw_uniqid || saw_valget {
-                    // Mavic 4 pattern: SEC-UNIQID or CFG-VALGET before CFG-VALSET
-                    DRONE_MODEL.store(1, Ordering::Release); // Mavic 4 Pro
-                    info!("AUTO-DETECT: Mavic 4 Pro (saw SEC-UNIQID={}, CFG-VALGET={})", saw_uniqid, saw_valget);
+                let current_model = DRONE_MODEL.load(Ordering::Acquire);
+                if current_model == 2 {
+                    // Air 3S set manually — skip auto-detection (no auto-detect pattern yet)
+                    info!("AUTO-DETECT: skipped, Air 3S set manually");
                 } else {
-                    // Air 3 pattern: CFG-VALSET immediately after MON-VER
-                    DRONE_MODEL.store(0, Ordering::Release); // Air 3
-                    info!("AUTO-DETECT: Air 3 (no SEC-UNIQID/CFG-VALGET before CFG-VALSET)");
+                    let saw_uniqid = SAW_SEC_UNIQID.load(Ordering::Acquire);
+                    let saw_valget = SAW_CFG_VALGET.load(Ordering::Acquire);
+
+                    if saw_uniqid || saw_valget {
+                        // Mavic 4 pattern: SEC-UNIQID or CFG-VALGET before CFG-VALSET
+                        DRONE_MODEL.store(1, Ordering::Release); // Mavic 4 Pro
+                        info!("AUTO-DETECT: Mavic 4 Pro (saw SEC-UNIQID={}, CFG-VALGET={})", saw_uniqid, saw_valget);
+                    } else {
+                        // Air 3 pattern: CFG-VALSET immediately after MON-VER
+                        DRONE_MODEL.store(0, Ordering::Release); // Air 3
+                        info!("AUTO-DETECT: Air 3 (no SEC-UNIQID/CFG-VALGET before CFG-VALSET)");
+                    }
                 }
                 DRONE_DETECTED.store(true, Ordering::Release);
             }

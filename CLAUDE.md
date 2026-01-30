@@ -113,9 +113,9 @@ Default coordinates are set in `config.rs` and automatically converted to all re
 ```rust
 // config.rs
 pub mod default_position {
-    pub const LATITUDE: f64 = 25.7889186;   // degrees
-    pub const LONGITUDE: f64 = -80.1919471; // degrees
-    pub const ALTITUDE_M: i32 = 101;        // meters
+    pub const LATITUDE: f64 = 37.6469;      // Rachel, Nevada
+    pub const LONGITUDE: f64 = -115.7444;
+    pub const ALTITUDE_M: i32 = 100;
 }
 ```
 
@@ -208,7 +208,7 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 
 **Bug fix (Jan 2026 #2)**: Fixed false teleport detection when switching from Emulation to Passthrough mode. Added `SPOOF_DETECTOR_RESET` atomic flag that triggers detector reset via `apply_mode_by_clicks()`. This prevents the detector from seeing emulation coordinates as the previous position when real GNSS data starts arriving.
 
-**Known bug (Jan 2026)**: SEC-UNIQID race condition in drone auto-detection. When Mavic 4 Pro connects, it sends SEC-UNIQID poll BEFORE CFG-VALSET, but auto-detection triggers on CFG-VALSET. Result: Mavic 4 receives Air 3's chip ID (`0xE0 0x95 0x65 0x0F 0x2A` instead of `0xEB 0xB9 0x91 0x0F 0x2B`), causing signature rejection. **Workaround**: Set default `DRONE_MODEL` to Mavic4Pro in `main.rs:172`.
+**Known bug (Jan 2026)**: SEC-UNIQID race condition in drone auto-detection. When Mavic 4 Pro connects, it sends SEC-UNIQID poll BEFORE CFG-VALSET, but auto-detection triggers on CFG-VALSET. Result: Mavic 4 receives Air 3's chip ID (`0xE0 0x95 0x65 0x0F 0x2A` instead of `0xEB 0xB9 0x91 0x0F 0x2B`), causing signature rejection. **Workaround**: Set default `DRONE_MODEL` to target model in `main.rs:172` (currently Air 3S = 2). Auto-detection is skipped when Air 3S is set manually.
 
 **Global state** (atomics in `main.rs`):
 - `SPOOF_DETECTED: AtomicBool` - spoofing active flag
@@ -419,7 +419,7 @@ rp_pac::UART1.uartifls().write(|w| {
 | DJI Air 3S | `PRIVATE_KEY_AIR3S` | 650ms | 2 seconds |
 | DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 650ms | 2 seconds |
 
-Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S)
+Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S). Default: Air 3S (2). Auto-detection skipped when Air 3S is set manually.
 
 **Implementation**: Pure Rust using `p192` crate primitives (no C dependencies)
 

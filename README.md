@@ -446,9 +446,9 @@ pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;  // Air 3S: каждые 2 се�
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
 
 // Координаты по умолчанию (автоматически конвертируются в ECEF)
-pub const LATITUDE: f64 = 25.7889186;
-pub const LONGITUDE: f64 = -80.1919471;
-pub const ALTITUDE_M: i32 = 101;
+pub const LATITUDE: f64 = 37.6469;      // Rachel, Nevada
+pub const LONGITUDE: f64 = -115.7444;
+pub const ALTITUDE_M: i32 = 100;
 ```
 
 При изменении координат в `config.rs` автоматически обновляются все NAV сообщения:

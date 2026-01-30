@@ -44,7 +44,7 @@
 3. Mavic sends CFG-VALSET → **Detection triggers** → DRONE_MODEL = Mavic4Pro (too late)
 4. SEC-SIGN computed with Mavic 4 key → Signature OK, but drone already has wrong ID
 
-**Workaround**: Set `DRONE_MODEL` default to Mavic 4 Pro in `main.rs:172`
+**Workaround**: Set `DRONE_MODEL` default to target model in `main.rs:172` (currently Air 3S = 2). Auto-detection skips when Air 3S is set manually.
 
 **Fix (TODO)**: Detect Mavic 4 Pro immediately on SEC-UNIQID poll (Air 3 never sends this):
 ```rust
