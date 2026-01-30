@@ -22,9 +22,9 @@ pub mod pins {
     pub const UART1_TX: u8 = 4;   // не используется, но резервируем
     pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
 
-    // Mode button (RP2350: GPIO10=PWR, GPIO11=INPUT)
-    pub const MODE_BTN_PWR: u8 = 10;
-    pub const MODE_BTN_INPUT: u8 = 11;
+    // Mode button (RP2350: GPIO13=PWR, GPIO14=INPUT)
+    pub const MODE_BTN_PWR: u8 = 13;
+    pub const MODE_BTN_INPUT: u8 = 14;
 
     // WS2812B LED
     pub const WS2812_LED: u8 = 16;

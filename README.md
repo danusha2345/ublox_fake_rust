@@ -35,7 +35,7 @@
 - **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
 - **LED RP2350**: WS2812B на GPIO16 (цветовая индикация)
 - **LED RP2354**: Simple GPIO LED на GPIO11/GPIO12 (blink code индикация)
-- **Кнопка**: GPIO11 (вход), GPIO10 (питание) — для RP2350; GPIO14/GPIO13 — для RP2354
+- **Кнопка**: GPIO14 (вход), GPIO13 (питание) — для RP2350 и RP2354
 
 ## Сборка и прошивка
 
