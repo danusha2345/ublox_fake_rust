@@ -26,6 +26,13 @@ pub const PRIVATE_KEY_MAVIC4PRO: [u8; 24] = [
     0x86, 0x36, 0xf5, 0x48, 0xd0, 0x71, 0xd6, 0x9f,
 ];
 
+/// SEC-SIGN private key for DJI Air 3S (SECP192R1 - 24 bytes)
+/// WARNING: Hardcoded for development. Production should use secure storage.
+pub const PRIVATE_KEY_AIR3S: [u8; 24] = [
+    0x37, 0xBB, 0xEA, 0xF7, 0x8D, 0xD1, 0xEE, 0x96, 0x31, 0x36, 0x43, 0xA8, 0x63, 0x62, 0xFE, 0x4A,
+    0x20, 0x2A, 0xAB, 0x5D, 0xBA, 0x7E, 0x73, 0x5F,
+];
+
 /// Legacy alias for backwards compatibility (defaults to Air 3)
 #[allow(dead_code)]
 pub const PRIVATE_KEY: [u8; 24] = PRIVATE_KEY_AIR3;
@@ -35,6 +42,7 @@ pub fn get_private_key(model: DroneModel) -> &'static [u8; 24] {
     match model {
         DroneModel::Air3 => &PRIVATE_KEY_AIR3,
         DroneModel::Mavic4Pro => &PRIVATE_KEY_MAVIC4PRO,
+        DroneModel::Air3S => &PRIVATE_KEY_AIR3S,
     }
 }
 

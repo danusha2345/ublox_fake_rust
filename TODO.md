@@ -57,9 +57,13 @@ ubx::UbxCommand::SecUniqidPoll => {
 }
 ```
 
+## Completed Features
+- [x] **DJI Air 3S support** (Jan 2026): Private key, SEC-UNIQID, CFG-0x41 template (no CFG-RINV, key @offset 115), timers (SEC-SIGN 2s, Config→NAV 780ms). DroneModel::Air3S = 2.
+
 ## Future Improvements
 - [ ] Test NMEA passthrough with real u-blox module
 - [x] Test time-based detection with simulated spoofing (tested Jan 2026)
 - [ ] Add signal-level anti-jam detection (AGC analysis)
 - [ ] Implement carrier-phase divergence detection
 - [ ] **Fix SEC-UNIQID auto-detection race condition**
+- [ ] Air 3S auto-detection pattern analysis (currently manual selection only)

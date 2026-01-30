@@ -18,7 +18,7 @@
 
 - Полная реализация протокола UBX (17 NAV сообщений, 4 MON сообщения, SEC-SIGN)
 - Криптографическая подпись ECDSA SECP192R1 (чистый Rust, без C зависимостей)
-- Поддержка приватных ключей DJI Air 3 и Mavic 4 Pro
+- Поддержка приватных ключей DJI Air 3, Air 3S и Mavic 4 Pro
 - Двухядерная асинхронная архитектура Embassy
 - Hot-switch режимов без перезагрузки
 - Сохранение режима во flash память
@@ -181,7 +181,7 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 - Координаты по умолчанию: настраиваемы в `config.rs`
 - 18 спутников: 9 GPS + 3 SBAS + 6 Galileo
 - 3D fix с DOP=1.0
-- SEC-SIGN подпись: Air 3 = каждые 4 сек, Mavic 4 Pro = каждые 2 сек
+- SEC-SIGN подпись: Air 3 = каждые 4 сек, Air 3S / Mavic 4 Pro = каждые 2 сек
 
 LED индикация в режиме Emulation:
 - **Зелёный**: валидные спутники (первые 20 сек)
@@ -355,12 +355,13 @@ LED индикация в режиме Emulation:
 
 ### Приватные ключи и тайминги
 
-| Модель | Константа | Период SEC-SIGN |
-|--------|-----------|-----------------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 секунды |
-| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды |
+| Модель | Константа | Период SEC-SIGN | Config→NAV delay |
+|--------|-----------|-----------------|------------------|
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 секунды | 700ms |
+| DJI Air 3S | `PRIVATE_KEY_AIR3S` | 2 секунды | 780ms |
+| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400ms |
 
-Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro)
+Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S)
 
 ### CFG-0x41 (OTP / DJI Proprietary)
 
@@ -385,11 +386,13 @@ B5 62 06 41 [len] 04 01 A4 [size] [hash:4] 28 EF 12 05 [config_data] [checksum]
 | 2. ROM Patch #1 | 26 | 28 | file 0x82, ARM Thumb-2 код |
 | 3. ROM Patch #2 | 54 | 42 | file 0x83, ARM Thumb-2 код |
 | 4. CFG-SIGNAL | 96 | ~20 | group 0x31, конфиг сигналов |
-| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory |
+| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory (Air 3 / Mavic 4 Pro) |
 | 6. SEC/KEY | ~166 | 26 | group 0xA6, **Приватный ключ** |
 | 7. CFG-UART1 | ~192 | 10 | group 0x52, baudrate |
 | 8. CFG-CLOCK | ~202 | 40 | group 0xA4, частоты |
 | 9. Padding | ~242 | 14 | 0xFF заполнение |
+
+**Примечание**: Air 3S использует другой шаблон CFG-0x41 **без секции CFG-RINV**. Ключ расположен на offset 115 (вместо 175). Остаток до 256 байт заполнен 0xFF.
 
 **Секция 5 - CFG-RINV (Remote Inventory)**:
 ```
@@ -423,7 +426,8 @@ A4 20 01
 - Получения ключей из других дронов для анализа
 
 **Реализация**: `src/ubx/messages.rs` → `Cfg41`, `cfg41_templates`
-- `PRIVATE_KEY_OFFSET = 175` - смещение для вставки ключа в шаблон
+- `PRIVATE_KEY_OFFSET = 175` — смещение для вставки ключа в шаблон (Air 3, Mavic 4 Pro)
+- `PRIVATE_KEY_OFFSET_AIR3S = 115` — смещение для Air 3S (нет CFG-RINV секции)
 
 ## Конфигурация
 
@@ -438,6 +442,7 @@ pub const NAV_MEAS_PERIOD_MS: u32 = 200;  // 5Hz
 pub const NAV_RATE: u32 = 1;
 pub const MON_PERIOD_MS: u64 = 1000;      // 1Hz
 pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;   // Air 3: каждые 4 сек
+pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;  // Air 3S: каждые 2 сек
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
 
 // Координаты по умолчанию (автоматически конвертируются в ECEF)

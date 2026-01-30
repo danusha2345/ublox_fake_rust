@@ -1560,6 +1560,7 @@ async fn nav_message_task() {
     let config_to_nav_delay = match model {
         DroneModel::Air3 => config::timers::CONFIG_TO_NAV_AIR3_MS,
         DroneModel::Mavic4Pro => config::timers::CONFIG_TO_NAV_MAVIC4_MS,
+        DroneModel::Air3S => config::timers::CONFIG_TO_NAV_AIR3S_MS,
     };
 
     // Wait remaining time to reach delay after first config
@@ -1825,6 +1826,10 @@ async fn sec_sign_timer_task() {
         DroneModel::Mavic4Pro => (
             config::timers::SEC_SIGN_FIRST_MAVIC4_MS,
             config::timers::SEC_SIGN_PERIOD_MAVIC4_MS,
+        ),
+        DroneModel::Air3S => (
+            config::timers::SEC_SIGN_FIRST_AIR3S_MS,
+            config::timers::SEC_SIGN_PERIOD_AIR3S_MS,
         ),
     };
     info!("SEC-SIGN timer task started (first={}ms, period={}ms for {:?})", first_delay_ms, period_ms, model);
