@@ -46,8 +46,10 @@ flash:
 	cargo run --release
 
 # Flash RP2354 via probe-rs (2MB internal flash, different pin config)
+# NOTE: cargo run не работает — CARGO_TARGET_*_RUNNER конкатенируется с .cargo/config.toml
 flash-rp2354:
-	CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo run --release --no-default-features --features rp2354
+	cargo build --release --no-default-features --features rp2354 --target thumbv8m.main-none-eabihf
+	probe-rs run --chip RP2354 target/thumbv8m.main-none-eabihf/release/ublox_fake
 
 clean:
 	cargo clean

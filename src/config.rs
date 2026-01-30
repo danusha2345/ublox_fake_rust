@@ -6,8 +6,11 @@
 pub const DEFAULT_BAUDRATE: u32 = 921600;
 
 /// Flash memory size in bytes
-/// Изменить для плат с другим размером flash (например, 2MB = 2 * 1024 * 1024)
-pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB по умолчанию
+#[cfg(not(feature = "rp2354"))]
+pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB external QSPI flash (RP2350)
+
+#[cfg(feature = "rp2354")]
+pub const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2MB internal flash (RP2354)
 
 /// GPIO pin assignments
 #[cfg(not(feature = "rp2354"))]
