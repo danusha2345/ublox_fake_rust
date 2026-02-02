@@ -1788,15 +1788,16 @@ async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
 
     // Wait for message output to start
-    // In Passthrough mode, don't wait for MSG_OUTPUT_STARTED - it's set by nav_message_task
-    // which requires first UBX command from host. In Passthrough we start immediately.
+    // In Passthrough/PassthroughOffset modes, don't wait for MSG_OUTPUT_STARTED -
+    // it's set by nav_message_task which requires first UBX command from host.
+    // Both modes use external GNSS and start SEC-SIGN timer after fixed 2s delay.
     let start_time = embassy_time::Instant::now();
     loop {
         let mode = OperatingMode::load();
-        if mode == OperatingMode::Passthrough {
-            // In Passthrough, wait a fixed delay then start
+        if mode == OperatingMode::Passthrough || mode == OperatingMode::PassthroughOffset {
+            // In Passthrough/PassthroughOffset, wait a fixed delay then start
             if start_time.elapsed().as_millis() >= 2000 {
-                info!("SEC-SIGN timer: Passthrough mode, starting after 2s delay");
+                info!("SEC-SIGN timer: Passthrough/Offset mode, starting after 2s delay");
                 break;
             }
         } else if mode == OperatingMode::PassthroughRaw {
@@ -1856,7 +1857,7 @@ async fn sec_sign_timer_task() {
         if mode == OperatingMode::Passthrough && !SPOOF_DETECTED.load(Ordering::Acquire) {
             continue;
         }
-        // Works for Emulation and Passthrough (with spoofing only)
+        // Works for Emulation, Passthrough (with spoofing only), and PassthroughOffset (always)
 
         // CRITICAL: Pause TX before capturing hash to prevent race condition
         // Any packets sent after hash capture but before SEC-SIGN TX would not
