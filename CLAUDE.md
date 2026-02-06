@@ -201,7 +201,7 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 - Time-based recovery: Immediate when GNSS time returns to normal
 - Coordinate-based recovery: 5 seconds of clean data + position within 2km of last good
 - **Recovery warmup** (10 samples, ~2 seconds): After recovery, coordinate anomalies are ignored to prevent false positives from GPS re-acquisition jitter. Time-based checks remain active during warmup.
-- Reset SEC_SIGN_ACC hash accumulator
+- Reset SEC_SIGN_ACC hash accumulator via `SEC_SIGN_ACC_NEEDS_RESET` atomic flag (deferred reset in `sec_sign_timer_task`)
 - Restore normal passthrough (original SEC-SIGN passed through)
 
 **Bug fix (Jan 2026)**: Fixed false positive triggering during GPS re-acquisition after spoofing ends. Previously, `last_good` was overwritten during time recovery, making detector vulnerable to coordinate jumps. Now `last_good` is preserved and recovery warmup ignores coordinate anomalies.
@@ -214,6 +214,7 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 - `SPOOF_DETECTED: AtomicBool` - spoofing active flag
 - `SPOOF_RECOVERY_START_MS: AtomicU32` - recovery timer start
 - `LAST_GOOD_LAT/LON/ALT: AtomicI32` - saved good coordinates
+- `SEC_SIGN_ACC_NEEDS_RESET: AtomicBool` - deferred SEC_SIGN_ACC reset (set by mode switch or spoof recovery, consumed by `sec_sign_timer_task`)
 
 **Implementation** (in `passthrough.rs`):
 - `UbxFrameParser` - state machine for UBX frame parsing
@@ -342,6 +343,8 @@ if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
 ```
 
 **Warning**: Do NOT use `try_lock()` instead of `lock().await` for SEC_SIGN_ACC - it breaks signature verification by skipping hash accumulation.
+
+**Bug fix (Feb 2026)**: SEC_SIGN_ACC not reset on mode switch or spoof recovery. Previously, `apply_mode_by_clicks()` didn't reset the hash accumulator, so the first SEC-SIGN after mode switch contained stale hashes → invalid signature. Spoof recovery used `try_lock()` which silently skipped reset when mutex was held by `uart0_tx_task`. Fix: `SEC_SIGN_ACC_NEEDS_RESET` atomic flag — set by mode switch and spoof recovery, consumed by `sec_sign_timer_task` before mode-skip checks (ensures reset even in modes that normally skip SEC-SIGN generation).
 
 ### UART Overrun Fix (Jan 2026) — 100% RELIABILITY ACHIEVED
 

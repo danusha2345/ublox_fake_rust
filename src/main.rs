@@ -146,6 +146,9 @@ static SEC_SIGN_DONE: Channel<CriticalSectionRawMutex, (), 2> = Channel::new();
 /// When true: NAV/MON tasks skip sending, uart_tx_task waits for result
 static SEC_SIGN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// Flag to request SEC_SIGN_ACC reset (set by mode switch or spoof recovery)
+static SEC_SIGN_ACC_NEEDS_RESET: AtomicBool = AtomicBool::new(false);
+
 // ============================================================================
 // Diagnostic counters for packet loss analysis (RTT logging)
 // ============================================================================
@@ -1139,12 +1142,8 @@ async fn gnss_processing_task() {
                                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                                         info!("Spoof recovery complete after 5s of clean data");
 
-                                        if let Ok(mut acc) = SEC_SIGN_ACC.try_lock() {
-                                            if let Some(ref mut accumulator) = *acc {
-                                                accumulator.reset();
-                                                info!("SEC_SIGN_ACC reset after spoof recovery");
-                                            }
-                                        }
+                                        SEC_SIGN_ACC_NEEDS_RESET.store(true, Ordering::Release);
+                                        info!("SEC_SIGN_ACC reset requested (spoof recovery)");
                                     }
                                 }
                             } else if is_spoofed {
@@ -1849,6 +1848,17 @@ async fn sec_sign_timer_task() {
     loop {
         ticker.next().await;
 
+        // Drain stale hash if reset was requested (mode switch or spoof recovery)
+        // Must be BEFORE mode-skip checks: in Passthrough without spoofing the loop
+        // does `continue`, so stale data would persist and corrupt future signatures.
+        if SEC_SIGN_ACC_NEEDS_RESET.swap(false, Ordering::AcqRel) {
+            let mut acc = SEC_SIGN_ACC.lock().await;
+            if let Some(ref mut accumulator) = *acc {
+                accumulator.reset();
+                info!("SEC_SIGN_ACC reset (requested by mode switch or recovery)");
+            }
+        }
+
         let mode = OperatingMode::load();
         if mode == OperatingMode::PassthroughRaw {
             continue;  // SEC-SIGN timer skipped in Raw mode
@@ -2006,6 +2016,9 @@ async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex)
         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
         info!("Cleared spoof detection state (entering raw passthrough)");
     }
+
+    // Stale hashes from previous mode would corrupt first signature
+    SEC_SIGN_ACC_NEEDS_RESET.store(true, Ordering::Release);
 
     // Сброс спуф-детектора при переключении в Passthrough или PassthroughOffset
     // Это предотвращает ложную детекцию "телепорта" при переходе из Emulation
