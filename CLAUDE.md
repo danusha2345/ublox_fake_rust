@@ -32,7 +32,7 @@ rustup target add thumbv8m.main-none-eabihf  # RP2350
 
 ## Required Files
 
-- `memory.x` - Linker script defining memory layout (BOOT2, FLASH, RAM). Build fails without it!
+- `build.rs` - Build script that auto-generates `memory.x` linker script (FLASH, RAM layout for RP2350/RP2354/RP2040)
 - `.cargo/config.toml` - Target selection and linker flags
 
 ## Build Commands
@@ -80,10 +80,11 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 |------|------|---------|
 | `uart0_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates SHA256 for SEC-SIGN |
 | `uart0_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
-| `uart1_rx_task` | async | Receives data from external GNSS (passthrough input) |
+| `uart1_rx_task` | async | Fast UART1 read, forwards raw chunks to RAW_RX_CHANNEL (minimal processing to prevent overrun) |
+| `gnss_processing_task` | async | Parses UBX frames from RAW_RX_CHANNEL, spoof detection, forwards to GNSS_RX_CHANNEL |
 | `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (uses Timer::at for drift-free timing) |
 | `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1, waits via SEC_SIGN_DONE Signal |
-| `button_task` | async | Mode selection by click count (1/2/3 clicks → Emulation/Passthrough/Raw) |
+| `button_task` | async | Mode selection by click count (1/2/3/4 clicks → Emulation/Passthrough/Raw/Offset) |
 
 ### Core1 Tasks
 | Task | Rate | Purpose |
@@ -274,7 +275,9 @@ Implementation: `OUTPUT_START_MILLIS` (AtomicU32) + `wrapping_sub` for overflow 
 
 **Current implementation (algos-v2):**
 - Uses UART1 RX (GPIO5) for receiving external GNSS data
-- Data flows: UART1 RX → `UbxFrameParser` → `GNSS_RX_CHANNEL` → `uart0_tx_task` → UART0 TX
+- Data flows: UART1 RX → `uart1_rx_task` → `RAW_RX_CHANNEL` → `gnss_processing_task` → `UbxFrameParser` → `GNSS_RX_CHANNEL` → `uart0_tx_task` → UART0 TX
+- `uart1_rx_task` and `gnss_processing_task` split for overrun prevention (UART read must not block on frame parsing)
+- `RAW_RX_CHANNEL`: 256-byte chunks, depth 64 (~16KB buffer for burst absorption)
 - Allows frame-by-frame parsing for spoof detection and NAV modification
 
 **Legacy PIO passthrough (in passthrough.rs, NOT USED):**
