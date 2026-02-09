@@ -60,11 +60,11 @@ pub mod timers {
 }
 
 /// Default coordinates (configurable)
-/// Flamingo Park, Miami Beach: 25°47'09.8"N 80°08'17.0"W
+/// Rachel, Nevada: 37°38'49"N 115°44'40"W
 pub mod default_position {
-    pub const LATITUDE: f64 = 25.7860556;
-    pub const LONGITUDE: f64 = -80.1380556;
-    pub const ALTITUDE_M: i32 = 3;
+    pub const LATITUDE: f64 = 37.6469;
+    pub const LONGITUDE: f64 = -115.7444;
+    pub const ALTITUDE_M: i32 = 100;
 }
 
 /// UBX protocol version emulation
