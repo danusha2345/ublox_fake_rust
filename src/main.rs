@@ -140,7 +140,6 @@ static SEC_SIGN_ACC: Mutex<CriticalSectionRawMutex, Option<SecSignAccumulator>> 
 // Channels for SEC-SIGN (Replaced Signal with Channel to prevent race conditions/deadlocks)
 static SEC_SIGN_REQUEST: Channel<CriticalSectionRawMutex, SecSignRequest, 2> = Channel::new();
 static SEC_SIGN_RESULT: Channel<CriticalSectionRawMutex, SecSignResult, 2> = Channel::new();
-static SEC_SIGN_DONE: Channel<CriticalSectionRawMutex, (), 2> = Channel::new();
 
 /// SEC-SIGN computation in progress - pause TX to avoid race condition
 /// When true: NAV/MON tasks skip sending, uart_tx_task waits for result
@@ -695,9 +694,8 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
                             info!("SEC-SIGN sent ({} packets)", result.packet_count);
                         }
-                        // Clear flag and wake waiting tasks (NAV/MON)
+                        // Clear flag (NAV/MON tasks poll this with yield_now)
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                        let _ = SEC_SIGN_DONE.try_send(());
                     }
                     Either3::Second(msg) => {
                         // Regular emulation message
@@ -708,15 +706,22 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             continue;
                         }
 
-                        if let Err(e) = tx.write_all(&msg).await {
-                            error!("UART TX error: {:?}", e);
-                            continue;
-                        }
-
-                        // Accumulate for SEC-SIGN
+                        // Hold lock across send+accumulate to prevent race with sec_sign_timer_task hash capture
+                        // Invariant: hash ONLY messages that were actually sent
                         let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-                        if !is_sec_sign {
+                        if is_sec_sign {
+                            // SEC-SIGN delimiter: no accumulation, no lock
+                            if let Err(e) = tx.write_all(&msg).await {
+                                error!("UART TX error: {:?}", e);
+                                continue;
+                            }
+                        } else {
+                            // Lock across both: timer can't capture hash mid-operation
                             let mut acc = SEC_SIGN_ACC.lock().await;
+                            if let Err(e) = tx.write_all(&msg).await {
+                                error!("UART TX error: {:?}", e);
+                                continue; // lock drops, NOT accumulated
+                            }
                             if let Some(ref mut accumulator) = *acc {
                                 accumulator.accumulate(&msg);
                             }
@@ -758,7 +763,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
                         }
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                        let _ = SEC_SIGN_DONE.try_send(());
                     }
                     Ok(Either::Second(msg)) => {
                         // If SEC-SIGN is in progress, buffer packets locally while waiting
@@ -801,7 +805,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                             }
                                         }
                                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                                        let _ = SEC_SIGN_DONE.try_send(());
                                         break;
                                     }
                                     Either::Second(next_msg) => {
@@ -816,54 +819,73 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
 
                             // Now send all buffered packets AFTER the signature
+                            // Snapshot accumulate decision BEFORE loop (stable for entire flush)
+                            let buf_mode = OperatingMode::load();
+                            let need_accumulate = SPOOF_DETECTED.load(Ordering::Acquire)
+                                || buf_mode == OperatingMode::PassthroughOffset;
                             for buffered_msg in pending.into_iter() {
-                                if let Err(e) = tx.write_all(&buffered_msg).await {
-                                    error!("Passthrough TX error (buffered): {:?}", e);
-                                    continue;
-                                }
-                                DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                                // Accumulate for next SEC-SIGN if spoofing OR PassthroughOffset
-                                // (spoofing may have ended while waiting for ECDSA)
-                                let buf_mode = OperatingMode::load();
-                                let need_accumulate = SPOOF_DETECTED.load(Ordering::Acquire)
-                                    || buf_mode == OperatingMode::PassthroughOffset;
                                 if need_accumulate {
                                     let is_sec_sign = buffered_msg.len() >= 4
                                         && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
-                                    if !is_sec_sign {
+                                    if is_sec_sign {
+                                        if let Err(e) = tx.write_all(&buffered_msg).await {
+                                            error!("Passthrough TX error (buffered): {:?}", e);
+                                            continue;
+                                        }
+                                    } else {
+                                        // Lock across both: send then accumulate
                                         let mut acc = SEC_SIGN_ACC.lock().await;
+                                        if let Err(e) = tx.write_all(&buffered_msg).await {
+                                            error!("Passthrough TX error (buffered): {:?}", e);
+                                            continue;
+                                        }
                                         if let Some(ref mut accumulator) = *acc {
                                             accumulator.accumulate(&buffered_msg);
                                         }
                                     }
+                                } else {
+                                    if let Err(e) = tx.write_all(&buffered_msg).await {
+                                        error!("Passthrough TX error (buffered): {:?}", e);
+                                        continue;
+                                    }
                                 }
+                                DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
                             }
                             continue; // Skip normal msg handling (already processed)
                         }
 
-                        // Normal path (no SEC-SIGN in progress): send immediately
-                        if let Err(e) = tx.write_all(&msg).await {
-                            error!("Passthrough TX error: {:?}", e);
-                            continue;
-                        }
-                        DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
-
-                        // Accumulate hash when spoofing OR in PassthroughOffset mode
-                        // - Spoofing: NAV modified, we generate our own SEC-SIGN
-                        // - PassthroughOffset: coordinates modified, original SEC-SIGN invalid
-                        // Without spoofing in normal Passthrough: original SEC-SIGN passes through
+                        // Normal path (no SEC-SIGN in progress)
+                        // Hold lock across send+accumulate to prevent race with sec_sign_timer_task
                         let current_mode = OperatingMode::load();
                         let need_own_sec_sign = SPOOF_DETECTED.load(Ordering::Acquire)
                             || current_mode == OperatingMode::PassthroughOffset;
+
                         if need_own_sec_sign {
                             let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-                            if !is_sec_sign {
+                            if is_sec_sign {
+                                if let Err(e) = tx.write_all(&msg).await {
+                                    error!("Passthrough TX error: {:?}", e);
+                                    continue;
+                                }
+                            } else {
+                                // Lock across both
                                 let mut acc = SEC_SIGN_ACC.lock().await;
+                                if let Err(e) = tx.write_all(&msg).await {
+                                    error!("Passthrough TX error: {:?}", e);
+                                    continue;
+                                }
                                 if let Some(ref mut accumulator) = *acc {
                                     accumulator.accumulate(&msg);
                                 }
                             }
+                        } else {
+                            // Normal Passthrough without spoofing: no accumulation, no lock
+                            if let Err(e) = tx.write_all(&msg).await {
+                                error!("Passthrough TX error: {:?}", e);
+                                continue;
+                            }
                         }
+                        DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
                         // Timeout - just loop to check mode
@@ -1604,10 +1626,9 @@ async fn nav_message_task() {
             continue;
         }
 
-        // Wait for SEC-SIGN computation to complete using async Signal
-        // This is more efficient than busy-wait yield_now loop
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            let _ = SEC_SIGN_DONE.receive().await;
+        // Wait for SEC-SIGN computation to complete (cooperative yield)
+        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            embassy_futures::yield_now().await;
         }
 
         // Get current message flags
@@ -1756,10 +1777,9 @@ async fn mon_message_task() {
             continue;
         }
 
-        // Wait for SEC-SIGN computation to complete using async Signal
-        // This is more efficient than busy-wait yield_now loop
-        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            let _ = SEC_SIGN_DONE.receive().await;
+        // Wait for SEC-SIGN computation to complete (cooperative yield)
+        while SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            embassy_futures::yield_now().await;
         }
 
         // Get current message flags
