@@ -819,34 +819,24 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             }
 
                             // Now send all buffered packets AFTER the signature
-                            // Snapshot accumulate decision BEFORE loop (stable for entire flush)
-                            let buf_mode = OperatingMode::load();
-                            let need_accumulate = SPOOF_DETECTED.load(Ordering::Acquire)
-                                || buf_mode == OperatingMode::PassthroughOffset;
+                            // Always accumulate — SEC-SIGN always generated in Passthrough/PassthroughOffset
                             for buffered_msg in pending.into_iter() {
-                                if need_accumulate {
-                                    let is_sec_sign = buffered_msg.len() >= 4
-                                        && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
-                                    if is_sec_sign {
-                                        if let Err(e) = tx.write_all(&buffered_msg).await {
-                                            error!("Passthrough TX error (buffered): {:?}", e);
-                                            continue;
-                                        }
-                                    } else {
-                                        // Lock across both: send then accumulate
-                                        let mut acc = SEC_SIGN_ACC.lock().await;
-                                        if let Err(e) = tx.write_all(&buffered_msg).await {
-                                            error!("Passthrough TX error (buffered): {:?}", e);
-                                            continue;
-                                        }
-                                        if let Some(ref mut accumulator) = *acc {
-                                            accumulator.accumulate(&buffered_msg);
-                                        }
-                                    }
-                                } else {
+                                let is_sec_sign = buffered_msg.len() >= 4
+                                    && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
+                                if is_sec_sign {
                                     if let Err(e) = tx.write_all(&buffered_msg).await {
                                         error!("Passthrough TX error (buffered): {:?}", e);
                                         continue;
+                                    }
+                                } else {
+                                    // Hold lock across send+accumulate to prevent race with sec_sign_timer_task
+                                    let mut acc = SEC_SIGN_ACC.lock().await;
+                                    if let Err(e) = tx.write_all(&buffered_msg).await {
+                                        error!("Passthrough TX error (buffered): {:?}", e);
+                                        continue;
+                                    }
+                                    if let Some(ref mut accumulator) = *acc {
+                                        accumulator.accumulate(&buffered_msg);
                                     }
                                 }
                                 DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -855,34 +845,22 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
 
                         // Normal path (no SEC-SIGN in progress)
-                        // Hold lock across send+accumulate to prevent race with sec_sign_timer_task
-                        let current_mode = OperatingMode::load();
-                        let need_own_sec_sign = SPOOF_DETECTED.load(Ordering::Acquire)
-                            || current_mode == OperatingMode::PassthroughOffset;
-
-                        if need_own_sec_sign {
-                            let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
-                            if is_sec_sign {
-                                if let Err(e) = tx.write_all(&msg).await {
-                                    error!("Passthrough TX error: {:?}", e);
-                                    continue;
-                                }
-                            } else {
-                                // Lock across both
-                                let mut acc = SEC_SIGN_ACC.lock().await;
-                                if let Err(e) = tx.write_all(&msg).await {
-                                    error!("Passthrough TX error: {:?}", e);
-                                    continue;
-                                }
-                                if let Some(ref mut accumulator) = *acc {
-                                    accumulator.accumulate(&msg);
-                                }
-                            }
-                        } else {
-                            // Normal Passthrough without spoofing: no accumulation, no lock
+                        // Always accumulate — SEC-SIGN always generated in Passthrough/PassthroughOffset
+                        let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
+                        if is_sec_sign {
                             if let Err(e) = tx.write_all(&msg).await {
                                 error!("Passthrough TX error: {:?}", e);
                                 continue;
+                            }
+                        } else {
+                            // Hold lock across send+accumulate to prevent race with sec_sign_timer_task
+                            let mut acc = SEC_SIGN_ACC.lock().await;
+                            if let Err(e) = tx.write_all(&msg).await {
+                                error!("Passthrough TX error: {:?}", e);
+                                continue;
+                            }
+                            if let Some(ref mut accumulator) = *acc {
+                                accumulator.accumulate(&msg);
                             }
                         }
                         DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -1201,20 +1179,11 @@ async fn gnss_processing_task() {
                         }
                     }
 
-                    // Filter SEC-SIGN in Passthrough/PassthroughOffset:
-                    // - PassthroughOffset: ALWAYS filter (coordinates modified, original SEC-SIGN invalid)
-                    // - Passthrough + spoofing: filter (NAV modified, we generate our own)
-                    // - Passthrough without spoofing: pass through original SEC-SIGN from real GNSS
+                    // Filter SEC-SIGN in Passthrough/PassthroughOffset — always generate our own.
+                    // This eliminates dirty hash (per-packet spoof checks) and timing gaps
+                    // (phase mismatch between real GNSS timer and our timer on spoof transitions).
                     if class == 0x27 && id == 0x04 {
-                        if apply_offset {
-                            // PassthroughOffset - always filter, we generate our own SEC-SIGN
-                            continue;
-                        }
-                        if SPOOF_DETECTED.load(Ordering::Acquire) {
-                            // Spoofing active - filter original SEC-SIGN, our timer generates replacement
-                            continue;
-                        }
-                        // No spoofing in normal Passthrough - let original SEC-SIGN pass through
+                        continue;
                     }
 
                     // Send frame to TX channel
@@ -1883,11 +1852,7 @@ async fn sec_sign_timer_task() {
         if mode == OperatingMode::PassthroughRaw {
             continue;  // SEC-SIGN timer skipped in Raw mode
         }
-        // In Passthrough without spoofing, original SEC-SIGN passes through - no need to generate
-        if mode == OperatingMode::Passthrough && !SPOOF_DETECTED.load(Ordering::Acquire) {
-            continue;
-        }
-        // Works for Emulation, Passthrough (with spoofing only), and PassthroughOffset (always)
+        // All other modes: Emulation, Passthrough, PassthroughOffset — always generate SEC-SIGN
 
         // CRITICAL: Pause TX before capturing hash to prevent race condition
         // Any packets sent after hash capture but before SEC-SIGN TX would not
