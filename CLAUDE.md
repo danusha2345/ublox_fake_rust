@@ -380,7 +380,7 @@ rp_pac::UART1.uartifls().write(|w| {
 ### RP2350A (default)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
 - UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
-- WS2812B LED: GPIO16 (PIO0)
+- WS2812B LED: GPIO25 (PIO0)
 - Mode button: GPIO14 (input), GPIO13 (power)
 
 ### RP2354A (`--features rp2354`)
