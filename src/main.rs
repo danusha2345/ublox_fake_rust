@@ -270,7 +270,7 @@ async fn main(spawner: Spawner) {
 
         let mut pio0 = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut pio0.common);
-        let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_16, &program);
+        let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
 
         for _ in 0..3 {
             ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
@@ -314,7 +314,7 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "rp2354"))]
     let dma_ch1 = p.DMA_CH1;
     #[cfg(not(feature = "rp2354"))]
-    let led_pin = p.PIN_16;  // WS2812B on GPIO16
+    let led_pin = p.PIN_25;  // WS2812B on GPIO25
 
     // Mode button using Flex for E9 workaround
     // RP2350: GPIO10=PWR, GPIO11=INPUT
@@ -462,7 +462,7 @@ async fn main(spawner: Spawner) {
 // ============================================================================
 
 /// LED control task - WS2812B on PIO (runs on Core1)
-/// GPIO16 on RP2350-Tiny
+/// GPIO25 on RP2350
 /// Green = Emulation mode, Blue = Passthrough mode
 /// Blinking Red = Spoofing detected (in passthrough mode)
 /// Note: Not available on RP2354 (no LED connected)
@@ -471,7 +471,7 @@ async fn main(spawner: Spawner) {
 async fn led_task(
     mut pio: Pio<'static, PIO0>,
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
-    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_16>,
+    pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
 ) {
     use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
     use smart_leds::RGB8;
