@@ -462,7 +462,7 @@ async fn main(spawner: Spawner) {
 // ============================================================================
 
 /// LED control task - WS2812B on PIO (runs on Core1)
-/// GPIO25 on RP2350
+/// GPIO25 on SpotPear RP2350-Core-A
 /// Green = Emulation mode, Blue = Passthrough mode
 /// Blinking Red = Spoofing detected (in passthrough mode)
 /// Note: Not available on RP2354 (no LED connected)

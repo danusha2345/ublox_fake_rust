@@ -377,7 +377,7 @@ rp_pac::UART1.uartifls().write(|w| {
 
 ## Hardware Pins
 
-### RP2350A (default)
+### RP2350A — SpotPear RP2350-Core-A (default)
 - UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
 - UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
 - WS2812B LED: GPIO25 (PIO0)
