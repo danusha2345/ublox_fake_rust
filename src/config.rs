@@ -7,7 +7,7 @@ pub const DEFAULT_BAUDRATE: u32 = 921600;
 
 /// Flash memory size in bytes
 /// Изменить для плат с другим размером flash (например, 2MB = 2 * 1024 * 1024)
-pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB по умолчанию
+pub const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2MB (Spotpear RP2350-Core-A)
 
 /// GPIO pin assignments for RP2350A (Spotpear RP2350-Core-A)
 pub mod pins {

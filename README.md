@@ -31,7 +31,7 @@
 - **LED**: WS2812B на GPIO16 (RP2350-Core-A)
 - **Кнопка**: GPIO11 (вход), GPIO10 (питание) — переключение режимов
 
-**Настройка пинов**: все GPIO пины можно изменить в файле [`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs) (модуль `pins`).
+**Настройка пинов**: все GPIO пины можно изменить в файле [`src/config.rs`](src/config.rs) (модуль `pins`).
 
 ## Сборка и прошивка
 
@@ -202,9 +202,11 @@ LED индикация в режиме Emulation:
 | NAV-SAT | 1 спутник, cno=8 dBHz, не используется |
 | NAV-SVINFO | 1 спутник, низкое качество |
 
-Таймер сбрасывается при:
-- Команде CFG-RST от дрона
-- Переключении режима Passthrough → Emulation
+Таймер сбрасывается **только** при:
+- Переключении режима Passthrough → Emulation (кнопка)
+
+> [!NOTE]
+> Команда CFG-RST от дрона **НЕ** сбрасывает таймер 20 секунд.
 
 ## Поддерживаемые UBX сообщения
 
@@ -285,10 +287,10 @@ LED индикация в режиме Emulation:
 | DJI Mavic 4 Pro (по умолчанию) | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400 мс |
 
 **Настройка модели дрона**:
-- Изменить константу `DRONE_MODEL` в [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L168) (строка 168)
+- Изменить константу `DRONE_MODEL` в [`src/main.rs`](src/main.rs#L168) (строка 168)
 - Значения: `0` = Air 3, `1` = Mavic 4 Pro
 - По умолчанию: `1` (DJI Mavic 4 Pro)
-- Приватные ключи хранятся в [`src/sec_sign.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/sec_sign.rs)
+- Приватные ключи хранятся в [`src/sec_sign.rs`](src/sec_sign.rs)
 
 ### CFG-0x41 (OTP / DJI Proprietary)
 
@@ -355,7 +357,7 @@ A4 20 01
 
 ## Конфигурация
 
-### Настройка пинов GPIO ([`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs))
+### Настройка пинов GPIO ([`src/config.rs`](src/config.rs))
 
 ```rust
 // UART0: к дрону/хосту
@@ -366,9 +368,9 @@ pub const UART0_RX: u8 = 1;
 pub const UART1_TX: u8 = 4;   // не используется, но резервируется
 pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
 
-// Mode button
-pub const MODE_BTN_PWR: u8 = 6;     // Устаревшее, используется GPIO10
-pub const MODE_BTN_INPUT: u8 = 7;   // Устаревшее, используется GPIO11
+// Mode button (перенесено с GPIO5/6)
+pub const MODE_BTN_PWR: u8 = 6;
+pub const MODE_BTN_INPUT: u8 = 7;
 
 // WS2812B LED (RP2350-Core-A: GPIO16)
 pub const WS2812_LED: u8 = 16;
@@ -380,13 +382,13 @@ pub const WS2812_LED: u8 = 16;
 > [!TIP]
 > **Изменение WS2812 LED пина**: Пин светодиода настраивается через **type alias** в одном месте!
 > 
-> Измените в [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L70) строку ~70:
+> Измените в [`src/main.rs`](src/main.rs#L70) строку ~70:
 > ```rust
 > type WS2812LedPin = embassy_rp::peripherals::PIN_16;  // <- Измените PIN_XX
 > ```
 > Пример для GPIO25: `type WS2812LedPin = embassy_rp::peripherals::PIN_25;`
 
-### Настройка модели дрона ([`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L168))
+### Настройка модели дрона ([`src/main.rs`](src/main.rs#L168))
 
 ```rust
 /// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
@@ -395,19 +397,19 @@ static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro по умолч�
 
 **Изменить модель**: замените `1` на `0` для Air 3
 
-### Настройка размера flash памяти ([`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs#L8))
+### Настройка размера flash памяти ([`src/config.rs`](src/config.rs#L8))
 
 ```rust
 /// Flash memory size in bytes
-/// Изменить для плат с другим размером flash (например, 2MB = 2 * 1024 * 1024)
-pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB по умолчанию
+/// Изменить для плат с другим размером flash (например, 4MB = 4 * 1024 * 1024)
+pub const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2MB (Spotpear RP2350-Core-A)
 ```
 
-**Важно**: При изменении размера памяти офсет для записи конфигурации во flash автоматически пересчитывается в [`src/flash_storage.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/flash_storage.rs)
-- Для 4MB: офсет = `0x3FE000` (сектор 1022 из 1024)
+**Важно**: При изменении размера памяти офсет для записи конфигурации во flash автоматически пересчитывается в [`src/flash_storage.rs`](src/flash_storage.rs)
 - Для 2MB: офсет = `0x1FE000` (сектор 510 из 512)
+- Для 4MB: офсет = `0x3FE000` (сектор 1022 из 1024)
 
-### Константы времени и координат ([`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs))
+### Константы времени и координат ([`src/config.rs`](src/config.rs))
 
 
 ```rust
@@ -422,9 +424,10 @@ pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;   // Air 3: каждые 4 сек
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
 
 // Координаты по умолчанию (автоматически конвертируются в ECEF)
-pub const LATITUDE: f64 = 25.7860556;   // Flamingo Park, Miami Beach
-pub const LONGITUDE: f64 = -80.1380556;
-pub const ALTITUDE_M: i32 = 3;
+// Rachel, Nevada: 37°38'49"N 115°44'40"W
+pub const LATITUDE: f64 = 37.6469;
+pub const LONGITUDE: f64 = -115.7444;
+pub const ALTITUDE_M: i32 = 100;
 ```
 
 При изменении координат в `config.rs` автоматически обновляются все NAV сообщения:
@@ -443,8 +446,7 @@ pub const ALTITUDE_M: i32 = 3;
 ```
 ublox_fake_rust/
 ├── Cargo.toml              # Зависимости и настройки сборки
-├── build.rs                # Build script (memory.x генерация)
-├── memory.x                # Linker script для RP2350
+├── build.rs                # Build script (генерирует memory.x в OUT_DIR)
 ├── .cargo/config.toml      # Cargo настройки (target, runner)
 ├── CLAUDE.md               # Документация для Claude Code
 └── src/
@@ -477,7 +479,8 @@ ublox_fake_rust/
 | pio | 0.3 | PIO макрос (**критично: версия 0.3!**) |
 | heapless | 0.9 | Статические коллекции |
 | libm | 0.2 | Математика для LLH→ECEF (sin, cos, sqrt) |
-| defmt + defmt-rtt | 1.0+ | Отладочный вывод |
+| defmt | 1.0 | Отладочный вывод |
+| defmt-rtt | 1.1 | RTT транспорт для defmt |
 
 ### Критичные версии
 
