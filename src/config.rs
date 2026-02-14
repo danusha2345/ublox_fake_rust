@@ -30,7 +30,7 @@ pub mod pins {
     pub const MODE_BTN_INPUT: u8 = 14;
 
     // WS2812B LED
-    pub const WS2812_LED: u8 = 16;
+    pub const WS2812_LED: u8 = 25;
     pub const HAS_WS2812_LED: bool = true;
 
     // Legacy alias

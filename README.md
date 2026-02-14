@@ -7,10 +7,11 @@
 
 ## Назначение
 
-Устройство эмулирует работу GNSS приёмника u-blox и может работать в трёх режимах:
+Устройство эмулирует работу GNSS приёмника u-blox и может работать в четырёх режимах:
 - **Emulation** — генерация фиктивных GNSS данных с криптографической подписью SEC-SIGN
 - **Passthrough** — ретрансляция данных от реального GNSS модуля с детекцией GPS-спуфинга
 - **PassthroughRaw** — прозрачная ретрансляция данных без какой-либо обработки
+- **PassthroughOffset** — ретрансляция с подменой координат и детекцией спуфинга
 
 Основное применение — тестирование и исследование систем, использующих u-blox GNSS с аутентификацией SEC-SIGN (например, дроны DJI).
 
@@ -33,7 +34,7 @@
 - **Flash**: 2 МБ
 - **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
 - **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
-- **LED RP2350**: WS2812B на GPIO16 (цветовая индикация)
+- **LED RP2350**: WS2812B на GPIO25 (цветовая индикация)
 - **LED RP2354**: Simple GPIO LED на GPIO11/GPIO12 (blink code индикация)
 - **Кнопка**: GPIO14 (вход), GPIO13 (питание) — для RP2350 и RP2354
 
@@ -109,7 +110,7 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 │           CORE 0              │            CORE 1               │
 │      (Embassy Executor)       │       (Embassy Executor)        │
 ├───────────────────────────────┼─────────────────────────────────┤
-│  uart0_tx_task                │  led_task (500ms)               │
+│  uart0_tx_task                │  led_task (100ms)               │
 │    └─ TX_CHANNEL → UART0 TX   │    └─ WS2812B управление        │
 │    └─ SHA256 накопление       │                                 │
 │    └─ SEC_SIGN_RESULT обрабо. │  sec_sign_compute_task          │
@@ -119,7 +120,11 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 │    └─ CFG команды             │    └─ MON-HW, RF, COMMS         │
 │                               │                                 │
 │  uart1_rx_task                │                                 │
-│    └─ Внешний GNSS вход       │                                 │
+│    └─ UART1 RX → RAW_RX_CH   │                                 │
+│                               │                                 │
+│  gnss_processing_task         │                                 │
+│    └─ RAW_RX → парсинг UBX   │                                 │
+│    └─ Spoof detect → GNSS_RX  │                                 │
 │                               │                                 │
 │  nav_message_task (5Hz)       │                                 │
 │    └─ NAV-PVT, STATUS, DOP... │                                 │
@@ -138,7 +143,8 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 | Канал/Сигнал | Направление | Назначение |
 |--------------|-------------|------------|
 | `TX_CHANNEL` (32 msg) | Tasks → uart0_tx | Очередь UBX сообщений для отправки |
-| `GNSS_RX_CHANNEL` | uart1_rx → uart0_tx | Данные от внешнего GNSS (passthrough) |
+| `RAW_RX_CHANNEL` (64×256B) | uart1_rx → gnss_processing | Сырые байты от UART1 |
+| `GNSS_RX_CHANNEL` (128 msg) | gnss_processing → uart0_tx | Распарсенные UBX фреймы (passthrough) |
 | `SEC_SIGN_REQUEST` | Core0 → Core1 | Запрос вычисления подписи |
 | `SEC_SIGN_RESULT` | Core1 → Core0 | Результат вычисления (r, s) |
 | `SEC_SIGN_IN_PROGRESS` | Атомик | Пауза TX во время вычисления |
@@ -219,9 +225,7 @@ LED индикация в режиме Emulation:
 2. Модифицируются ВСЕ NAV сообщения: `num_sv=2`, `fix_type=0`, `flags=0`
 3. LED моргает красным (цикл 200 мс)
 4. Пересчитывается Fletcher-8 checksum
-5. **Заменяется SEC-SIGN** при получении от реального GNSS:
-   - Входящий SEC-SIGN триггерит генерацию подписи нашим ключом
-   - Синхронизация с периодом реального GNSS модуля
+5. **SEC-SIGN** всегда генерируется нашим таймером (входящий SEC-SIGN от реального GNSS фильтруется)
 
 **Восстановление:**
 - **Time-based recovery**: при возврате GNSS времени к ожидаемому значению (±5 сек от проекции)
@@ -243,6 +247,26 @@ LED индикация в режиме Emulation:
 - SEC-SIGN проходит от реального модуля без изменений
 
 Используйте этот режим когда нужна чистая ретрансляция без вмешательства.
+
+### PassthroughOffset (LED белый / моргающий красный)
+
+Ретрансляция с подменой координат и детекцией спуфинга:
+- Работает как Passthrough, но применяет фиксированное смещение координат ко всем NAV сообщениям
+- **Текущее смещение**: Санкт-Петербург (59.9343°N, 30.3351°E) → Rachel, Nevada (37.6469°N, 115.7444°W)
+- Детекция спуфинга анализирует **оригинальные** координаты (до смещения)
+- SEC-SIGN генерируется нашим таймером (как в Passthrough)
+
+**Модифицируемые NAV сообщения**:
+
+| Сообщение | Применяемые смещения |
+|-----------|---------------------|
+| NAV-PVT | lon, lat, height, hMSL |
+| NAV-POSLLH | lon, lat, height, hMSL |
+| NAV-POSECEF | ecefX, ecefY, ecefZ |
+| NAV-HPPOSECEF | ecefX, ecefY, ecefZ |
+| NAV-SOL | ecefX, ecefY, ecefZ |
+
+Смещения настраиваются в `config.rs` → модуль `coordinate_offset`.
 
 ### Переключение режимов
 

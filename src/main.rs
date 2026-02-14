@@ -317,12 +317,12 @@ async fn main(spawner: Spawner) {
     let led_pin = p.PIN_25;  // WS2812B on GPIO25
 
     // Mode button using Flex for E9 workaround
-    // RP2350: GPIO10=PWR, GPIO11=INPUT
+    // RP2350: GPIO13=PWR, GPIO14=INPUT
     // RP2354: GPIO13=PWR, GPIO14=INPUT
     #[cfg(not(feature = "rp2354"))]
-    let _btn_pwr = Output::new(p.PIN_10, Level::High);
+    let _btn_pwr = Output::new(p.PIN_13, Level::High);
     #[cfg(not(feature = "rp2354"))]
-    let btn_flex = Flex::new(p.PIN_11);
+    let btn_flex = Flex::new(p.PIN_14);
 
     #[cfg(feature = "rp2354")]
     let _btn_pwr = Output::new(p.PIN_13, Level::High);
