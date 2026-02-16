@@ -19,7 +19,7 @@
 
 - Полная реализация протокола UBX (17 NAV сообщений, 4 MON сообщения, SEC-SIGN)
 - Криптографическая подпись ECDSA SECP192R1 (чистый Rust, без C зависимостей)
-- Поддержка приватных ключей DJI Air 3, Air 3S и Mavic 4 Pro
+- Поддержка приватных ключей DJI Air 3, Air 3S, Mavic 4 Pro и Mavic 3 Pro
 - Двухядерная асинхронная архитектура Embassy
 - Hot-switch режимов без перезагрузки
 - Сохранение режима во flash память
@@ -384,8 +384,9 @@ LED индикация в режиме Emulation:
 | DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 секунды | 700ms |
 | DJI Air 3S | `PRIVATE_KEY_AIR3S` | 2 секунды | 780ms |
 | DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400ms |
+| DJI Mavic 3 Pro | `PRIVATE_KEY_MAVIC3PRO` | 2 секунды | 780ms |
 
-Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S)
+Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro)
 
 ### CFG-0x41 (OTP / DJI Proprietary)
 
@@ -416,7 +417,7 @@ B5 62 06 41 [len] 04 01 A4 [size] [hash:4] 28 EF 12 05 [config_data] [checksum]
 | 8. CFG-CLOCK | ~202 | 40 | group 0xA4, частоты |
 | 9. Padding | ~242 | 14 | 0xFF заполнение |
 
-**Примечание**: Air 3S использует другой шаблон CFG-0x41 **без секции CFG-RINV**. Ключ расположен на offset 115 (вместо 175). Остаток до 256 байт заполнен 0xFF.
+**Примечание**: Air 3S и Mavic 3 Pro используют другой шаблон CFG-0x41 **без секции CFG-RINV**. Ключ расположен на offset 115 (вместо 175). Mavic 3 Pro дополнительно не содержит секций CFG-UART1/CFG-CLOCK (всё 0xFF после ключа).
 
 **Секция 5 - CFG-RINV (Remote Inventory)**:
 ```
@@ -451,7 +452,7 @@ A4 20 01
 
 **Реализация**: `src/ubx/messages.rs` → `Cfg41`, `cfg41_templates`
 - `PRIVATE_KEY_OFFSET = 175` — смещение для вставки ключа в шаблон (Air 3, Mavic 4 Pro)
-- `PRIVATE_KEY_OFFSET_AIR3S = 115` — смещение для Air 3S (нет CFG-RINV секции)
+- `PRIVATE_KEY_OFFSET_AIR3S = 115` — смещение для Air 3S и Mavic 3 Pro (нет CFG-RINV секции)
 
 ## Конфигурация
 
@@ -468,6 +469,7 @@ pub const MON_PERIOD_MS: u64 = 1000;      // 1Hz
 pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;   // Air 3: каждые 4 сек
 pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;  // Air 3S: каждые 2 сек
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
+pub const SEC_SIGN_PERIOD_MAVIC3PRO_MS: u64 = 2000; // Mavic 3 Pro: каждые 2 сек
 
 // Координаты по умолчанию (автоматически конвертируются в ECEF)
 pub const LATITUDE: f64 = 37.6469;      // Rachel, Nevada

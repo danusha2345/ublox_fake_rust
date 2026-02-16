@@ -96,6 +96,12 @@ pub mod timers {
     pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;
     /// Delay from first config to NAV start for Air 3S (real: 780ms)
     pub const CONFIG_TO_NAV_AIR3S_MS: u64 = 780;
+    /// First SEC-SIGN delay after NAV start for Mavic 3 Pro (estimated, same as Air 3S)
+    pub const SEC_SIGN_FIRST_MAVIC3PRO_MS: u64 = 650;
+    /// SEC-SIGN interval for DJI Mavic 3 Pro (confirmed from logs)
+    pub const SEC_SIGN_PERIOD_MAVIC3PRO_MS: u64 = 2000;
+    /// Delay from first config to NAV start for Mavic 3 Pro (estimated, same as Air 3S)
+    pub const CONFIG_TO_NAV_MAVIC3PRO_MS: u64 = 780;
     /// Delay after CFG-RST before message output starts (0 = immediate)
     pub const UART_TX_INIT_DELAY_MS: u64 = 0;
     /// Time after start when satellites become invalid (ms)
@@ -147,6 +153,7 @@ pub enum DroneModel {
     Air3 = 0,
     Mavic4Pro = 1,
     Air3S = 2,
+    Mavic3Pro = 3,
 }
 
 impl DroneModel {
@@ -154,6 +161,7 @@ impl DroneModel {
         match val {
             1 => Self::Mavic4Pro,
             2 => Self::Air3S,
+            3 => Self::Mavic3Pro,
             _ => Self::Air3,
         }
     }

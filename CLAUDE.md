@@ -237,6 +237,7 @@ NAV messages start after a model-specific delay from the first UBX command (any 
 | Air 3 | 666ms | 700ms |
 | Air 3S | 780ms | 780ms |
 | Mavic 4 Pro | 399ms | 400ms |
+| Mavic 3 Pro | ~780ms (est.) | 780ms |
 
 ```
 First UBX command → +delay → NAV output starts → +650ms → First SEC-SIGN
@@ -420,8 +421,9 @@ rp_pac::UART1.uartifls().write(|w| {
 | DJI Air 3 | `PRIVATE_KEY_AIR3` | 1000ms | 4 seconds |
 | DJI Air 3S | `PRIVATE_KEY_AIR3S` | 650ms | 2 seconds |
 | DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 650ms | 2 seconds |
+| DJI Mavic 3 Pro | `PRIVATE_KEY_MAVIC3PRO` | 650ms | 2 seconds |
 
-Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S). Default: Air 3S (2). Auto-detection skipped when Air 3S is set manually.
+Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro). Default: Air 3S (2). Auto-detection skipped when Air 3S or Mavic 3 Pro is set manually.
 
 **Implementation**: Pure Rust using `p192` crate primitives (no C dependencies)
 
@@ -485,8 +487,8 @@ B5 62 06 41 [len] 04 01 A4 [size] [hash:4] 28 EF 12 05 [config_data] [checksum]
 | 2. ROM Patch #1 | 26 | 28 | file 0x82, ARM Thumb-2 code |
 | 3. ROM Patch #2 | 54 | 42 | file 0x83, ARM Thumb-2 code |
 | 4. CFG-SIGNAL | 96 | ~20 | group 0x31, signal config |
-| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory (Air 3/Mavic 4 Pro only, absent in Air 3S) |
-| 6. SEC/KEY | ~166 | 26 | group 0xA6, **Private Key** (offset 175 or 115 for Air 3S) |
+| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory (Air 3/Mavic 4 Pro only, absent in Air 3S/Mavic 3 Pro) |
+| 6. SEC/KEY | ~166 | 26 | group 0xA6, **Private Key** (offset 175 or 115 for Air 3S/Mavic 3 Pro) |
 | 7. CFG-UART1 | ~192 | 10 | group 0x52, baudrate |
 | 8. CFG-CLOCK | ~202 | 40 | group 0xA4, clock frequencies |
 | 9. Padding | ~242 | 14 | 0xFF fill |
@@ -519,9 +521,10 @@ A4 20 01
 
 **Implementation**: `src/ubx/messages.rs` → `Cfg41`, `cfg41_templates`
 - `PRIVATE_KEY_OFFSET = 175` - where key is inserted in template (Air 3, Mavic 4 Pro)
-- `PRIVATE_KEY_OFFSET_AIR3S = 115` - key offset for Air 3S (no CFG-RINV section)
+- `PRIVATE_KEY_OFFSET_AIR3S = 115` - key offset for Air 3S and Mavic 3 Pro (no CFG-RINV section)
 - `TEMPLATE` captured from real Mavic 4 Pro GNSS module
 - `TEMPLATE_AIR3S` captured from real Air 3S GNSS module (no CFG-RINV, more FF padding)
+- `TEMPLATE_MAVIC3PRO` captured from real Mavic 3 Pro GNSS module (no CFG-RINV, no CFG-UART1/CLOCK, unique bitmask)
 
 **Security note**: This command exposes the private key, allowing key extraction from real DJI GNSS modules.
 

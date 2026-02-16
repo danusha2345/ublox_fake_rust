@@ -169,7 +169,7 @@ static NAV_RATE: AtomicU32 = AtomicU32::new(config::timers::NAV_RATE);
 /// Time reference (0=UTC, 1=GPS, 2=GLONASS, etc.) - stored but not used
 static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
-/// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro, 2 = Air3S)
+/// Drone model for SEC-SIGN key selection (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro)
 /// Default is Air 3S. Auto-detection skipped when Air 3S is set manually.
 static DRONE_MODEL: AtomicU8 = AtomicU8::new(2); // Air 3S (default)
 
@@ -1464,8 +1464,8 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // If we haven't detected yet, decide based on what we saw before
             if !DRONE_DETECTED.load(Ordering::Acquire) {
                 let current_model = DRONE_MODEL.load(Ordering::Acquire);
-                if current_model == 2 {
-                    // Air 3S set manually — skip auto-detection (no auto-detect pattern yet)
+                if current_model == 2 || current_model == 3 {
+                    // Air 3S / Mavic 3 Pro set manually — skip auto-detection
                     info!("AUTO-DETECT: skipped, Air 3S set manually");
                 } else {
                     let saw_uniqid = SAW_SEC_UNIQID.load(Ordering::Acquire);
@@ -1557,6 +1557,7 @@ async fn nav_message_task() {
         DroneModel::Air3 => config::timers::CONFIG_TO_NAV_AIR3_MS,
         DroneModel::Mavic4Pro => config::timers::CONFIG_TO_NAV_MAVIC4_MS,
         DroneModel::Air3S => config::timers::CONFIG_TO_NAV_AIR3S_MS,
+        DroneModel::Mavic3Pro => config::timers::CONFIG_TO_NAV_MAVIC3PRO_MS,
     };
 
     // Wait remaining time to reach delay after first config
@@ -1825,6 +1826,10 @@ async fn sec_sign_timer_task() {
         DroneModel::Air3S => (
             config::timers::SEC_SIGN_FIRST_AIR3S_MS,
             config::timers::SEC_SIGN_PERIOD_AIR3S_MS,
+        ),
+        DroneModel::Mavic3Pro => (
+            config::timers::SEC_SIGN_FIRST_MAVIC3PRO_MS,
+            config::timers::SEC_SIGN_PERIOD_MAVIC3PRO_MS,
         ),
     };
     info!("SEC-SIGN timer task started (first={}ms, period={}ms for {:?})", first_delay_ms, period_ms, model);
