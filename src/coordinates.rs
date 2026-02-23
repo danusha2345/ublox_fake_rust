@@ -102,3 +102,24 @@ pub fn ecef_y_cm() -> i32 {
 pub fn ecef_z_cm() -> i32 {
     unsafe { CACHED.ecef_z_cm }
 }
+
+/// Runtime LLH → ECEF conversion (for spoof detection LAST_GOOD coordinates)
+/// Uses f64 trig (software-emulated on Cortex-M33, ~50µs per call — acceptable for rare spoof events)
+pub fn llh_to_ecef_cm(lat_1e7: i32, lon_1e7: i32, alt_mm: i32) -> (i32, i32, i32) {
+    let lat_rad = (lat_1e7 as f64 * 1e-7_f64).to_radians();
+    let lon_rad = (lon_1e7 as f64 * 1e-7_f64).to_radians();
+
+    let sin_lat = sin(lat_rad);
+    let cos_lat = cos(lat_rad);
+    let sin_lon = sin(lon_rad);
+    let cos_lon = cos(lon_rad);
+
+    let n = WGS84_A / sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat);
+    let alt_m = alt_mm as f64 / 1000.0;
+
+    let x_cm = ((n + alt_m) * cos_lat * cos_lon * 100.0) as i32;
+    let y_cm = ((n + alt_m) * cos_lat * sin_lon * 100.0) as i32;
+    let z_cm = ((n * (1.0 - WGS84_E2) + alt_m) * sin_lat * 100.0) as i32;
+
+    (x_cm, y_cm, z_cm)
+}

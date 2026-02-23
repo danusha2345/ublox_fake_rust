@@ -356,14 +356,10 @@ pub fn modify_nav_svinfo(frame: &mut [u8]) {
 // Transforms: Saint Petersburg (59.9343°N, 30.3351°E) → Rachel, Nevada (37.6469°N, 115.7444°W)
 // ============================================================================
 
-use crate::config::coordinate_offset::{LAT_OFFSET_1E7, LON_OFFSET_1E7, ALT_OFFSET_MM};
-
-/// Pre-computed ECEF offset in centimeters
-/// Saint Petersburg ECEF: X=2825884m, Y=1671063m, Z=5479661m
-/// Rachel, Nevada ECEF:   X=-2072755m, Y=-4627963m, Z=3885879m
-const ECEF_OFFSET_X_CM: i32 = -489_863_900;  // (-2072755 - 2825884) * 100
-const ECEF_OFFSET_Y_CM: i32 = -629_902_600;  // (-4627963 - 1671063) * 100
-const ECEF_OFFSET_Z_CM: i32 = -159_378_200;  // (3885879 - 5479661) * 100
+use crate::config::coordinate_offset::{
+    LAT_OFFSET_1E7, LON_OFFSET_1E7, ALT_OFFSET_MM,
+    ECEF_OFFSET_X_CM, ECEF_OFFSET_Y_CM, ECEF_OFFSET_Z_CM,
+};
 
 /// Apply coordinate offset to NAV-PVT (0x01 0x07)
 /// Payload: 92 bytes
@@ -482,6 +478,88 @@ pub fn apply_offset_nav_sol(frame: &mut [u8]) {
     frame[6 + 12..6 + 16].copy_from_slice(&new_x.to_le_bytes());
     frame[6 + 16..6 + 20].copy_from_slice(&new_y.to_le_bytes());
     frame[6 + 20..6 + 24].copy_from_slice(&new_z.to_le_bytes());
+}
+
+// ============================================================================
+// Spoof Modification Functions — replace coordinates with LAST_GOOD values
+// Used during spoofing to prevent both real and spoofed coordinates from leaking.
+// These replace the simple modify_nav_pvt/sol/status functions for comprehensive protection.
+// ============================================================================
+
+/// Modify NAV-PVT (0x01 0x07) during spoofing: replace coordinates + degrade status
+/// Payload: 92 bytes. Replaces lon(24), lat(28), height(32), hMSL(36), velN(48), velE(52), velD(56)
+pub fn modify_nav_pvt_spoof(frame: &mut [u8], lat: i32, lon: i32, alt: i32) {
+    if frame.len() < 100 { return; }
+    // Replace coordinates
+    frame[6 + 24..6 + 28].copy_from_slice(&lon.to_le_bytes());
+    frame[6 + 28..6 + 32].copy_from_slice(&lat.to_le_bytes());
+    frame[6 + 32..6 + 36].copy_from_slice(&alt.to_le_bytes());
+    frame[6 + 36..6 + 40].copy_from_slice(&alt.to_le_bytes()); // hMSL ≈ height
+    // Zero velocity to prevent speed-based position estimation
+    frame[6 + 48..6 + 52].copy_from_slice(&0i32.to_le_bytes()); // velN
+    frame[6 + 52..6 + 56].copy_from_slice(&0i32.to_le_bytes()); // velE
+    frame[6 + 56..6 + 60].copy_from_slice(&0i32.to_le_bytes()); // velD
+    // Degrade status
+    frame[6 + 20] = 0; // fix_type = 0
+    frame[6 + 21] = 0; // flags = 0
+    frame[6 + 23] = 2; // num_sv = 2
+}
+
+/// Modify NAV-POSLLH (0x01 0x02) during spoofing: replace coordinates + degrade accuracy
+/// Payload: 28 bytes. lon(4), lat(8), height(12), hMSL(16), hAcc(20), vAcc(24)
+pub fn modify_nav_posllh_spoof(frame: &mut [u8], lat: i32, lon: i32, alt: i32) {
+    if frame.len() < 36 { return; }
+    frame[6 + 4..6 + 8].copy_from_slice(&lon.to_le_bytes());
+    frame[6 + 8..6 + 12].copy_from_slice(&lat.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&alt.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&alt.to_le_bytes()); // hMSL ≈ height
+    // Degrade accuracy to signal unreliable position (9999999 mm ≈ 10 km)
+    frame[6 + 20..6 + 24].copy_from_slice(&9_999_999u32.to_le_bytes()); // hAcc
+    frame[6 + 24..6 + 28].copy_from_slice(&9_999_999u32.to_le_bytes()); // vAcc
+}
+
+/// Modify NAV-POSECEF (0x01 0x01) during spoofing: replace ECEF coordinates + degrade accuracy
+/// Payload: 20 bytes. ecefX(4), ecefY(8), ecefZ(12), pAcc(16)
+pub fn modify_nav_posecef_spoof(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: i32) {
+    if frame.len() < 28 { return; }
+    frame[6 + 4..6 + 8].copy_from_slice(&ecef_x.to_le_bytes());
+    frame[6 + 8..6 + 12].copy_from_slice(&ecef_y.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&ecef_z.to_le_bytes());
+    // Degrade accuracy (9999999 cm ≈ 100 km)
+    frame[6 + 16..6 + 20].copy_from_slice(&9_999_999u32.to_le_bytes()); // pAcc
+}
+
+/// Modify NAV-HPPOSECEF (0x01 0x13) during spoofing: replace ECEF + set invalid flag
+/// Payload: 28 bytes. ecefX(8), ecefY(12), ecefZ(16), ecefXHp(20), ecefYHp(21), ecefZHp(22), flags(23), pAcc(24)
+pub fn modify_nav_hpposecef_spoof(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: i32) {
+    if frame.len() < 36 { return; }
+    frame[6 + 8..6 + 12].copy_from_slice(&ecef_x.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&ecef_y.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&ecef_z.to_le_bytes());
+    frame[6 + 20] = 0; // ecefXHp = 0
+    frame[6 + 21] = 0; // ecefYHp = 0
+    frame[6 + 22] = 0; // ecefZHp = 0
+    frame[6 + 23] |= 0x01; // flags bit 0: invalidEcef
+    // Degrade accuracy (9999999 * 0.1mm = 999 m)
+    frame[6 + 24..6 + 28].copy_from_slice(&9_999_999u32.to_le_bytes()); // pAcc
+}
+
+/// Modify NAV-SOL (0x01 0x06) during spoofing: replace ECEF coordinates + degrade status
+/// Payload: 52 bytes. gps_fix(10), ecefX(12), ecefY(16), ecefZ(20), pAcc(24), num_sv(47)
+pub fn modify_nav_sol_spoof(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: i32) {
+    if frame.len() < 60 { return; }
+    frame[6 + 12..6 + 16].copy_from_slice(&ecef_x.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&ecef_y.to_le_bytes());
+    frame[6 + 20..6 + 24].copy_from_slice(&ecef_z.to_le_bytes());
+    // Degrade accuracy (9999999 cm ≈ 100 km)
+    frame[6 + 24..6 + 28].copy_from_slice(&9_999_999u32.to_le_bytes()); // pAcc
+    // Zero velocity
+    frame[6 + 28..6 + 32].copy_from_slice(&0i32.to_le_bytes()); // ecefVX
+    frame[6 + 32..6 + 36].copy_from_slice(&0i32.to_le_bytes()); // ecefVY
+    frame[6 + 36..6 + 40].copy_from_slice(&0i32.to_le_bytes()); // ecefVZ
+    // Degrade status
+    frame[6 + 10] = 0;  // gps_fix = 0
+    frame[6 + 47] = 2;  // num_sv = 2
 }
 
 /// Extract position data from NAV-PVT payload
