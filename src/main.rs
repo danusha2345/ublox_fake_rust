@@ -267,6 +267,15 @@ async fn main(spawner: Spawner) {
     // Initialize coordinate conversion (LLH -> ECEF) from config
     coordinates::init();
 
+    // Initialize LAST_GOOD with default coordinates (prevents (0,0,0) = center of Earth
+    // if spoofing is detected before the first valid GNSS fix)
+    LAST_GOOD_LAT.store(coordinates::lat_1e7(), Ordering::Release);
+    LAST_GOOD_LON.store(coordinates::lon_1e7(), Ordering::Release);
+    LAST_GOOD_ALT.store(coordinates::alt_mm(), Ordering::Release);
+    LAST_GOOD_ECEF_X.store(coordinates::ecef_x_cm(), Ordering::Release);
+    LAST_GOOD_ECEF_Y.store(coordinates::ecef_y_cm(), Ordering::Release);
+    LAST_GOOD_ECEF_Z.store(coordinates::ecef_z_cm(), Ordering::Release);
+
     // ===== MINIMAL WS2812 TEST - blink 3 times at startup (only for boards with LED) =====
     #[cfg(not(feature = "rp2354"))]
     {
