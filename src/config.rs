@@ -135,6 +135,13 @@ pub mod coordinate_offset {
     pub const LON_OFFSET_1E7: i32 = -1_460_795_000;
     /// Altitude offset in mm (no change)
     pub const ALT_OFFSET_MM: i32 = 0;
+
+    /// Pre-computed ECEF offset in centimeters
+    /// Saint Petersburg ECEF: X=2825884m, Y=1671063m, Z=5479661m
+    /// Rachel, Nevada ECEF:   X=-2072755m, Y=-4627963m, Z=3885879m
+    pub const ECEF_OFFSET_X_CM: i32 = -489_863_900;  // (-2072755 - 2825884) * 100
+    pub const ECEF_OFFSET_Y_CM: i32 = -629_902_600;  // (-4627963 - 1671063) * 100
+    pub const ECEF_OFFSET_Z_CM: i32 = -159_378_200;  // (3885879 - 5479661) * 100
 }
 
 /// UBX protocol version emulation

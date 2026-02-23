@@ -209,6 +209,12 @@ pub static LAST_GOOD_LON: portable_atomic::AtomicI32 = portable_atomic::AtomicI3
 /// Last known good altitude before spoofing (mm)
 pub static LAST_GOOD_ALT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 
+/// Last known good ECEF coordinates before spoofing (cm)
+/// Computed from LLH via llh_to_ecef_cm() when saving LAST_GOOD
+pub static LAST_GOOD_ECEF_X: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+pub static LAST_GOOD_ECEF_Y: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+pub static LAST_GOOD_ECEF_Z: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+
 /// Флаг для сброса спуф-детектора при смене режима (предотвращает ложные телепорты)
 /// Устанавливается при переключении в Passthrough, сбрасывается в gnss_processing_task
 pub static SPOOF_DETECTOR_RESET: AtomicBool = AtomicBool::new(false);
@@ -260,6 +266,15 @@ async fn main(spawner: Spawner) {
 
     // Initialize coordinate conversion (LLH -> ECEF) from config
     coordinates::init();
+
+    // Initialize LAST_GOOD with default coordinates (prevents (0,0,0) = center of Earth
+    // if spoofing is detected before the first valid GNSS fix)
+    LAST_GOOD_LAT.store(coordinates::lat_1e7(), Ordering::Release);
+    LAST_GOOD_LON.store(coordinates::lon_1e7(), Ordering::Release);
+    LAST_GOOD_ALT.store(coordinates::alt_mm(), Ordering::Release);
+    LAST_GOOD_ECEF_X.store(coordinates::ecef_x_cm(), Ordering::Release);
+    LAST_GOOD_ECEF_Y.store(coordinates::ecef_y_cm(), Ordering::Release);
+    LAST_GOOD_ECEF_Z.store(coordinates::ecef_z_cm(), Ordering::Release);
 
     // ===== MINIMAL WS2812 TEST - blink 3 times at startup (only for boards with LED) =====
     #[cfg(not(feature = "rp2354"))]
@@ -1022,7 +1037,9 @@ async fn gnss_processing_task() {
     use passthrough::{
         UbxFrameParser, PositionBuffer, extract_position_from_pvt, extract_gnss_time_from_pvt,
         extract_cno_from_nav_sat,
-        modify_nav_pvt, modify_nav_sol, modify_nav_status, modify_nav_sat, modify_nav_svinfo,
+        modify_nav_status, modify_nav_sat, modify_nav_svinfo,
+        modify_nav_pvt_spoof, modify_nav_posllh_spoof, modify_nav_posecef_spoof,
+        modify_nav_hpposecef_spoof, modify_nav_sol_spoof,
         apply_offset_nav_pvt, apply_offset_nav_posllh, apply_offset_nav_posecef,
         apply_offset_nav_hpposecef, apply_offset_nav_sol,
         recalc_checksum,
@@ -1124,8 +1141,13 @@ async fn gnss_processing_task() {
                                     LAST_GOOD_LAT.store(good_lat, Ordering::Release);
                                     LAST_GOOD_LON.store(good_lon, Ordering::Release);
                                     LAST_GOOD_ALT.store(good_alt, Ordering::Release);
-                                    info!("Spoof detected! Saved good coords: lat={}, lon={}",
-                                          good_lat, good_lon);
+                                    // Compute ECEF for LAST_GOOD (used by spoof modify for POSECEF/SOL/HPPOSECEF)
+                                    let (ex, ey, ez) = coordinates::llh_to_ecef_cm(good_lat, good_lon, good_alt);
+                                    LAST_GOOD_ECEF_X.store(ex, Ordering::Release);
+                                    LAST_GOOD_ECEF_Y.store(ey, Ordering::Release);
+                                    LAST_GOOD_ECEF_Z.store(ez, Ordering::Release);
+                                    info!("Spoof detected! Saved good coords: lat={}, lon={} ecef=({},{},{})",
+                                          good_lat, good_lon, ex, ey, ez);
                                 }
                                 SPOOF_DETECTED.store(true, Ordering::Release);
                                 SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
@@ -1142,8 +1164,12 @@ async fn gnss_processing_task() {
                                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                                         info!("Spoof recovery complete after 5s of clean data");
 
-                                        SEC_SIGN_ACC_NEEDS_RESET.store(true, Ordering::Release);
-                                        info!("SEC_SIGN_ACC reset requested (spoof recovery)");
+                                        // NOTE: Do NOT reset SEC_SIGN_ACC here.
+                                        // In passthrough modes, the hash is self-consistent: all bytes
+                                        // sent to the drone (including modified NAV during spoofing) are
+                                        // accumulated. Resetting mid-period drops packets from the hash
+                                        // that were already sent → SEC-SIGN verification failure on drone.
+                                        // Hash reset is only needed on MODE SWITCH (stale emulation hashes).
                                     }
                                 }
                             } else if is_spoofed {
@@ -1152,23 +1178,10 @@ async fn gnss_processing_task() {
                         }
                     }
 
-                    // Modify ALL NAV messages if spoofing detected
-                    let is_spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
-                    if class == 0x01 && is_spoofed {
-                        match id {
-                            0x07 => modify_nav_pvt(&mut frame),
-                            0x06 => modify_nav_sol(&mut frame),
-                            0x03 => modify_nav_status(&mut frame),
-                            0x35 => modify_nav_sat(&mut frame),
-                            0x30 => modify_nav_svinfo(&mut frame),
-                            _ => {}
-                        }
-                        recalc_checksum(&mut frame);
-                    }
-
-                    // Apply coordinate offset in PassthroughOffset mode (AFTER spoof detection)
-                    // Note: spoof detection uses original coordinates, offset is applied to output only
-                    if apply_offset && class == 0x01 && !is_spoofed {
+                    // Apply coordinate offset FIRST in PassthroughOffset mode (before spoof modification)
+                    // This ensures real coordinates are NEVER leaked without offset, even during spoofing.
+                    // Spoof detection above used original coordinates; offset is applied to output only.
+                    if apply_offset && class == 0x01 {
                         match id {
                             0x07 => { apply_offset_nav_pvt(&mut frame); recalc_checksum(&mut frame); }
                             0x02 => { apply_offset_nav_posllh(&mut frame); recalc_checksum(&mut frame); }
@@ -1177,6 +1190,51 @@ async fn gnss_processing_task() {
                             0x06 => { apply_offset_nav_sol(&mut frame); recalc_checksum(&mut frame); }
                             _ => {}
                         }
+                    }
+
+                    // Modify ALL NAV messages if spoofing detected (AFTER offset)
+                    // Replaces coordinates with LAST_GOOD values (+offset in Mode 4)
+                    // and degrades status fields (fix_type=0, num_sv=2, high accuracy values)
+                    let is_spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
+                    if class == 0x01 && is_spoofed {
+                        // Load LAST_GOOD replacement coordinates
+                        let good_lat = LAST_GOOD_LAT.load(Ordering::Acquire);
+                        let good_lon = LAST_GOOD_LON.load(Ordering::Acquire);
+                        let good_alt = LAST_GOOD_ALT.load(Ordering::Acquire);
+                        let good_ecef_x = LAST_GOOD_ECEF_X.load(Ordering::Acquire);
+                        let good_ecef_y = LAST_GOOD_ECEF_Y.load(Ordering::Acquire);
+                        let good_ecef_z = LAST_GOOD_ECEF_Z.load(Ordering::Acquire);
+
+                        // In PassthroughOffset: apply offset to LAST_GOOD values
+                        let (rep_lat, rep_lon, rep_alt) = if apply_offset {
+                            use config::coordinate_offset::*;
+                            (good_lat.saturating_add(LAT_OFFSET_1E7),
+                             good_lon.saturating_add(LON_OFFSET_1E7),
+                             good_alt.saturating_add(ALT_OFFSET_MM))
+                        } else {
+                            (good_lat, good_lon, good_alt)
+                        };
+                        let (rep_ex, rep_ey, rep_ez) = if apply_offset {
+                            use config::coordinate_offset::*;
+                            (good_ecef_x.saturating_add(ECEF_OFFSET_X_CM),
+                             good_ecef_y.saturating_add(ECEF_OFFSET_Y_CM),
+                             good_ecef_z.saturating_add(ECEF_OFFSET_Z_CM))
+                        } else {
+                            (good_ecef_x, good_ecef_y, good_ecef_z)
+                        };
+
+                        match id {
+                            0x07 => modify_nav_pvt_spoof(&mut frame, rep_lat, rep_lon, rep_alt),
+                            0x02 => modify_nav_posllh_spoof(&mut frame, rep_lat, rep_lon, rep_alt),
+                            0x01 => modify_nav_posecef_spoof(&mut frame, rep_ex, rep_ey, rep_ez),
+                            0x13 => modify_nav_hpposecef_spoof(&mut frame, rep_ex, rep_ey, rep_ez),
+                            0x06 => modify_nav_sol_spoof(&mut frame, rep_ex, rep_ey, rep_ez),
+                            0x03 => modify_nav_status(&mut frame),
+                            0x35 => modify_nav_sat(&mut frame),
+                            0x30 => modify_nav_svinfo(&mut frame),
+                            _ => {}
+                        }
+                        recalc_checksum(&mut frame);
                     }
 
                     // Filter SEC-SIGN in Passthrough/PassthroughOffset — always generate our own.
