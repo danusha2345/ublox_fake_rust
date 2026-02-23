@@ -201,6 +201,8 @@ PassthroughOffset works like Passthrough (spoof detection enabled), but applies 
 
 **SEC-SIGN handling**: In both Passthrough and PassthroughOffset modes, we **always** generate our own SEC-SIGN (real GNSS SEC-SIGN filtered, hash accumulation always enabled, our timer always generates). This eliminates dirty hash problems (per-packet spoof checks causing partial accumulation) and timing gaps (phase mismatch between real GNSS timer and ours on spoof transitions).
 
+**Bug fix (Feb 2026)**: SEC-SIGN rejected in PassthroughOffset mode. Root cause: non-UBX data (NMEA sentences, garbage bytes from GNSS module boot) was forwarded through `GNSS_RX_CHANNEL` and accumulated into SHA256 hash by `uart0_tx_task`. The drone only hashes UBX frames → hash mismatch → signature rejected. Fix: (1) `gnss_processing_task` no longer forwards non-UBX data — `take_non_ubx_data()` drains buffer without sending to channel; (2) `uart0_tx_task` checks for UBX sync bytes (`0xB5 0x62`) before accumulating — non-UBX data is transmitted but not hashed (defense in depth).
+
 ### Spoof Detection in Passthrough Mode
 
 When in passthrough mode, the device parses incoming UBX frames and detects GPS spoofing:

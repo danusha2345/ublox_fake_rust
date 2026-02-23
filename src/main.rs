@@ -286,12 +286,12 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "rp2354"))]
     {
         use embassy_rp::pio::Pio;
-        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
+        use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
         use smart_leds::RGB8;
 
         let mut pio0 = Pio::new(p.PIO0, Irqs);
         let program = PioWs2812Program::new(&mut pio0.common);
-        let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
+        let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
 
         for _ in 0..3 {
             ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
@@ -500,11 +500,11 @@ async fn led_task(
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH1>,
     pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>,
 ) {
-    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Rgb};
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program, Grb};
     use smart_leds::RGB8;
 
     let program = PioWs2812Program::new(&mut pio.common);
-    let mut ws: PioWs2812<_, 0, 1, Rgb> = PioWs2812::with_color_order(&mut pio.common, pio.sm0, dma, pin, &program);
+    let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::with_color_order(&mut pio.common, pio.sm0, dma, pin, &program);
 
     // Faster tick for smooth blinking during spoof detection
     let mut ticker = Ticker::every(Duration::from_millis(100));
@@ -856,14 +856,23 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                         continue;
                                     }
                                 } else {
-                                    // Hold lock across send+accumulate to prevent race with sec_sign_timer_task
-                                    let mut acc = SEC_SIGN_ACC.lock().await;
-                                    if let Err(e) = tx.write_all(&buffered_msg).await {
-                                        error!("Passthrough TX error (buffered): {:?}", e);
-                                        continue;
-                                    }
-                                    if let Some(ref mut accumulator) = *acc {
-                                        accumulator.accumulate(&buffered_msg);
+                                    let is_ubx = buffered_msg.len() >= 2 && buffered_msg[0] == 0xB5 && buffered_msg[1] == 0x62;
+                                    if is_ubx {
+                                        // UBX frame: lock, send, accumulate hash
+                                        let mut acc = SEC_SIGN_ACC.lock().await;
+                                        if let Err(e) = tx.write_all(&buffered_msg).await {
+                                            error!("Passthrough TX error (buffered): {:?}", e);
+                                            continue;
+                                        }
+                                        if let Some(ref mut accumulator) = *acc {
+                                            accumulator.accumulate(&buffered_msg);
+                                        }
+                                    } else {
+                                        // Non-UBX data: send but do NOT accumulate in hash
+                                        if let Err(e) = tx.write_all(&buffered_msg).await {
+                                            error!("Passthrough TX error (buffered non-UBX): {:?}", e);
+                                            continue;
+                                        }
                                     }
                                 }
                                 DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -880,14 +889,23 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                 continue;
                             }
                         } else {
-                            // Hold lock across send+accumulate to prevent race with sec_sign_timer_task
-                            let mut acc = SEC_SIGN_ACC.lock().await;
-                            if let Err(e) = tx.write_all(&msg).await {
-                                error!("Passthrough TX error: {:?}", e);
-                                continue;
-                            }
-                            if let Some(ref mut accumulator) = *acc {
-                                accumulator.accumulate(&msg);
+                            let is_ubx = msg.len() >= 2 && msg[0] == 0xB5 && msg[1] == 0x62;
+                            if is_ubx {
+                                // UBX frame: lock, send, accumulate hash
+                                let mut acc = SEC_SIGN_ACC.lock().await;
+                                if let Err(e) = tx.write_all(&msg).await {
+                                    error!("Passthrough TX error: {:?}", e);
+                                    continue;
+                                }
+                                if let Some(ref mut accumulator) = *acc {
+                                    accumulator.accumulate(&msg);
+                                }
+                            } else {
+                                // Non-UBX data (NMEA, etc.): send but do NOT accumulate in hash
+                                if let Err(e) = tx.write_all(&msg).await {
+                                    error!("Passthrough TX error (non-UBX): {:?}", e);
+                                    continue;
+                                }
                             }
                         }
                         DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -1271,15 +1289,10 @@ async fn gnss_processing_task() {
                 }
             }
 
-            // Send accumulated non-UBX data (NMEA, RTCM, etc.)
+            // Drain non-UBX data (NMEA, RTCM, garbage) but do NOT forward it.
+            // Non-UBX bytes corrupt SHA256 hash for SEC-SIGN (drone only hashes UBX frames).
             if parser.is_idle() {
-                if let Some(non_ubx_data) = parser.take_non_ubx_data() {
-                    if GNSS_RX_CHANNEL.try_send(non_ubx_data).is_err() {
-                        warn!("GNSS_RX_CHANNEL full (non-UBX)!");
-                    } else {
-                        DIAG_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                let _ = parser.take_non_ubx_data();
             }
         }
         // Emulation mode: ignore raw data (uart0_tx_task generates its own)
