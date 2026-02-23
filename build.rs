@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let out = &PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
 
     // === Generate firmware version from git ===
     generate_version_info(out);
@@ -94,8 +94,8 @@ SECTIONS {
 "#)
     };
 
-    let mut f = File::create(out.join("memory.x")).unwrap();
-    f.write_all(memory_x.as_bytes()).unwrap();
+    let mut f = File::create(out.join("memory.x")).expect("failed to create memory.x");
+    f.write_all(memory_x.as_bytes()).expect("failed to write memory.x");
 
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=build.rs");
@@ -146,6 +146,6 @@ pub const FW_VERSION: &str = "{}";
         git_hash, git_dirty, cargo_version, fw_version
     );
 
-    let mut f = File::create(out.join("version.rs")).unwrap();
-    f.write_all(version_rs.as_bytes()).unwrap();
+    let mut f = File::create(out.join("version.rs")).expect("failed to create version.rs");
+    f.write_all(version_rs.as_bytes()).expect("failed to write version.rs");
 }

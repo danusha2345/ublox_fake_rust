@@ -49,7 +49,7 @@ Firmware version is automatically extracted from git at build time and stored in
 | Sector | Offset (4MB) | Offset (2MB) | Content |
 |--------|-------------|-------------|---------|
 | Last-2 | 0x3FE000 | 0x1FE000 | Mode data (ModeData) |
-| Last-3 | 0x3FC000 | 0x1FC000 | **Version data** |
+| Last-3 | 0x3FD000 | 0x1FD000 | **Version data** |
 
 **Version data format in flash** (37 bytes):
 | Offset | Size | Content |
@@ -60,11 +60,11 @@ Firmware version is automatically extracted from git at build time and stored in
 
 **Reading version from a flashed board** (via probe-rs):
 ```bash
-# RP2350 (4MB flash): version at 0x103FC000
-probe-rs read --chip RP2350 0x103FC000 37
+# RP2350 (4MB flash): version at 0x103FD000
+probe-rs read --chip RP2350 0x103FD000 37
 
-# RP2354 (2MB flash): version at 0x101FC000
-probe-rs read --chip RP2354 0x101FC000 37
+# RP2354 (2MB flash): version at 0x101FD000
+probe-rs read --chip RP2354 0x101FD000 37
 ```
 
 **Build-time regeneration**: `build.rs` watches `.git/HEAD` and `.git/index` — version updates automatically on new commits.
