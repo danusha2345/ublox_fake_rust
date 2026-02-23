@@ -1,4 +1,4 @@
-//! Flash storage for persistent mode
+//! Flash storage for persistent mode and firmware version
 
 use defmt::*;
 use embassy_rp::flash::{Async, Flash, ERASE_SIZE};
@@ -7,12 +7,18 @@ use embassy_rp::peripherals::FLASH;
 /// Magic value to identify valid flash data
 const FLASH_MAGIC: u32 = 0xDEADBEEF;
 
-/// Flash offset - second-to-last sector (автоматически вычисляется от размера памяти)
-/// Last sector causes erase to fail (end == FLASH_SIZE)
-/// Using second-to-last sector for safety
+/// Magic value for firmware version data
+const VERSION_MAGIC: u32 = 0x56455253; // "VERS" in ASCII
+
+/// Flash offset for mode data - second-to-last sector
 /// Для 4MB: 0x3FE000 (sector 1022 of 1024)
 /// Для 2MB: 0x1FE000 (sector 510 of 512)
 const FLASH_OFFSET: u32 = (crate::config::FLASH_SIZE_BYTES as u32) - (2 * ERASE_SIZE as u32);
+
+/// Flash offset for version data - third-to-last sector
+/// Для 4MB: 0x3FC000 (sector 1021 of 1024)
+/// Для 2MB: 0x1FC000 (sector 509 of 512)
+const VERSION_FLASH_OFFSET: u32 = (crate::config::FLASH_SIZE_BYTES as u32) - (3 * ERASE_SIZE as u32);
 
 /// Mode data stored in flash
 #[repr(C)]
@@ -75,6 +81,75 @@ pub fn load_mode(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic == FLASH_MAGIC {
             return Some(buf[4]);
+        }
+    }
+
+    None
+}
+
+/// Max firmware version string length stored in flash
+const VERSION_MAX_LEN: usize = 32;
+
+/// Version data layout in flash:
+///   [0..4]   magic (VERSION_MAGIC, LE)
+///   [4]      string length
+///   [5..37]  version string (up to 32 bytes, null-padded)
+/// Total: 37 bytes, padded to 256 for flash write alignment
+
+/// Save firmware version string to flash.
+/// Only writes if version differs from what's already stored — avoids unnecessary flash wear.
+pub fn save_version(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>, version: &str) -> bool {
+    // Check if already stored with same version
+    if let Some(stored) = load_version(flash) {
+        if stored.as_str() == version {
+            info!("Firmware version unchanged in flash: {}", version);
+            return true;
+        }
+    }
+
+    let version_bytes = version.as_bytes();
+    let len = version_bytes.len().min(VERSION_MAX_LEN);
+
+    let mut data = [0xFFu8; ERASE_SIZE];
+
+    // Write magic
+    data[0..4].copy_from_slice(&VERSION_MAGIC.to_le_bytes());
+    // Write string length
+    data[4] = len as u8;
+    // Write version string
+    data[5..5 + len].copy_from_slice(&version_bytes[..len]);
+
+    // Erase sector
+    if let Err(e) = flash.blocking_erase(VERSION_FLASH_OFFSET, VERSION_FLASH_OFFSET + ERASE_SIZE as u32) {
+        error!("Version flash erase failed: {:?}", e);
+        return false;
+    }
+
+    // Write data
+    if let Err(e) = flash.blocking_write(VERSION_FLASH_OFFSET, &data[..256]) {
+        error!("Version flash write failed: {:?}", e);
+        return false;
+    }
+
+    info!("Firmware version saved to flash: {}", version);
+    true
+}
+
+/// Load firmware version from flash, returns None if no valid data
+pub fn load_version(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>) -> Option<heapless::String<VERSION_MAX_LEN>> {
+    let mut buf = [0u8; 5 + VERSION_MAX_LEN]; // magic + len + string
+
+    if flash.blocking_read(VERSION_FLASH_OFFSET, &mut buf).is_ok() {
+        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic == VERSION_MAGIC {
+            let len = buf[4] as usize;
+            if len <= VERSION_MAX_LEN {
+                if let Ok(s) = core::str::from_utf8(&buf[5..5 + len]) {
+                    let mut result = heapless::String::new();
+                    let _ = result.push_str(s);
+                    return Some(result);
+                }
+            }
         }
     }
 

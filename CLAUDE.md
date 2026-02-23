@@ -32,8 +32,42 @@ rustup target add thumbv8m.main-none-eabihf  # RP2350
 
 ## Required Files
 
-- `build.rs` - Build script that auto-generates `memory.x` linker script (FLASH, RAM layout for RP2350/RP2354/RP2040)
+- `build.rs` - Build script that auto-generates `memory.x` linker script + firmware version from git
 - `.cargo/config.toml` - Target selection and linker flags
+
+## Firmware Version Storage
+
+Firmware version is automatically extracted from git at build time and stored in flash on the board.
+
+**How it works:**
+1. `build.rs` runs `git rev-parse --short HEAD` + dirty check → generates `$OUT_DIR/version.rs`
+2. Version format: `"0.1.0-a72ddc5"` or `"0.1.0-a72ddc5-dirty"` (Cargo.toml version + git hash)
+3. At startup, firmware writes version to flash (third-to-last sector), skips write if unchanged
+4. defmt log prints version at boot: `"Firmware version: 0.1.0-a72ddc5"`
+
+**Flash layout for version data** (sector = 4KB = `ERASE_SIZE`):
+| Sector | Offset (4MB) | Offset (2MB) | Content |
+|--------|-------------|-------------|---------|
+| Last-2 | 0x3FE000 | 0x1FE000 | Mode data (ModeData) |
+| Last-3 | 0x3FD000 | 0x1FD000 | **Version data** |
+
+**Version data format in flash** (37 bytes):
+| Offset | Size | Content |
+|--------|------|---------|
+| 0 | 4 | Magic `0x56455253` ("VERS", LE) |
+| 4 | 1 | String length |
+| 5 | 32 | Version string (null-padded) |
+
+**Reading version from a flashed board** (via probe-rs):
+```bash
+# RP2350 (4MB flash): version at 0x103FD000
+probe-rs read --chip RP2350 0x103FD000 37
+
+# RP2354 (2MB flash): version at 0x101FD000
+probe-rs read --chip RP2354 0x101FD000 37
+```
+
+**Build-time regeneration**: `build.rs` watches `.git/HEAD` and `.git/index` — version updates automatically on new commits.
 
 ## Build Commands
 
