@@ -1142,8 +1142,12 @@ async fn gnss_processing_task() {
                                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                                         info!("Spoof recovery complete after 5s of clean data");
 
-                                        SEC_SIGN_ACC_NEEDS_RESET.store(true, Ordering::Release);
-                                        info!("SEC_SIGN_ACC reset requested (spoof recovery)");
+                                        // NOTE: Do NOT reset SEC_SIGN_ACC here.
+                                        // In passthrough modes, the hash is self-consistent: all bytes
+                                        // sent to the drone (including modified NAV during spoofing) are
+                                        // accumulated. Resetting mid-period drops packets from the hash
+                                        // that were already sent → SEC-SIGN verification failure on drone.
+                                        // Hash reset is only needed on MODE SWITCH (stale emulation hashes).
                                     }
                                 }
                             } else if is_spoofed {
@@ -1152,7 +1156,22 @@ async fn gnss_processing_task() {
                         }
                     }
 
-                    // Modify ALL NAV messages if spoofing detected
+                    // Apply coordinate offset FIRST in PassthroughOffset mode (before spoof modification)
+                    // This ensures real coordinates are NEVER leaked without offset, even during spoofing.
+                    // Spoof detection above used original coordinates; offset is applied to output only.
+                    if apply_offset && class == 0x01 {
+                        match id {
+                            0x07 => { apply_offset_nav_pvt(&mut frame); recalc_checksum(&mut frame); }
+                            0x02 => { apply_offset_nav_posllh(&mut frame); recalc_checksum(&mut frame); }
+                            0x01 => { apply_offset_nav_posecef(&mut frame); recalc_checksum(&mut frame); }
+                            0x13 => { apply_offset_nav_hpposecef(&mut frame); recalc_checksum(&mut frame); }
+                            0x06 => { apply_offset_nav_sol(&mut frame); recalc_checksum(&mut frame); }
+                            _ => {}
+                        }
+                    }
+
+                    // Modify ALL NAV messages if spoofing detected (AFTER offset)
+                    // Modified fields (fix_type, flags, num_sv) are applied on top of offset coordinates
                     let is_spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
                     if class == 0x01 && is_spoofed {
                         match id {
@@ -1164,19 +1183,6 @@ async fn gnss_processing_task() {
                             _ => {}
                         }
                         recalc_checksum(&mut frame);
-                    }
-
-                    // Apply coordinate offset in PassthroughOffset mode (AFTER spoof detection)
-                    // Note: spoof detection uses original coordinates, offset is applied to output only
-                    if apply_offset && class == 0x01 && !is_spoofed {
-                        match id {
-                            0x07 => { apply_offset_nav_pvt(&mut frame); recalc_checksum(&mut frame); }
-                            0x02 => { apply_offset_nav_posllh(&mut frame); recalc_checksum(&mut frame); }
-                            0x01 => { apply_offset_nav_posecef(&mut frame); recalc_checksum(&mut frame); }
-                            0x13 => { apply_offset_nav_hpposecef(&mut frame); recalc_checksum(&mut frame); }
-                            0x06 => { apply_offset_nav_sol(&mut frame); recalc_checksum(&mut frame); }
-                            _ => {}
-                        }
                     }
 
                     // Filter SEC-SIGN in Passthrough/PassthroughOffset — always generate our own.
