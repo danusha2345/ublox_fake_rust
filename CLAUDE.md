@@ -573,6 +573,30 @@ A4 20 01
 
 **Security note**: This command exposes the private key, allowing key extraction from real DJI GNSS modules.
 
+## Diagnostic Mode (Per-Message Counters)
+
+Built-in diagnostic for analyzing UBX message flow in Passthrough modes. Disabled by default.
+
+**Enable**: Set `DIAG_MSG_DETAIL = true` in `src/main.rs` (~line 167), rebuild and flash.
+
+**What it provides** (output in `diag_stats_task` every 10 seconds):
+- Per-message-type RX counters (from GNSS on UART1): NAV-PVT, NAV-POSLLH, etc.
+- Per-message-type TX counters (to drone on UART0)
+- CFG-VALSET key=value logging (each key printed as `key={:#010x} val={}`)
+- Stored VALSET buffer (256 keys) — captures keys from boot, dumps on first diag cycle (survives probe-rs late attach)
+- VALSET packet counter in DIAG line
+
+**Modules** (in `src/main.rs`):
+- `diag_msg_counts` — 28 known UBX message types, atomic RX/TX counters, `log_and_reset()`
+- `diag_valset_store` — static buffer for CFG-VALSET keys, one-time dump via `log_stored()`
+
+**Air 3S baseline** (Feb 2026, verified):
+- 32 CFG-VALSET packets, 39 unique keys at boot
+- Drone enables: PVT, POSLLH, STATUS, DOP, VELNED, TIMEGPS, TIMEUTC, CLOCK, SAT, AOPSTATUS, MON-RF, RXM-RAWX, TIM-TP, NAV-SOL
+- Drone disables: NAV-POSECEF
+- TIM-TP and NAV-SOL: enabled by drone but GNSS module doesn't generate them (not in OTP)
+- Steady state: RX=TX for all types, 0% loss
+
 ## RAM/Flash Usage Comparison (vs C/FreeRTOS)
 
 | Metric | C/FreeRTOS | Rust/Embassy |

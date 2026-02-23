@@ -162,6 +162,201 @@ static DIAG_TX_PACKETS: AtomicU32 = AtomicU32::new(0);   // Packets sent to UART
 static DIAG_CHANNEL_DROPS: AtomicU32 = AtomicU32::new(0); // GNSS_RX_CHANNEL full drops
 static DIAG_LOCAL_BUF_DROPS: AtomicU32 = AtomicU32::new(0); // Local buffer overflow during SEC-SIGN
 static DIAG_SEC_SIGN_WAIT_MS: AtomicU32 = AtomicU32::new(0); // Last SEC-SIGN wait duration
+static DIAG_VALSET_COUNT: AtomicU32 = AtomicU32::new(0);     // CFG-VALSET messages received
+
+/// Enable detailed per-message-type counters and VALSET key logging (set to true to diagnose)
+const DIAG_MSG_DETAIL: bool = false;
+
+/// Temporary diagnostic: per-message-type counters
+mod diag_msg_counts {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use defmt::info;
+
+    // Index mapping for known message types
+    const NUM_TYPES: usize = 28;
+    // 0=NAV-POSECEF, 1=NAV-POSLLH, 2=NAV-STATUS, 3=NAV-DOP, 4=NAV-PVT,
+    // 5=NAV-VELECEF, 6=NAV-VELNED, 7=NAV-HPPOSECEF, 8=NAV-TIMEGPS, 9=NAV-TIMEUTC,
+    // 10=NAV-CLOCK, 11=NAV-TIMELS, 12=NAV-SVINFO, 13=NAV-SAT, 14=NAV-COV,
+    // 15=NAV-AOPSTATUS, 16=NAV-EOE, 17=NAV-SOL,
+    // 18=MON-HW, 19=MON-COMMS, 20=MON-RF, 21=MON-VER,
+    // 22=TIM-TP, 23=RXM-RAWX, 24=RXM-SFRBX, 25=SEC-SIGN, 26=SEC-UNIQID,
+    // 27=OTHER
+
+    static RX_COUNTS: [AtomicU32; NUM_TYPES] = {
+        const ZERO: AtomicU32 = AtomicU32::new(0);
+        [ZERO; NUM_TYPES]
+    };
+    static TX_COUNTS: [AtomicU32; NUM_TYPES] = {
+        const ZERO: AtomicU32 = AtomicU32::new(0);
+        [ZERO; NUM_TYPES]
+    };
+
+    fn msg_index(class: u8, id: u8) -> usize {
+        match (class, id) {
+            (0x01, 0x01) => 0,  // NAV-POSECEF
+            (0x01, 0x02) => 1,  // NAV-POSLLH
+            (0x01, 0x03) => 2,  // NAV-STATUS
+            (0x01, 0x04) => 3,  // NAV-DOP
+            (0x01, 0x07) => 4,  // NAV-PVT
+            (0x01, 0x11) => 5,  // NAV-VELECEF
+            (0x01, 0x12) => 6,  // NAV-VELNED
+            (0x01, 0x13) => 7,  // NAV-HPPOSECEF
+            (0x01, 0x20) => 8,  // NAV-TIMEGPS
+            (0x01, 0x21) => 9,  // NAV-TIMEUTC
+            (0x01, 0x22) => 10, // NAV-CLOCK
+            (0x01, 0x26) => 11, // NAV-TIMELS
+            (0x01, 0x30) => 12, // NAV-SVINFO
+            (0x01, 0x35) => 13, // NAV-SAT
+            (0x01, 0x36) => 14, // NAV-COV
+            (0x01, 0x60) => 15, // NAV-AOPSTATUS
+            (0x01, 0x61) => 16, // NAV-EOE
+            (0x01, 0x06) => 17, // NAV-SOL
+            (0x0A, 0x09) => 18, // MON-HW
+            (0x0A, 0x36) => 19, // MON-COMMS
+            (0x0A, 0x38) => 20, // MON-RF
+            (0x0A, 0x04) => 21, // MON-VER
+            (0x0D, 0x01) => 22, // TIM-TP
+            (0x02, 0x15) => 23, // RXM-RAWX
+            (0x02, 0x13) => 24, // RXM-SFRBX
+            (0x27, 0x04) => 25, // SEC-SIGN
+            (0x27, 0x03) => 26, // SEC-UNIQID
+            _ => 27,            // OTHER
+        }
+    }
+
+    fn msg_name(idx: usize) -> &'static str {
+        match idx {
+            0 => "POSECEF",
+            1 => "POSLLH",
+            2 => "STATUS",
+            3 => "DOP",
+            4 => "PVT",
+            5 => "VELECEF",
+            6 => "VELNED",
+            7 => "HPPOSECEF",
+            8 => "TIMEGPS",
+            9 => "TIMEUTC",
+            10 => "CLOCK",
+            11 => "TIMELS",
+            12 => "SVINFO",
+            13 => "SAT",
+            14 => "COV",
+            15 => "AOPSTATUS",
+            16 => "EOE",
+            17 => "SOL",
+            18 => "MON-HW",
+            19 => "MON-COMMS",
+            20 => "MON-RF",
+            21 => "MON-VER",
+            22 => "TIM-TP",
+            23 => "RXM-RAWX",
+            24 => "RXM-SFRBX",
+            25 => "SEC-SIGN",
+            26 => "SEC-UNIQID",
+            27 => "OTHER",
+            _ => "?",
+        }
+    }
+
+    pub fn inc_rx(class: u8, id: u8) {
+        RX_COUNTS[msg_index(class, id)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_tx(class: u8, id: u8) {
+        TX_COUNTS[msg_index(class, id)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn log_and_reset() {
+        // Dump stored VALSET keys (one-time, captured at boot)
+        super::log_stored_valset();
+
+        // Collect non-zero RX counts
+        let mut has_rx = false;
+        for i in 0..NUM_TYPES {
+            let v = RX_COUNTS[i].swap(0, Ordering::Relaxed);
+            if v > 0 {
+                if !has_rx {
+                    info!("=== MSG RX ===");
+                    has_rx = true;
+                }
+                info!("  {}={}", msg_name(i), v);
+            }
+        }
+
+        // Collect non-zero TX counts
+        let mut has_tx = false;
+        for i in 0..NUM_TYPES {
+            let v = TX_COUNTS[i].swap(0, Ordering::Relaxed);
+            if v > 0 {
+                if !has_tx {
+                    info!("=== MSG TX ===");
+                    has_tx = true;
+                }
+                info!("  {}={}", msg_name(i), v);
+            }
+        }
+    }
+}
+
+/// Stored CFG-VALSET keys from boot (survives until diag_stats_task prints them)
+mod diag_valset_store {
+    use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+    use defmt::info;
+
+    const MAX_KEYS: usize = 256;
+
+    struct ValsetEntry {
+        key: [u8; 4],
+        val: [u8; 4],
+    }
+
+    static mut VALSET_BUF: [ValsetEntry; MAX_KEYS] = {
+        const EMPTY: ValsetEntry = ValsetEntry { key: [0; 4], val: [0; 4] };
+        [EMPTY; MAX_KEYS]
+    };
+    static VALSET_COUNT: AtomicU16 = AtomicU16::new(0);
+    static VALSET_DUMPED: AtomicBool = AtomicBool::new(false);
+
+    pub fn store(key: u32, val: u32) {
+        let idx = VALSET_COUNT.load(Ordering::Relaxed) as usize;
+        if idx < MAX_KEYS {
+            unsafe {
+                VALSET_BUF[idx].key = key.to_le_bytes();
+                VALSET_BUF[idx].val = val.to_le_bytes();
+            }
+            VALSET_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn log_stored() {
+        if VALSET_DUMPED.swap(true, Ordering::Relaxed) {
+            return; // Already dumped
+        }
+        let count = VALSET_COUNT.load(Ordering::Relaxed) as usize;
+        if count == 0 {
+            VALSET_DUMPED.store(false, Ordering::Relaxed); // Try again next cycle
+            return;
+        }
+        info!("=== STORED VALSET ({} keys) ===", count);
+        for i in 0..count {
+            let (key, val) = unsafe {
+                (
+                    u32::from_le_bytes(VALSET_BUF[i].key),
+                    u32::from_le_bytes(VALSET_BUF[i].val),
+                )
+            };
+            info!("  key={:#010x} val={}", key, val);
+        }
+    }
+}
+
+fn store_valset_key(key: u32, val: u32) {
+    diag_valset_store::store(key, val);
+}
+
+fn log_stored_valset() {
+    diag_valset_store::log_stored();
+}
 
 /// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(2);
@@ -875,6 +1070,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                         }
                                     }
                                 }
+                                if DIAG_MSG_DETAIL && buffered_msg.len() >= 4 && buffered_msg[0] == 0xB5 && buffered_msg[1] == 0x62 {
+                                    diag_msg_counts::inc_tx(buffered_msg[2], buffered_msg[3]);
+                                }
                                 DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
                             }
                             continue; // Skip normal msg handling (already processed)
@@ -907,6 +1105,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                     continue;
                                 }
                             }
+                        }
+                        if DIAG_MSG_DETAIL && msg.len() >= 4 && msg[0] == 0xB5 && msg[1] == 0x62 {
+                            diag_msg_counts::inc_tx(msg[2], msg[3]);
                         }
                         DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
                     }
@@ -952,8 +1153,15 @@ async fn diag_stats_task() {
         // Calculate in-flight packets (RX - TX)
         let in_flight = rx_pkts.saturating_sub(tx_pkts);
 
-        info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms ===",
-              rx_pkts, tx_pkts, in_flight, ch_drops, buf_drops, sec_wait);
+        if DIAG_MSG_DETAIL {
+            let valset_cnt = DIAG_VALSET_COUNT.load(Ordering::Relaxed);
+            info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms valset={} ===",
+                  rx_pkts, tx_pkts, in_flight, ch_drops, buf_drops, sec_wait, valset_cnt);
+            diag_msg_counts::log_and_reset();
+        } else {
+            info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms ===",
+                  rx_pkts, tx_pkts, in_flight, ch_drops, buf_drops, sec_wait);
+        }
     }
 }
 
@@ -1132,6 +1340,7 @@ async fn gnss_processing_task() {
                     let class = frame[2];
                     let id = frame[3];
                     let now_ms = embassy_time::Instant::now().as_millis() as u32;
+                    if DIAG_MSG_DETAIL { diag_msg_counts::inc_rx(class, id); }
 
                     // Extract CNO values from NAV-SAT (0x01, 0x35)
                     if class == 0x01 && id == 0x35 && frame.len() >= 14 {
@@ -1567,12 +1776,17 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
                 DRONE_DETECTED.store(true, Ordering::Release);
             }
 
+            if DIAG_MSG_DETAIL { DIAG_VALSET_COUNT.fetch_add(1, Ordering::Relaxed); }
             info!("CFG-VALSET received with {} keys", keys.len());
 
             // Process all keys (message output starts on CFG-RST)
             {
                 let mut flags = MSG_FLAGS_STATE.lock().await;
                 for &(key, val) in keys.iter() {
+                    if DIAG_MSG_DETAIL {
+                        info!("  VALSET key={:#010x} val={}", key, val);
+                        store_valset_key(key, val);
+                    }
                     // Update message flags for MSGOUT keys
                     update_flag_from_valset_key(&mut flags, key, val);
                     // Process rate and config keys (baudrate, measurement period)
