@@ -16,8 +16,8 @@ const VERSION_MAGIC: u32 = 0x56455253; // "VERS" in ASCII
 const FLASH_OFFSET: u32 = (crate::config::FLASH_SIZE_BYTES as u32) - (2 * ERASE_SIZE as u32);
 
 /// Flash offset for version data - third-to-last sector
-/// Для 4MB: 0x3FC000 (sector 1021 of 1024)
-/// Для 2MB: 0x1FC000 (sector 509 of 512)
+/// Для 4MB: 0x3FD000 (sector 1021 of 1024)
+/// Для 2MB: 0x1FD000 (sector 509 of 512)
 const VERSION_FLASH_OFFSET: u32 = (crate::config::FLASH_SIZE_BYTES as u32) - (3 * ERASE_SIZE as u32);
 
 /// Mode data stored in flash
