@@ -960,12 +960,13 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                 // Use timeout to limit blocking time to 100ms for mode switching check
                 match embassy_time::with_timeout(
                     Duration::from_millis(100),
-                    select(
+                    select3(
                         SEC_SIGN_RESULT.receive(),
                         GNSS_RX_CHANNEL.receive(),
+                        TX_CHANNEL.receive(),
                     )
                 ).await {
-                    Ok(Either::First(result)) => {
+                    Ok(Either3::First(result)) => {
                         // SEC-SIGN computed - send it
                         let sec_sign_msg = SecSign {
                             version: 0x01,
@@ -986,7 +987,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                     }
-                    Ok(Either::Second(msg)) => {
+                    Ok(Either3::Second(msg)) => {
                         // If SEC-SIGN is in progress, buffer packets locally while waiting
                         // This prevents GNSS_RX_CHANNEL overflow during ~59ms ECDSA computation
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
@@ -1111,6 +1112,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         }
                         DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
                     }
+                    Ok(Either3::Third(_)) => {
+                        // Drain TX_CHANNEL (ACK/poll responses — real GNSS handles drone commands)
+                    }
                     Err(_) => {
                         // Timeout - just loop to check mode
                     }
@@ -1119,13 +1123,16 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
             OperatingMode::PassthroughRaw => {
                 // Raw passthrough: just forward without any processing
                 // Use timeout to allow checking mode changes even if no data arrives
-                match embassy_time::with_timeout(Duration::from_millis(100), GNSS_RX_CHANNEL.receive()).await {
-                    Ok(msg) => {
+                match embassy_time::with_timeout(Duration::from_millis(100), select(GNSS_RX_CHANNEL.receive(), TX_CHANNEL.receive())).await {
+                    Ok(Either::First(msg)) => {
                         if let Err(e) = tx.write_all(&msg).await {
                             error!("PassthroughRaw TX error: {:?}", e);
                         } else {
                             DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+                    Ok(Either::Second(_)) => {
+                        // Drain TX_CHANNEL (ACK/poll responses not needed in raw mode)
                     }
                     Err(_) => {
                         // Timeout, loop to check mode again
@@ -1421,13 +1428,18 @@ async fn gnss_processing_task() {
                     // This ensures real coordinates are NEVER leaked without offset, even during spoofing.
                     // Spoof detection above used original coordinates; offset is applied to output only.
                     if apply_offset && class == 0x01 {
+                        let mut offset_applied = true;
                         match id {
-                            0x07 => { apply_offset_nav_pvt(&mut frame); recalc_checksum(&mut frame); }
-                            0x02 => { apply_offset_nav_posllh(&mut frame); recalc_checksum(&mut frame); }
-                            0x01 => { apply_offset_nav_posecef(&mut frame); recalc_checksum(&mut frame); }
-                            0x13 => { apply_offset_nav_hpposecef(&mut frame); recalc_checksum(&mut frame); }
-                            0x06 => { apply_offset_nav_sol(&mut frame); recalc_checksum(&mut frame); }
-                            _ => {}
+                            0x07 => apply_offset_nav_pvt(&mut frame),
+                            0x02 => apply_offset_nav_posllh(&mut frame),
+                            0x01 => apply_offset_nav_posecef(&mut frame),
+                            0x13 => apply_offset_nav_hpposecef(&mut frame),
+                            0x06 => apply_offset_nav_sol(&mut frame),
+                            _ => { offset_applied = false; }
+                        }
+                        // Skip checksum if spoofed — spoof handler below recalculates after coordinate replacement
+                        if offset_applied && !SPOOF_DETECTED.load(Ordering::Acquire) {
+                            recalc_checksum(&mut frame);
                         }
                     }
 

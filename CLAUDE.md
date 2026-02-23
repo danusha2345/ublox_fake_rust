@@ -112,7 +112,7 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 ### Core0 Tasks (src/main.rs)
 | Task | Rate | Purpose |
 |------|------|---------|
-| `uart0_tx_task` | async | Sends UBX messages from TX_CHANNEL, accumulates SHA256 for SEC-SIGN |
+| `uart0_tx_task` | async | Sends UBX messages from TX_CHANNEL (Emulation) or GNSS_RX_CHANNEL (Passthrough), accumulates SHA256 for SEC-SIGN. Drains TX_CHANNEL in all Passthrough modes (ACK/poll responses discarded — real GNSS handles drone commands) |
 | `uart0_rx_task` | async | Parses incoming UBX commands, updates MSG_FLAGS |
 | `uart1_rx_task` | async | Fast UART1 read, forwards raw chunks to RAW_RX_CHANNEL (minimal processing to prevent overrun) |
 | `gnss_processing_task` | async | Parses UBX frames from RAW_RX_CHANNEL, spoof detection, forwards to GNSS_RX_CHANNEL |
@@ -197,7 +197,7 @@ PassthroughOffset works like Passthrough (spoof detection enabled), but applies 
 
 **Important**: Spoof detection analyzes original (unmodified) coordinates. Offset is applied only to output.
 
-**Offset + spoofing order** (Feb 2026 fix): Offset is applied ALWAYS (even during spoofing), BEFORE spoof modification. This prevents real coordinates from leaking without offset. During spoofing, LAST_GOOD coordinates also get offset applied before being written into NAV messages.
+**Offset + spoofing order** (Feb 2026 fix): Offset is applied ALWAYS (even during spoofing), BEFORE spoof modification. This prevents real coordinates from leaking without offset. During spoofing, LAST_GOOD coordinates also get offset applied before being written into NAV messages. Checksum is recalculated only once: after offset (if no spoofing) or after spoof modification (which overwrites offset coordinates anyway).
 
 **SEC-SIGN handling**: In both Passthrough and PassthroughOffset modes, we **always** generate our own SEC-SIGN (real GNSS SEC-SIGN filtered, hash accumulation always enabled, our timer always generates). This eliminates dirty hash problems (per-packet spoof checks causing partial accumulation) and timing gaps (phase mismatch between real GNSS timer and ours on spoof transitions).
 
