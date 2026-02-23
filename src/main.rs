@@ -1053,12 +1053,12 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                 } else {
                                     let is_ubx = buffered_msg.len() >= 2 && buffered_msg[0] == 0xB5 && buffered_msg[1] == 0x62;
                                     if is_ubx {
-                                        // UBX frame: lock, send, accumulate hash
-                                        let mut acc = SEC_SIGN_ACC.lock().await;
+                                        // UBX frame: send first, then lock briefly for hash accumulate
                                         if let Err(e) = tx.write_all(&buffered_msg).await {
                                             error!("Passthrough TX error (buffered): {:?}", e);
                                             continue;
                                         }
+                                        let mut acc = SEC_SIGN_ACC.lock().await;
                                         if let Some(ref mut accumulator) = *acc {
                                             accumulator.accumulate(&buffered_msg);
                                         }
@@ -1089,12 +1089,12 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         } else {
                             let is_ubx = msg.len() >= 2 && msg[0] == 0xB5 && msg[1] == 0x62;
                             if is_ubx {
-                                // UBX frame: lock, send, accumulate hash
-                                let mut acc = SEC_SIGN_ACC.lock().await;
+                                // UBX frame: send first, then lock briefly for hash accumulate
                                 if let Err(e) = tx.write_all(&msg).await {
                                     error!("Passthrough TX error: {:?}", e);
                                     continue;
                                 }
+                                let mut acc = SEC_SIGN_ACC.lock().await;
                                 if let Some(ref mut accumulator) = *acc {
                                     accumulator.accumulate(&msg);
                                 }

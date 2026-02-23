@@ -502,6 +502,8 @@ Critical synchronization points:
 - `uart_tx_task` waits for `SEC_SIGN_RESULT` signal when flag is set
 - Flag is cleared by `uart_tx_task` AFTER sending SEC-SIGN message
 
+**Bug fix (Feb 2026)**: SEC-SIGN timer misses in Passthrough modes. `sec_sign_timer_task` uses `Ticker::every(2000ms)` but blocked on `SEC_SIGN_ACC.lock().await` while `uart0_tx_task` held the mutex during slow UART `write_all()` (~10-50ms per packet). Result: only 55% of SEC-SIGN at 2s interval, mean 3.78s (all intervals exact multiples of 2s: 250×2s, 104×4s, 44×6s...). Fix: reorder operations in `uart0_tx_task` — `write_all()` first (no lock), then `lock().await` + `accumulate()` (~microseconds). Safe because `SEC_SIGN_IN_PROGRESS` flag already prevents other tasks from sending during hash capture.
+
 **Hash accumulation**: ALL transmitted UBX messages are accumulated except SEC-SIGN itself (0x27, 0x04). This includes:
 - All NAV-* messages (PVT, POSECEF, STATUS, DOP, SAT, EOE, etc.)
 - All MON-* messages (HW, RF, COMMS, VER)
