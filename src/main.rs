@@ -557,8 +557,8 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "rp2354")]
     let _led_cathode = Output::new(p.PIN_12, Level::Low); // Постоянно LOW (земля)
 
-    // Spawn Core1 for LED (if available), SEC-SIGN computation, and MON messages
-    // MON runs on Core1 to balance load (Core0 handles NAV at higher rate)
+    // Spawn Core1 for LED (if available) and SEC-SIGN computation
+    // MON moved to Core0 to avoid yield_now() contention with ECDSA on Core1
     static EXECUTOR1: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
     #[cfg(not(feature = "rp2354"))]
@@ -570,7 +570,6 @@ async fn main(spawner: Spawner) {
             executor1.run(|spawner: embassy_executor::Spawner| {
                 spawner.must_spawn(led_task(pio0, dma_ch1, led_pin));
                 spawner.must_spawn(sec_sign_compute_task());
-                spawner.must_spawn(mon_message_task());
             });
         },
     );
@@ -584,7 +583,6 @@ async fn main(spawner: Spawner) {
             executor1.run(|spawner: embassy_executor::Spawner| {
                 spawner.must_spawn(simple_led_task(led_anode));
                 spawner.must_spawn(sec_sign_compute_task());
-                spawner.must_spawn(mon_message_task());
             });
         },
     );
@@ -660,8 +658,8 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(gnss_processing_task()); // Separated from uart1_rx to prevent overrun
 
     // Emulation tasks (check MODE internally, skip work in passthrough)
-    // Note: mon_message_task runs on Core1 for load balancing
     spawner.must_spawn(nav_message_task());
+    spawner.must_spawn(mon_message_task());
     spawner.must_spawn(sec_sign_timer_task());
 
     // Button task for mode switching (no reboot!)
@@ -928,7 +926,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             continue;
                         }
 
-                        // Hold lock across send+accumulate to prevent race with sec_sign_timer_task hash capture
                         // Invariant: hash ONLY messages that were actually sent
                         let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                         if is_sec_sign {
@@ -938,12 +935,13 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                 continue;
                             }
                         } else {
-                            // Lock across both: timer can't capture hash mid-operation
-                            let mut acc = SEC_SIGN_ACC.lock().await;
+                            // Send first, then lock briefly for accumulation (same pattern as Passthrough fix)
+                            // SEC_SIGN_IN_PROGRESS flag prevents new messages during hash capture
                             if let Err(e) = tx.write_all(&msg).await {
                                 error!("UART TX error: {:?}", e);
-                                continue; // lock drops, NOT accumulated
+                                continue;
                             }
+                            let mut acc = SEC_SIGN_ACC.lock().await;
                             if let Some(ref mut accumulator) = *acc {
                                 accumulator.accumulate(&msg);
                             }

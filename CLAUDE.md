@@ -117,6 +117,7 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 | `uart1_rx_task` | async | Fast UART1 read, forwards raw chunks to RAW_RX_CHANNEL (minimal processing to prevent overrun) |
 | `gnss_processing_task` | async | Parses UBX frames from RAW_RX_CHANNEL, spoof detection, forwards to GNSS_RX_CHANNEL |
 | `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (uses Timer::at for drift-free timing) |
+| `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS (moved from Core1 to avoid yield_now contention with ECDSA) |
 | `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1, waits via SEC_SIGN_DONE Signal |
 | `button_task` | async | Mode selection by click count (1/2/3/4 clicks → Emulation/Passthrough/Raw/Offset) |
 
@@ -126,7 +127,6 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 | `led_task` (RP2350) | 100ms | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, red=spoof) |
 | `simple_led_task` (RP2354) | 50ms | Simple GPIO LED blink code (1-4 blinks = mode number, fast blink = spoof) |
 | `sec_sign_compute_task` | async | ECDSA signature computation (CPU intensive) |
-| `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS |
 
 ### Module Structure
 - `src/ubx/` - UBX protocol implementation
@@ -503,6 +503,8 @@ Critical synchronization points:
 - Flag is cleared by `uart_tx_task` AFTER sending SEC-SIGN message
 
 **Bug fix (Feb 2026)**: SEC-SIGN timer misses in Passthrough modes. `sec_sign_timer_task` uses `Ticker::every(2000ms)` but blocked on `SEC_SIGN_ACC.lock().await` while `uart0_tx_task` held the mutex during slow UART `write_all()` (~10-50ms per packet). Result: only 55% of SEC-SIGN at 2s interval, mean 3.78s (all intervals exact multiples of 2s: 250×2s, 104×4s, 44×6s...). Fix: reorder operations in `uart0_tx_task` — `write_all()` first (no lock), then `lock().await` + `accumulate()` (~microseconds). Safe because `SEC_SIGN_IN_PROGRESS` flag already prevents other tasks from sending during hash capture.
+
+**Bug fix (Feb 2026 #2)**: Same lock-during-write issue existed in Emulation mode. `uart0_tx_task` held `SEC_SIGN_ACC` lock during `write_all()` (1-5ms per message, ~15-20 messages per 200ms NAV cycle → 30-60ms lock contention per cycle). Over 2s SEC-SIGN period: 15-30% probability timer hits locked mutex. Fix: same reorder as Passthrough — `write_all()` first, then brief `lock().await` + `accumulate()`. Also moved `mon_message_task` from Core1 to Core0 to eliminate `yield_now()` contention with `sec_sign_compute_task` on Core1.
 
 **Hash accumulation**: ALL transmitted UBX messages are accumulated except SEC-SIGN itself (0x27, 0x04). This includes:
 - All NAV-* messages (PVT, POSECEF, STATUS, DOP, SAT, EOE, etc.)
