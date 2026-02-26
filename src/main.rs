@@ -486,7 +486,7 @@ async fn main(spawner: Spawner) {
     // FORCE_KEY_EXTRACT debug flag.
     // If triggered → run PIO extraction BEFORE UART init (GPIO0/GPIO5 free).
     // ========================================================================
-    let extracted_key = {
+    let (extracted_key, extraction_attempted) = {
         let mut flash_tmp = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
         let request = flash_storage::load_and_clear_extract_request(&mut flash_tmp);
         drop(flash_tmp);
@@ -501,14 +501,14 @@ async fn main(spawner: Spawner) {
             info!("KEY EXTRACT: running extraction (request={}, force={})", request, FORCE_KEY_EXTRACT);
             let key = key_extract::extract(p.PIO1, p.PIN_1, p.UART1, p.PIN_5).await;
             let _p = unsafe { embassy_rp::Peripherals::steal() };
-            key
+            (key, true)
         } else {
-            None
+            (None, false)
         }
     };
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
-    // ===== MINIMAL WS2812 TEST - blink 3 times at startup (only for boards with LED) =====
+    // ===== LED feedback: extraction result or startup blink =====
     #[cfg(not(feature = "rp2354"))]
     {
         use embassy_rp::pio::Pio;
@@ -519,14 +519,29 @@ async fn main(spawner: Spawner) {
         let program = PioWs2812Program::new(&mut pio0.common);
         let mut ws: PioWs2812<_, 0, 1, Grb> = PioWs2812::with_color_order(&mut pio0.common, pio0.sm0, p.DMA_CH1, p.PIN_25, &program);
 
-        for _ in 0..3 {
-            ws.write(&[RGB8::new(0, 50, 0)]).await; // Green
-            Timer::after(Duration::from_millis(200)).await;
-            ws.write(&[RGB8::new(0, 0, 0)]).await; // Off
-            Timer::after(Duration::from_millis(200)).await;
+        if extraction_attempted {
+            let color = if extracted_key.is_some() {
+                RGB8::new(0, 50, 0) // Green = success
+            } else {
+                RGB8::new(50, 0, 0) // Red = failure
+            };
+            for _ in 0..5 {
+                ws.write(&[color]).await;
+                Timer::after(Duration::from_millis(100)).await;
+                ws.write(&[RGB8::new(0, 0, 0)]).await;
+                Timer::after(Duration::from_millis(100)).await;
+            }
+        } else {
+            // Normal startup: 3x green blink
+            for _ in 0..3 {
+                ws.write(&[RGB8::new(0, 50, 0)]).await;
+                Timer::after(Duration::from_millis(200)).await;
+                ws.write(&[RGB8::new(0, 0, 0)]).await;
+                Timer::after(Duration::from_millis(200)).await;
+            }
         }
     }
-    // ===== END TEST =====
+    // ===== END LED feedback =====
 
     // Re-init peripherals (PIO0 was consumed by test) - only needed when LED test runs
     #[cfg(not(feature = "rp2354"))]
@@ -604,9 +619,20 @@ async fn main(spawner: Spawner) {
 
     // Simple GPIO LED for RP2354: GPIO11 (anode), GPIO12 (cathode/ground)
     #[cfg(feature = "rp2354")]
-    let led_anode = Output::new(p.PIN_11, Level::Low); // LED выключен при старте
+    let mut led_anode = Output::new(p.PIN_11, Level::Low);
     #[cfg(feature = "rp2354")]
-    let _led_cathode = Output::new(p.PIN_12, Level::Low); // Постоянно LOW (земля)
+    let _led_cathode = Output::new(p.PIN_12, Level::Low);
+
+    // RP2354 extraction LED feedback: 5x fast blink
+    #[cfg(feature = "rp2354")]
+    if extraction_attempted {
+        for _ in 0..5 {
+            led_anode.set_high();
+            Timer::after(Duration::from_millis(100)).await;
+            led_anode.set_low();
+            Timer::after(Duration::from_millis(100)).await;
+        }
+    }
 
     // Spawn Core1 for LED (if available) and SEC-SIGN computation
     // MON moved to Core0 to avoid yield_now() contention with ECDSA on Core1
