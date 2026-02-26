@@ -168,6 +168,9 @@ static DIAG_VALSET_COUNT: AtomicU32 = AtomicU32::new(0);     // CFG-VALSET messa
 /// Enable detailed per-message-type counters and VALSET key logging (set to true to diagnose)
 const DIAG_MSG_DETAIL: bool = false;
 
+/// Force key extraction on every boot (for SWD debugging, bypasses button/flash flag)
+const FORCE_KEY_EXTRACT: bool = false;
+
 /// Temporary diagnostic: per-message-type counters
 mod diag_msg_counts {
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -479,8 +482,9 @@ async fn main(spawner: Spawner) {
     LAST_GOOD_ECEF_Z.store(coordinates::ecef_z_cm(), Ordering::Release);
 
     // ========================================================================
-    // Key extraction: check flash flag (set by long-press reboot).
-    // If flag set → run PIO extraction BEFORE UART init (GPIO0/GPIO5 free).
+    // Key extraction: check flash flag (set by long-press reboot) or
+    // FORCE_KEY_EXTRACT debug flag.
+    // If triggered → run PIO extraction BEFORE UART init (GPIO0/GPIO5 free).
     // ========================================================================
     let extracted_key = {
         let mut flash_tmp = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
@@ -488,7 +492,13 @@ async fn main(spawner: Spawner) {
         drop(flash_tmp);
         let p = unsafe { embassy_rp::Peripherals::steal() };
 
-        if request {
+        let should_extract = request || FORCE_KEY_EXTRACT;
+        if FORCE_KEY_EXTRACT {
+            warn!("KEY EXTRACT: FORCE_KEY_EXTRACT=true (debug mode)");
+        }
+
+        if should_extract {
+            info!("KEY EXTRACT: running extraction (request={}, force={})", request, FORCE_KEY_EXTRACT);
             let key = key_extract::extract(p.PIO1, p.PIN_0, p.PIN_5).await;
             let _p = unsafe { embassy_rp::Peripherals::steal() };
             key
@@ -552,14 +562,20 @@ async fn main(spawner: Spawner) {
 
         // Load previously extracted key from flash (if any)
         if let Some(key) = flash_storage::load_key(&mut flash) {
-            info!("Loaded extracted private key from flash");
+            info!("Loaded extracted private key from flash:");
+            info!("  key[0..12]:  {:02x}", &key[..12]);
+            info!("  key[12..24]: {:02x}", &key[12..24]);
             unsafe { sec_sign::set_flash_key(key); }
+        } else {
+            info!("No extracted key in flash (using hardcoded)");
         }
 
         // Save freshly extracted key (from key extraction mode at boot)
         if let Some(ref key) = extracted_key {
             if flash_storage::save_key(&mut flash, key) {
                 info!("Freshly extracted key saved to flash");
+            } else {
+                error!("FAILED to save extracted key to flash!");
             }
             unsafe { sec_sign::set_flash_key(*key); }
         }
