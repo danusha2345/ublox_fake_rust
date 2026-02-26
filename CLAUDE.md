@@ -139,7 +139,8 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 - `src/coordinates.rs` - LLH→ECEF conversion, cached at startup
 - `src/passthrough.rs` - UBX frame parser, position buffer, NAV modification for spoof detection
 - `src/spoof_detector.rs` - GPS spoofing detection algorithms (teleportation, speed, altitude, acceleration)
-- `src/flash_storage.rs` - Flash persistence for operating mode
+- `src/flash_storage.rs` - Flash persistence for operating mode, extracted keys, extraction requests
+- `src/key_extract.rs` - Runtime key extraction from real GNSS module via CFG-0x41 poll
 
 ### Coordinate System
 
@@ -577,6 +578,53 @@ A4 20 01
 
 **Security note**: This command exposes the private key, allowing key extraction from real DJI GNSS modules.
 
+## Runtime Key Extraction
+
+Extracts the 24-byte SEC-SIGN private key from a real u-blox GNSS module connected to the board. Uses CFG-0x41 poll command to read OTP configuration containing the key.
+
+**Trigger**: Long button press (3+ seconds) during normal operation → saves flash flag → reboots → extraction runs at boot BEFORE UART init.
+
+**Hardware connections for extraction**:
+- TX: PIO1 SM0 on GPIO1 (to GNSS module RX) — 921600 baud
+- RX: Hardware UART1 on GPIO5 (from GNSS module TX) — BufferedUartRx, 1KB buffer, FIFO 1/4
+
+**Why Hardware UART1 RX (not PIO RX)**: PIO UART RX lost ~99.6% of bytes at 921600 baud. The async `read_u8().await` per-byte approach caused PIO FIFO overflow — 264-byte response took 735ms instead of 2.86ms with corrupted data. Hardware UART1 with DMA-backed BufferedUartRx handles the full data rate reliably.
+
+**Algorithm** (`src/key_extract.rs`):
+1. Init PIO1 TX on GPIO1, Hardware UART1 RX on GPIO5
+2. Wait 2s for GNSS module to stabilize after power-on
+3. Flush RX buffer (GNSS outputs NMEA at startup)
+4. Loop up to 5 attempts:
+   - Send `B5 62 06 41 00 00 47 DB` (CFG-0x41 poll, 8 bytes)
+   - Collect up to 1024 bytes with 2s timeout (offline into buffer)
+   - Search buffer for UBX frame `B5 62 06 41 00 01` (class=0x06, id=0x41, len=256)
+   - Validate Fletcher-8 checksum
+   - Extract key: try offset 113 (Air3S/Mavic3Pro), then 173 (Air3/Mavic4Pro), then fallback scan for `A6 18` tag
+5. Return `Some(key)` or `None`
+
+**Key storage** (`src/flash_storage.rs`):
+- Extracted key saved to flash (Last-1 sector, magic `0x4B455953` = "KEYS")
+- Loaded on every subsequent boot — overrides hardcoded keys in `sec_sign.rs`
+- If no key in flash → fallback to hardcoded `PRIVATE_KEY_*` by `DroneModel`
+
+**LED feedback after extraction**:
+| Board | Success | Failure |
+|-------|---------|---------|
+| RP2350 (WS2812) | 5x green blink (100ms) | 5x red blink (100ms) |
+| RP2354 (GPIO) | 5x blink (100ms) | 5x blink (100ms) |
+
+Normal startup (no extraction): 3x green blink (200ms) as usual.
+
+**Flash layout for extraction**:
+| Sector | Content | Magic |
+|--------|---------|-------|
+| Last-1 | Extracted key (24 bytes) | `0x4B455953` ("KEYS") |
+| Last-4 | Extraction request flag | `0x45585452` ("EXTR") |
+
+**Debug flag**: `FORCE_KEY_EXTRACT` in `main.rs` (default `false`) — forces extraction on every boot, bypassing button/flash mechanism. For SWD debugging only.
+
+**Error handling**: If GNSS not connected or doesn't respond → 5 attempts × 2s = ~12s delay at boot → `None` → program continues with hardcoded or previously saved key. Never blocks indefinitely.
+
 ## Diagnostic Mode (Per-Message Counters)
 
 Built-in diagnostic for analyzing UBX message flow in Passthrough modes. Disabled by default.
@@ -652,7 +700,8 @@ All core features complete:
 8. ✅ SEC-UNIQID - Unique ID poll response
 9. ✅ CFG-0x41 - DJI proprietary SEC-SIGN config (256-byte response with private key)
 10. ✅ MGA-* - AssistNow assistance data (ACK-ACK response)
-11. ✅ Release build - 0 warnings, pure Rust
+11. ✅ Key extraction - Runtime private key extraction from real GNSS via CFG-0x41
+12. ✅ Release build - 0 warnings, pure Rust
 
 ## Implemented UBX Messages
 
