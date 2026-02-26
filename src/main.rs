@@ -64,7 +64,7 @@ use ubx::{
 };
 
 // Interrupt bindings
-bind_interrupts!(struct Irqs {
+bind_interrupts!(pub struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     UART1_IRQ => BufferedInterruptHandler<UART1>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
@@ -499,7 +499,7 @@ async fn main(spawner: Spawner) {
 
         if should_extract {
             info!("KEY EXTRACT: running extraction (request={}, force={})", request, FORCE_KEY_EXTRACT);
-            let key = key_extract::extract(p.PIO1, p.PIN_0, p.PIN_5).await;
+            let key = key_extract::extract(p.PIO1, p.PIN_1, p.UART1, p.PIN_5).await;
             let _p = unsafe { embassy_rp::Peripherals::steal() };
             key
         } else {
