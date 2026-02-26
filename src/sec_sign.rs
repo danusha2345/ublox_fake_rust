@@ -45,13 +45,29 @@ pub const PRIVATE_KEY_MAVIC3PRO: [u8; 24] = [
 #[allow(dead_code)]
 pub const PRIVATE_KEY: [u8; 24] = PRIVATE_KEY_AIR3;
 
-/// Get private key for specified drone model
-pub fn get_private_key(model: DroneModel) -> &'static [u8; 24] {
+/// Flash-loaded key (set once at boot, read-only after)
+/// Safety: Written once in main() before any tasks start, read-only after.
+static mut FLASH_KEY_STORAGE: Option<[u8; 24]> = None;
+
+/// Set the flash-loaded key. Call once at boot, before tasks start.
+/// # Safety
+/// Must be called before any tasks access get_private_key()
+pub unsafe fn set_flash_key(key: [u8; 24]) {
+    FLASH_KEY_STORAGE = Some(key);
+}
+
+/// Get private key for specified drone model.
+/// Returns flash-stored key if available, otherwise falls back to hardcoded constants.
+pub fn get_private_key(model: DroneModel) -> [u8; 24] {
+    // Flash key overrides hardcoded keys
+    if let Some(key) = unsafe { FLASH_KEY_STORAGE } {
+        return key;
+    }
     match model {
-        DroneModel::Air3 => &PRIVATE_KEY_AIR3,
-        DroneModel::Mavic4Pro => &PRIVATE_KEY_MAVIC4PRO,
-        DroneModel::Air3S => &PRIVATE_KEY_AIR3S,
-        DroneModel::Mavic3Pro => &PRIVATE_KEY_MAVIC3PRO,
+        DroneModel::Air3 => PRIVATE_KEY_AIR3,
+        DroneModel::Mavic4Pro => PRIVATE_KEY_MAVIC4PRO,
+        DroneModel::Air3S => PRIVATE_KEY_AIR3S,
+        DroneModel::Mavic3Pro => PRIVATE_KEY_MAVIC3PRO,
     }
 }
 

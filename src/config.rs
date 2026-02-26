@@ -117,6 +117,8 @@ pub mod button {
     pub const DEBOUNCE_MS: u64 = 50;
     /// Период опроса кнопки (мс)
     pub const POLL_PERIOD_MS: u64 = 20;
+    /// Длительность удержания для запуска key extraction (мс)
+    pub const LONG_PRESS_MS: u64 = 3000;
 }
 
 /// Default coordinates (configurable)

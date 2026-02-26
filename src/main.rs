@@ -12,6 +12,7 @@
 mod config;
 mod coordinates;
 mod flash_storage;
+mod key_extract;
 mod led;
 mod passthrough;
 mod sec_sign;
@@ -477,6 +478,26 @@ async fn main(spawner: Spawner) {
     LAST_GOOD_ECEF_Y.store(coordinates::ecef_y_cm(), Ordering::Release);
     LAST_GOOD_ECEF_Z.store(coordinates::ecef_z_cm(), Ordering::Release);
 
+    // ========================================================================
+    // Key extraction: check flash flag (set by long-press reboot).
+    // If flag set → run PIO extraction BEFORE UART init (GPIO0/GPIO5 free).
+    // ========================================================================
+    let extracted_key = {
+        let mut flash_tmp = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
+        let request = flash_storage::load_and_clear_extract_request(&mut flash_tmp);
+        drop(flash_tmp);
+        let p = unsafe { embassy_rp::Peripherals::steal() };
+
+        if request {
+            let key = key_extract::extract(p.PIO1, p.PIN_0, p.PIN_5).await;
+            let _p = unsafe { embassy_rp::Peripherals::steal() };
+            key
+        } else {
+            None
+        }
+    };
+    let p = unsafe { embassy_rp::Peripherals::steal() };
+
     // ===== MINIMAL WS2812 TEST - blink 3 times at startup (only for boards with LED) =====
     #[cfg(not(feature = "rp2354"))]
     {
@@ -528,6 +549,20 @@ async fn main(spawner: Spawner) {
         // Save firmware version to flash (skips write if unchanged)
         info!("Firmware version: {}", version::FW_VERSION);
         flash_storage::save_version(&mut flash, version::FW_VERSION);
+
+        // Load previously extracted key from flash (if any)
+        if let Some(key) = flash_storage::load_key(&mut flash) {
+            info!("Loaded extracted private key from flash");
+            unsafe { sec_sign::set_flash_key(key); }
+        }
+
+        // Save freshly extracted key (from key extraction mode at boot)
+        if let Some(ref key) = extracted_key {
+            if flash_storage::save_key(&mut flash, key) {
+                info!("Freshly extracted key saved to flash");
+            }
+            unsafe { sec_sign::set_flash_key(*key); }
+        }
     };
 
     // Initialize PIO0 for WS2812 LED (only for boards with LED)
@@ -854,7 +889,7 @@ async fn sec_sign_compute_task() {
         let private_key = get_private_key(model);
 
         // Sign with ECDSA SECP192R1
-        let signature = Signature::sign(&z, private_key).unwrap_or_default();
+        let signature = Signature::sign(&z, &private_key).unwrap_or_default();
 
         // Send result back to Core0
         let result = SecSignResult {
@@ -2235,15 +2270,16 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
         if is_high && !was_high {
             info!("button_task: edge detected (0->1), debouncing");
             Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
-            
+
             if flex.is_high() {
                 click_count = click_count.saturating_add(1).min(4);
                 info!("button_task: click #{}", click_count);
 
                 // Ждём отпускания кнопки с E9 workaround и защитой от зависания
+                // + детекция long press (3+ сек) для key extraction
                 info!("button_task: waiting for release...");
                 let mut high_count: u32 = 0;
-                const MAX_RELEASE_WAIT: u32 = 40; // 40 * 50ms = 2 секунды максимум
+                let long_press_ticks = (config::button::LONG_PRESS_MS / 50) as u32;
                 loop {
                     if !flex.is_high() {
                         info!("button_task: released!");
@@ -2252,10 +2288,24 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
                     Timer::after(Duration::from_millis(50)).await;
                     high_count += 1;
 
-                    // Защита от зависания - максимум 2 секунды ожидания
-                    if high_count >= MAX_RELEASE_WAIT {
-                        warn!("button_task: release wait timeout (2s), forcing exit");
-                        break;
+                    // Long press detection: 3+ секунд удержания → key extraction
+                    if high_count == long_press_ticks {
+                        info!("KEY EXTRACT: long press detected ({}s), saving request and rebooting...",
+                            config::button::LONG_PRESS_MS / 1000);
+
+                        // Записываем флаг запроса в flash
+                        {
+                            let mut flash = flash_mutex.lock().await;
+                            if !flash_storage::save_extract_request(&mut flash) {
+                                error!("KEY EXTRACT: failed to save request to flash!");
+                                break;
+                            }
+                        }
+
+                        // Перезагрузка — дрон всё равно перезагрузится
+                        info!("KEY EXTRACT: rebooting NOW");
+                        Timer::after(Duration::from_millis(50)).await;
+                        cortex_m::peripheral::SCB::sys_reset();
                     }
 
                     // E9 discharge kick каждые ~250мс (5 * 50мс)
