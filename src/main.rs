@@ -1650,6 +1650,7 @@ fn send_ubx_message<M: UbxMessage>(msg: &M) {
 }
 
 /// CFG-VALSET key IDs
+#[allow(dead_code)]
 mod valset_keys {
     // MSGOUT keys for UART1
     pub const NAV_PVT: u32 = 0x20910007;
@@ -1672,6 +1673,7 @@ mod valset_keys {
     pub const TIM_TP: u32 = 0x2091017E;
     pub const MON_HW: u32 = 0x209101B5;
     pub const RXM_RAWX: u32 = 0x209102A5;
+    pub const RXM_SFRBX: u32 = 0x20910232;
     pub const MON_COMMS: u32 = 0x20910350;
     pub const MON_RF: u32 = 0x2091035A;
 
@@ -1845,7 +1847,7 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
                 let current_model = DRONE_MODEL.load(Ordering::Acquire);
                 if current_model == 2 || current_model == 3 {
                     // Air 3S / Mavic 3 Pro set manually — skip auto-detection
-                    info!("AUTO-DETECT: skipped, Air 3S set manually");
+                    info!("AUTO-DETECT: skipped, model {} set manually", current_model);
                 } else {
                     let saw_uniqid = SAW_SEC_UNIQID.load(Ordering::Acquire);
                     let saw_valget = SAW_CFG_VALGET.load(Ordering::Acquire);
