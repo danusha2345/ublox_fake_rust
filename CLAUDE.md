@@ -104,7 +104,7 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 
 ### Dual-core async design (Embassy)
 - **Core0**: Embassy executor - UART TX/RX, NAV message generation, button handling
-- **Core1**: Embassy executor - LED control (PIO), SEC-SIGN ECDSA, MON messages
+- **Core1**: Embassy executor - LED control (PIO), SEC-SIGN ECDSA
 - Inter-core communication via `Signal` and `Channel` from `embassy-sync`
 - Mode state shared via `AtomicU8` with `Acquire/Release` ordering
 - TX_CHANNEL capacity: 32 messages (buffer for SEC-SIGN computation delays)
@@ -246,7 +246,7 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 
 **Bug fix (Jan 2026 #2)**: Fixed false teleport detection when switching from Emulation to Passthrough mode. Added `SPOOF_DETECTOR_RESET` atomic flag that triggers detector reset via `apply_mode_by_clicks()`. This prevents the detector from seeing emulation coordinates as the previous position when real GNSS data starts arriving.
 
-**Known bug (Jan 2026)**: SEC-UNIQID race condition in drone auto-detection. When Mavic 4 Pro connects, it sends SEC-UNIQID poll BEFORE CFG-VALSET, but auto-detection triggers on CFG-VALSET. Result: Mavic 4 receives Air 3's chip ID (`0xE0 0x95 0x65 0x0F 0x2A` instead of `0xEB 0xB9 0x91 0x0F 0x2B`), causing signature rejection. **Workaround**: Set default `DRONE_MODEL` to target model in `main.rs:172` (currently Air 3S = 2). Auto-detection is skipped when Air 3S is set manually.
+**Known bug (Jan 2026)**: SEC-UNIQID race condition in drone auto-detection. When Mavic 4 Pro connects, it sends SEC-UNIQID poll BEFORE CFG-VALSET, but auto-detection triggers on CFG-VALSET. Result: Mavic 4 receives Air 3's chip ID (`0xE0 0x95 0x65 0x0F 0x2A` instead of `0xEB 0xB9 0x91 0x0F 0x2B`), causing signature rejection. **Workaround**: Set default `DRONE_MODEL` to target model in `main.rs` (currently Air 3S = 2). Auto-detection is skipped when Air 3S or Mavic 3 Pro is set manually.
 
 **Global state** (atomics in `main.rs`):
 - `SPOOF_DETECTED: AtomicBool` - spoofing active flag
@@ -270,9 +270,9 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 | NAV-POSECEF | 20B | ecefX/Y/Z → LAST_GOOD_ECEF; pAcc → 9999999 |
 | NAV-HPPOSECEF | 28B | ecefX/Y/Z → LAST_GOOD_ECEF; Hp → 0; invalidEcef flag; pAcc → 9999999 |
 | NAV-SOL | 52B | ecefX/Y/Z → LAST_GOOD_ECEF; ecefVX/Y/Z → 0; gps_fix=0, num_sv=2; pAcc → 9999999 |
-| NAV-STATUS | 16B | gps_fix=4, flags=5 |
-| NAV-SAT | 8+12n | num_svs=5 |
-| NAV-SVINFO | 8+12n | num_ch=4 |
+| NAV-STATUS | 16B | gps_fix=0, flags=0 |
+| NAV-SAT | 8+12n | num_svs=2 |
+| NAV-SVINFO | 8+12n | num_ch=2 |
 
 ### NAV Output Start Timing
 
@@ -286,8 +286,9 @@ NAV messages start after a model-specific delay from the first UBX command (any 
 | Mavic 3 Pro | ~780ms (est.) | 780ms |
 
 ```
-First UBX command → +delay → NAV output starts → +650ms → First SEC-SIGN
+First UBX command → +delay → NAV output starts → +first_delay → First SEC-SIGN
 ```
+First delay: 1000ms for Air 3, 650ms for Air 3S/Mavic 4 Pro/Mavic 3 Pro.
 
 Implementation:
 - `FIRST_CONFIG_MILLIS` records timestamp of first command
@@ -512,7 +513,7 @@ Critical synchronization points:
 - All MON-* messages (HW, RF, COMMS, VER)
 - All ACK-ACK responses to CFG commands
 - SEC-UNIQID (0x27, 0x03) - IS included in hash
-- TIM-TP, RXM-RAWX
+- TIM-TP, RXM-RAWX, RXM-SFRBX
 
 ## CFG-0x41 (OTP Configuration / DJI Proprietary)
 
@@ -690,9 +691,9 @@ Uses direct UART0 register access via `rp-pac` crate (embassy-rp doesn't expose 
 
 All core features complete:
 
-1. ✅ NAV messages - All 17 NAV message types implemented
+1. ✅ NAV messages - All 18 NAV message types implemented (including NAV-SOL)
 2. ✅ MON messages - MON-HW, MON-COMMS, MON-RF, MON-VER (poll)
-3. ✅ Passthrough mode - PIO-based GPIO3→GPIO0 with flash persistence
+3. ✅ Passthrough mode - UART1 RX with frame parsing, spoof detection, flash persistence
 4. ✅ ECDSA signing - Pure Rust p192 with RFC6979 deterministic k
 5. ✅ CFG-PRT baudrate - Direct PAC register access
 6. ✅ CFG-VALSET - Full M10 configuration support
@@ -712,6 +713,7 @@ All core features complete:
 | 0x02 | NAV-POSLLH | 28 | Position in LLH |
 | 0x03 | NAV-STATUS | 16 | Receiver status |
 | 0x04 | NAV-DOP | 18 | Dilution of precision |
+| 0x06 | NAV-SOL | 52 | Navigation solution (legacy) |
 | 0x07 | NAV-PVT | 92 | Position/Velocity/Time |
 | 0x11 | NAV-VELECEF | 20 | Velocity in ECEF |
 | 0x12 | NAV-VELNED | 36 | Velocity in NED |
@@ -737,6 +739,7 @@ All core features complete:
 ### Other Classes
 | Class | ID | Name | Payload | Description |
 |-------|-----|------|---------|-------------|
+| 0x02 | 0x13 | RXM-SFRBX | 8+n | Subframe buffer (passthrough only) |
 | 0x02 | 0x15 | RXM-RAWX | 16+ | Raw measurements |
 | 0x05 | 0x00 | ACK-NAK | 2 | Negative acknowledgement |
 | 0x05 | 0x01 | ACK-ACK | 2 | Acknowledgement |
