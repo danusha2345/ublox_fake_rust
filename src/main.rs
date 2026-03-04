@@ -507,6 +507,15 @@ async fn main(spawner: Spawner) {
     };
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
+    // Read drone model from flash BEFORE LED blink (model determines blink count)
+    // model 0..3 → blinks 1..4 (same as button selection clicks)
+    let startup_blink_count: u8 = {
+        let mut flash_tmp = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
+        let model = flash_storage::load_drone_model(&mut flash_tmp).unwrap_or(2); // default Air 3S
+        model + 1 // Air3=1, Mavic4Pro=2, Air3S=3, Mavic3Pro=4
+    };
+    let p = unsafe { embassy_rp::Peripherals::steal() };
+
     // ===== LED feedback: extraction result or startup blink =====
     #[cfg(not(feature = "rp2354"))]
     {
@@ -531,13 +540,16 @@ async fn main(spawner: Spawner) {
                 Timer::after(Duration::from_millis(100)).await;
             }
         } else {
-            // Normal startup: 3x green blink
-            for _ in 0..3 {
+            // Startup blink: N green blinks = drone model number
+            // 1=Air3, 2=Mavic4Pro, 3=Air3S(default), 4=Mavic3Pro
+            // Длинная пауза после серии, чтобы отличить от режима Emulation (тоже зелёный)
+            for _ in 0..startup_blink_count {
                 ws.write(&[RGB8::new(0, 50, 0)]).await;
-                Timer::after(Duration::from_millis(200)).await;
+                Timer::after(Duration::from_millis(150)).await;
                 ws.write(&[RGB8::new(0, 0, 0)]).await;
-                Timer::after(Duration::from_millis(200)).await;
+                Timer::after(Duration::from_millis(150)).await;
             }
+            Timer::after(Duration::from_millis(800)).await;
         }
     }
     // ===== END LED feedback =====
@@ -630,7 +642,7 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "rp2354")]
     let _led_cathode = Output::new(p.PIN_12, Level::Low);
 
-    // RP2354 extraction LED feedback: 5x fast blink
+    // RP2354 LED feedback: extraction result or startup blink
     #[cfg(feature = "rp2354")]
     if extraction_attempted {
         for _ in 0..5 {
@@ -639,6 +651,15 @@ async fn main(spawner: Spawner) {
             led_anode.set_low();
             Timer::after(Duration::from_millis(100)).await;
         }
+    } else {
+        // Startup blink: N blinks = drone model number
+        for _ in 0..startup_blink_count {
+            led_anode.set_high();
+            Timer::after(Duration::from_millis(150)).await;
+            led_anode.set_low();
+            Timer::after(Duration::from_millis(150)).await;
+        }
+        Timer::after(Duration::from_millis(800)).await;
     }
 
     // Spawn Core1 for LED (if available) and SEC-SIGN computation
