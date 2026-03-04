@@ -2550,8 +2550,9 @@ async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex)
     }
 }
 
-/// Применяет модель дрона по количеству нажатий в режиме выбора модели
-/// 1 клик → Air 3, 2 → Mavic 4 Pro, 3 → Air 3S, 4 → Mavic 3 Pro
+/// Применяет модель дрона по количеству нажатий в режиме выбора модели.
+/// 1 клик → Air 3, 2 → Mavic 4 Pro, 3 → Air 3S, 4 → Mavic 3 Pro.
+/// Сохраняет во flash и ПЕРЕЗАГРУЖАЕТ плату (SEC-SIGN таймер кеширует тайминги при старте).
 async fn apply_model_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex) {
     let new_model = match click_count {
         1 => config::DroneModel::Air3,
@@ -2578,4 +2579,12 @@ async fn apply_model_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex
             warn!("Failed to save drone model to flash");
         }
     }
+
+    // Ждём завершения LED подтверждения, затем ребут.
+    // SEC-SIGN таймер и NAV задача кешируют модель при старте — без ребута
+    // тайминги не обновятся (Air 3 = 4s period vs остальные = 2s).
+    // RP2350: 100ms × 4 тика × N вспышек, RP2354: 50ms × 4 × N. Макс ~1.6с.
+    Timer::after(Duration::from_millis(click_count as u64 * 400 + 500)).await;
+    info!("MODEL SELECT: rebooting to apply new model");
+    cortex_m::peripheral::SCB::sys_reset();
 }
