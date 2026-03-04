@@ -178,14 +178,16 @@ Timeout between clicks: 800ms. Hot-switch without reboot.
 
 ### PassthroughOffset Mode
 
-PassthroughOffset works like Passthrough (spoof detection enabled), but applies a fixed coordinate offset to all NAV messages. The offset transforms coordinates from one region to another.
+PassthroughOffset works like Passthrough (spoof detection enabled), but applies a dynamic coordinate offset to all NAV messages. The offset is computed **once** at the first 3D GPS fix: `offset = default_position - actual_gps_position`. This means it works from **any location** — no hardcoded source/target offsets needed.
 
-**Current offset**: Saint Petersburg (59.9343°N, 30.3351°E) → Austin, Nevada (39.4933°N, 117.0686°W)
+**Target position**: `default_position` in `config.rs` (same coordinates used by Emulation mode)
 
-**Offset values** (in `config.rs`):
-- LAT_OFFSET_1E7 = -204,410,000 (1e-7 degrees)
-- LON_OFFSET_1E7 = -1,474,037,000 (1e-7 degrees)
-- ECEF offset: pre-computed approximate values
+**Dynamic offset computation** (in `gnss_processing_task`):
+1. Wait for first NAV-PVT with `fix_type >= 3` (3D fix) and `num_sv >= 4`
+2. Extract actual lat/lon/alt from PVT payload
+3. Compute ECEF for actual position via `llh_to_ecef_cm()` (~50µs, one-time)
+4. `offset = target (cached at init) - actual` for all 6 components (lat, lon, alt, ecef_x/y/z)
+5. Offset locked in `dynamic_offset: Option<DynamicOffset>` — reset on mode switch
 
 **Modified NAV messages**:
 | Message | Offsets applied |

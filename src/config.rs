@@ -124,28 +124,15 @@ pub mod button {
 }
 
 /// Default coordinates (configurable) — Golden Beach, FL
+/// Also used as target position for PassthroughOffset mode (dynamic offset computed at first GPS fix)
 pub mod default_position {
     pub const LATITUDE: f64 = 25.966443;
     pub const LONGITUDE: f64 = -80.122371;
     pub const ALTITUDE_M: i32 = 100;
-}
-
-/// Coordinate offset for PassthroughOffset mode
-/// Transforms: Saint Petersburg (59.9343°N, 30.3351°E) → Austin, Nevada (39.4933°N, 117.0686°W)
-pub mod coordinate_offset {
-    /// Latitude offset in 1e-7 degrees: (39.4933 - 59.9343) × 1e7
-    pub const LAT_OFFSET_1E7: i32 = -204_410_000;
-    /// Longitude offset in 1e-7 degrees: (-117.0686 - 30.3351) × 1e7
-    pub const LON_OFFSET_1E7: i32 = -1_474_037_000;
-    /// Altitude offset in mm (no change)
-    pub const ALT_OFFSET_MM: i32 = 0;
-
-    /// Pre-computed ECEF offset in centimeters
-    /// Saint Petersburg ECEF: X=2825884m, Y=1671063m, Z=5479661m
-    /// Austin, Nevada ECEF:   X=-2242830m, Y=-4388803m, Z=4034730m
-    pub const ECEF_OFFSET_X_CM: i32 = -506_871_400;  // (-2242830 - 2825884) * 100
-    pub const ECEF_OFFSET_Y_CM: i32 = -605_986_600;  // (-4388803 - 1671063) * 100
-    pub const ECEF_OFFSET_Z_CM: i32 = -144_493_100;  // (4034730 - 5479661) * 100
+    // Pre-computed for PassthroughOffset dynamic offset calculation
+    pub const LAT_1E7: i32 = 259_664_430;    // (LATITUDE * 1e7) as i32
+    pub const LON_1E7: i32 = -801_223_710;   // (LONGITUDE * 1e7) as i32
+    pub const ALT_MM: i32 = 100_000;          // ALTITUDE_M * 1000
 }
 
 /// UBX protocol version emulation

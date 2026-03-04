@@ -1462,7 +1462,8 @@ async fn uart1_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
 #[embassy_executor::task]
 async fn gnss_processing_task() {
     use passthrough::{
-        UbxFrameParser, PositionBuffer, extract_position_from_pvt, extract_gnss_time_from_pvt,
+        UbxFrameParser, PositionBuffer, DynamicOffset,
+        extract_position_from_pvt, extract_gnss_time_from_pvt,
         extract_cno_from_nav_sat,
         modify_nav_status, modify_nav_sat, modify_nav_svinfo,
         modify_nav_pvt_spoof, modify_nav_posllh_spoof, modify_nav_posecef_spoof,
@@ -1477,6 +1478,9 @@ async fn gnss_processing_task() {
     let mut parser: Option<UbxFrameParser> = None;
     let mut detector: Option<SpoofDetector> = None;
     let mut pos_buffer: Option<PositionBuffer> = None;
+
+    // Dynamic offset for PassthroughOffset — computed once at first 3D GPS fix
+    let mut dynamic_offset: Option<DynamicOffset> = None;
 
     // CNO buffer - accumulates CNO values from NAV-SAT messages
     let mut last_cno_values: heapless::Vec<u8, 16> = heapless::Vec::new();
@@ -1517,6 +1521,8 @@ async fn gnss_processing_task() {
                 // Также сбрасываем глобальные флаги спуфинга
                 SPOOF_DETECTED.store(false, Ordering::Release);
                 SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                // Reset dynamic offset — will be recomputed at next 3D fix
+                dynamic_offset = None;
             }
 
             let parser = parser.as_mut().unwrap();
@@ -1606,22 +1612,53 @@ async fn gnss_processing_task() {
                         }
                     }
 
-                    // Apply coordinate offset FIRST in PassthroughOffset mode (before spoof modification)
+                    // Compute dynamic offset at first 3D GPS fix (PassthroughOffset mode)
+                    if apply_offset && dynamic_offset.is_none()
+                        && class == 0x01 && id == 0x07 && frame.len() >= 100
+                    {
+                        let fix_type_byte = frame[6 + 20];
+                        let num_sv = frame[6 + 23];
+                        if fix_type_byte >= 3 && num_sv >= 4 {
+                            // Extract actual GPS position from NAV-PVT
+                            let act_lat = i32::from_le_bytes([frame[6+28], frame[6+29], frame[6+30], frame[6+31]]);
+                            let act_lon = i32::from_le_bytes([frame[6+24], frame[6+25], frame[6+26], frame[6+27]]);
+                            let act_alt = i32::from_le_bytes([frame[6+36], frame[6+37], frame[6+38], frame[6+39]]);
+                            // Compute ECEF for actual position (~50µs, one-time)
+                            let (act_ex, act_ey, act_ez) = coordinates::llh_to_ecef_cm(act_lat, act_lon, act_alt);
+                            // Target = default_position (cached at init)
+                            let off = DynamicOffset {
+                                lat_1e7: coordinates::lat_1e7() - act_lat,
+                                lon_1e7: coordinates::lon_1e7() - act_lon,
+                                alt_mm: coordinates::alt_mm() - act_alt,
+                                ecef_x_cm: coordinates::ecef_x_cm() - act_ex,
+                                ecef_y_cm: coordinates::ecef_y_cm() - act_ey,
+                                ecef_z_cm: coordinates::ecef_z_cm() - act_ez,
+                            };
+                            info!("Dynamic offset locked: actual=({},{}) target=({},{}) dlat={} dlon={}",
+                                  act_lat, act_lon, coordinates::lat_1e7(), coordinates::lon_1e7(),
+                                  off.lat_1e7, off.lon_1e7);
+                            dynamic_offset = Some(off);
+                        }
+                    }
+
+                    // Apply coordinate offset in PassthroughOffset mode (before spoof modification)
                     // This ensures real coordinates are NEVER leaked without offset, even during spoofing.
                     // Spoof detection above used original coordinates; offset is applied to output only.
                     if apply_offset && class == 0x01 {
-                        let mut offset_applied = true;
-                        match id {
-                            0x07 => apply_offset_nav_pvt(&mut frame),
-                            0x02 => apply_offset_nav_posllh(&mut frame),
-                            0x01 => apply_offset_nav_posecef(&mut frame),
-                            0x13 => apply_offset_nav_hpposecef(&mut frame),
-                            0x06 => apply_offset_nav_sol(&mut frame),
-                            _ => { offset_applied = false; }
-                        }
-                        // Skip checksum if spoofed — spoof handler below recalculates after coordinate replacement
-                        if offset_applied && !SPOOF_DETECTED.load(Ordering::Acquire) {
-                            recalc_checksum(&mut frame);
+                        if let Some(ref off) = dynamic_offset {
+                            let mut offset_applied = true;
+                            match id {
+                                0x07 => apply_offset_nav_pvt(&mut frame, off),
+                                0x02 => apply_offset_nav_posllh(&mut frame, off),
+                                0x01 => apply_offset_nav_posecef(&mut frame, off),
+                                0x13 => apply_offset_nav_hpposecef(&mut frame, off),
+                                0x06 => apply_offset_nav_sol(&mut frame, off),
+                                _ => { offset_applied = false; }
+                            }
+                            // Skip checksum if spoofed — spoof handler below recalculates after coordinate replacement
+                            if offset_applied && !SPOOF_DETECTED.load(Ordering::Acquire) {
+                                recalc_checksum(&mut frame);
+                            }
                         }
                     }
 
@@ -1639,19 +1676,17 @@ async fn gnss_processing_task() {
                         let good_ecef_z = LAST_GOOD_ECEF_Z.load(Ordering::Acquire);
 
                         // In PassthroughOffset: apply offset to LAST_GOOD values
-                        let (rep_lat, rep_lon, rep_alt) = if apply_offset {
-                            use config::coordinate_offset::*;
-                            (good_lat.saturating_add(LAT_OFFSET_1E7),
-                             good_lon.saturating_add(LON_OFFSET_1E7),
-                             good_alt.saturating_add(ALT_OFFSET_MM))
+                        let (rep_lat, rep_lon, rep_alt) = if let Some(ref off) = dynamic_offset {
+                            (good_lat.saturating_add(off.lat_1e7),
+                             good_lon.saturating_add(off.lon_1e7),
+                             good_alt.saturating_add(off.alt_mm))
                         } else {
                             (good_lat, good_lon, good_alt)
                         };
-                        let (rep_ex, rep_ey, rep_ez) = if apply_offset {
-                            use config::coordinate_offset::*;
-                            (good_ecef_x.saturating_add(ECEF_OFFSET_X_CM),
-                             good_ecef_y.saturating_add(ECEF_OFFSET_Y_CM),
-                             good_ecef_z.saturating_add(ECEF_OFFSET_Z_CM))
+                        let (rep_ex, rep_ey, rep_ez) = if let Some(ref off) = dynamic_offset {
+                            (good_ecef_x.saturating_add(off.ecef_x_cm),
+                             good_ecef_y.saturating_add(off.ecef_y_cm),
+                             good_ecef_z.saturating_add(off.ecef_z_cm))
                         } else {
                             (good_ecef_x, good_ecef_y, good_ecef_z)
                         };
