@@ -253,6 +253,63 @@ pub fn save_extract_request(flash: &mut Flash<'_, FLASH, Async, { crate::config:
     true
 }
 
+// ============================================================================
+// Drone model persistence
+// ============================================================================
+
+/// Magic value for drone model data
+const DRONE_MODEL_MAGIC: u32 = 0x4D4F444C; // "MODL" in ASCII
+
+/// Flash offset for drone model - fifth-to-last sector
+/// For 4MB: 0x3FB000, For 2MB: 0x1FB000
+const DRONE_MODEL_FLASH_OFFSET: u32 = (crate::config::FLASH_SIZE_BYTES as u32) - (5 * ERASE_SIZE as u32);
+
+/// Save drone model to flash. Returns true on success.
+pub fn save_drone_model(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>, model: u8) -> bool {
+    // Check if already stored with same model
+    if let Some(stored) = load_drone_model(flash) {
+        if stored == model {
+            info!("Drone model unchanged in flash: {}", model);
+            return true;
+        }
+    }
+
+    let mut data = [0xFFu8; ERASE_SIZE];
+    data[0..4].copy_from_slice(&DRONE_MODEL_MAGIC.to_le_bytes());
+    data[4] = model;
+
+    if let Err(e) = flash.blocking_erase(DRONE_MODEL_FLASH_OFFSET, DRONE_MODEL_FLASH_OFFSET + ERASE_SIZE as u32) {
+        error!("Drone model flash erase failed: {:?}", e);
+        return false;
+    }
+
+    if let Err(e) = flash.blocking_write(DRONE_MODEL_FLASH_OFFSET, &data[..256]) {
+        error!("Drone model flash write failed: {:?}", e);
+        return false;
+    }
+
+    info!("Drone model {} saved to flash successfully", model);
+    true
+}
+
+/// Load drone model from flash, returns None if no valid data.
+/// Valid values: 0 (Air3), 1 (Mavic4Pro), 2 (Air3S), 3 (Mavic3Pro).
+pub fn load_drone_model(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>) -> Option<u8> {
+    let mut buf = [0u8; 8];
+
+    if flash.blocking_read(DRONE_MODEL_FLASH_OFFSET, &mut buf).is_ok() {
+        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic == DRONE_MODEL_MAGIC {
+            let model = buf[4];
+            if model <= 3 {
+                return Some(model);
+            }
+        }
+    }
+
+    None
+}
+
 /// Check if key extraction was requested, and clear the flag.
 /// Returns true if extraction was requested.
 pub fn load_and_clear_extract_request(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>) -> bool {
