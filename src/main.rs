@@ -378,13 +378,12 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 /// Default is Air 3S. Auto-detection skipped when Air 3S is set manually.
 static DRONE_MODEL: AtomicU8 = AtomicU8::new(2); // Air 3S (default)
 
-/// Auto-detection state flags
-/// Set to true once drone model is detected (prevents re-detection)
-static DRONE_DETECTED: AtomicBool = AtomicBool::new(false);
-/// Set to true if SEC-UNIQID poll received (Mavic 4 sends this before CFG-RST, Air 3 doesn't)
-static SAW_SEC_UNIQID: AtomicBool = AtomicBool::new(false);
-/// Set to true if CFG-VALGET received before CFG-VALSET (Mavic 4 pattern)
-static SAW_CFG_VALGET: AtomicBool = AtomicBool::new(false);
+
+/// Model selection mode active (for LED feedback: cyan blinking)
+static IN_MODEL_SELECTION: AtomicBool = AtomicBool::new(false);
+
+/// Number of confirmation LED blinks after model selection (0 = none, 1-4 = blink count)
+static MODEL_CONFIRM_BLINKS: AtomicU8 = AtomicU8::new(0);
 
 /// Timestamp when message output started (for 20s invalid satellites timer)
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
@@ -569,6 +568,14 @@ async fn main(spawner: Spawner) {
             // No saved mode, default to Passthrough
             info!("No saved mode, defaulting to Passthrough");
             OperatingMode::Passthrough.store();
+        }
+
+        // Load drone model from flash (if set via button)
+        if let Some(model_byte) = flash_storage::load_drone_model(&mut flash) {
+            DRONE_MODEL.store(model_byte, Ordering::Release);
+            info!("Loaded drone model from flash: {:?}", config::DroneModel::from_u8(model_byte));
+        } else {
+            info!("No saved drone model, using default (Air 3S)");
         }
 
         // Save firmware version to flash (skips write if unchanged)
@@ -780,8 +787,50 @@ async fn led_task(
     let mut ticker = Ticker::every(Duration::from_millis(100));
     let mut blink_counter: u8 = 0;
 
+    // State machine for model selection confirmation blinks
+    // Each blink = 2 ticks ON (200ms) + 2 ticks OFF (200ms) = 4 ticks
+    let mut confirm_remaining: u8 = 0; // blinks left to show
+    let mut confirm_tick: u8 = 0;      // tick within current blink cycle
+
     loop {
         blink_counter = blink_counter.wrapping_add(1);
+
+        // Check for new model confirmation request
+        let new_confirm = MODEL_CONFIRM_BLINKS.swap(0, Ordering::AcqRel);
+        if new_confirm > 0 {
+            confirm_remaining = new_confirm;
+            confirm_tick = 0;
+        }
+
+        // Model confirmation blinks: N white blinks (200ms ON, 200ms OFF each)
+        if confirm_remaining > 0 {
+            let phase = confirm_tick % 4;
+            let color = if phase < 2 {
+                RGB8::new(50, 50, 50) // White ON
+            } else {
+                RGB8::new(0, 0, 0)    // OFF
+            };
+            confirm_tick += 1;
+            if confirm_tick >= confirm_remaining * 4 {
+                confirm_remaining = 0;
+            }
+            let _ = ws.write(&[color]).await;
+            ticker.next().await;
+            continue;
+        }
+
+        // Model selection mode: fast cyan blinking (100ms ON, 100ms OFF)
+        if IN_MODEL_SELECTION.load(Ordering::Acquire) {
+            let color = if blink_counter.is_multiple_of(2) {
+                RGB8::new(0, 30, 30) // Cyan ON
+            } else {
+                RGB8::new(0, 0, 0)   // OFF
+            };
+            let _ = ws.write(&[color]).await;
+            ticker.next().await;
+            continue;
+        }
+
         let mode = OperatingMode::load();
         let sats_invalid = SATELLITES_INVALID.load(Ordering::Acquire);
         let spoof_detected = SPOOF_DETECTED.load(Ordering::Acquire);
@@ -864,9 +913,46 @@ async fn simple_led_task(mut led: Output<'static>) {
     let mut ticker = Ticker::every(Duration::from_millis(50));
     let mut tick: u8 = 0;
 
+    // State machine for model selection confirmation blinks
+    // Each blink = 2 ticks ON (100ms) + 2 ticks OFF (100ms) = 4 ticks (200ms)
+    let mut confirm_remaining: u8 = 0;
+    let mut confirm_tick: u8 = 0;
+
     loop {
         ticker.next().await;
         tick = if tick >= 29 { 0 } else { tick + 1 };
+
+        // Check for new model confirmation request
+        let new_confirm = MODEL_CONFIRM_BLINKS.swap(0, Ordering::AcqRel);
+        if new_confirm > 0 {
+            confirm_remaining = new_confirm;
+            confirm_tick = 0;
+        }
+
+        // Model confirmation blinks: N blinks (100ms ON, 100ms OFF each)
+        if confirm_remaining > 0 {
+            let phase = confirm_tick % 4;
+            if phase < 2 {
+                led.set_high();
+            } else {
+                led.set_low();
+            }
+            confirm_tick += 1;
+            if confirm_tick >= confirm_remaining * 4 {
+                confirm_remaining = 0;
+            }
+            continue;
+        }
+
+        // Model selection mode: very fast blinking (50ms ON, 50ms OFF = every tick)
+        if IN_MODEL_SELECTION.load(Ordering::Acquire) {
+            if tick.is_multiple_of(2) {
+                led.set_high();
+            } else {
+                led.set_low();
+            }
+            continue;
+        }
 
         let mode = OperatingMode::load();
         let spoof_detected = SPOOF_DETECTED.load(Ordering::Acquire);
@@ -1830,10 +1916,6 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ack(0x06, 0x86); // ACK for CFG-PMS
         }
         ubx::UbxCommand::CfgValget { keys } => {
-            // CFG-VALGET before CFG-VALSET is a Mavic 4 pattern
-            // Mark this for auto-detection
-            SAW_CFG_VALGET.store(true, Ordering::Release);
-
             info!("CFG-VALGET received for {} keys", keys.len());
             let response = CfgValgetResponse::for_keys(keys);
             send_ubx_message(&response);
@@ -1841,30 +1923,6 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             // NAV output now starts 700ms after first config command (handled in nav_message_task)
         }
         ubx::UbxCommand::CfgValset { _layer: _, keys } => {
-            // Auto-detect drone model on first CFG-VALSET
-            // If we haven't detected yet, decide based on what we saw before
-            if !DRONE_DETECTED.load(Ordering::Acquire) {
-                let current_model = DRONE_MODEL.load(Ordering::Acquire);
-                if current_model == 2 || current_model == 3 {
-                    // Air 3S / Mavic 3 Pro set manually — skip auto-detection
-                    info!("AUTO-DETECT: skipped, model {} set manually", current_model);
-                } else {
-                    let saw_uniqid = SAW_SEC_UNIQID.load(Ordering::Acquire);
-                    let saw_valget = SAW_CFG_VALGET.load(Ordering::Acquire);
-
-                    if saw_uniqid || saw_valget {
-                        // Mavic 4 pattern: SEC-UNIQID or CFG-VALGET before CFG-VALSET
-                        DRONE_MODEL.store(1, Ordering::Release); // Mavic 4 Pro
-                        info!("AUTO-DETECT: Mavic 4 Pro (saw SEC-UNIQID={}, CFG-VALGET={})", saw_uniqid, saw_valget);
-                    } else {
-                        // Air 3 pattern: CFG-VALSET immediately after MON-VER
-                        DRONE_MODEL.store(0, Ordering::Release); // Air 3
-                        info!("AUTO-DETECT: Air 3 (no SEC-UNIQID/CFG-VALGET before CFG-VALSET)");
-                    }
-                }
-                DRONE_DETECTED.store(true, Ordering::Release);
-            }
-
             if DIAG_MSG_DETAIL { DIAG_VALSET_COUNT.fetch_add(1, Ordering::Relaxed); }
             info!("CFG-VALSET received with {} keys", keys.len());
 
@@ -1891,10 +1949,6 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
             send_ubx_message(&ver);
         }
         ubx::UbxCommand::SecUniqidPoll => {
-            // SEC-UNIQID poll is sent by Mavic 4 before CFG-RST
-            // Mark this for auto-detection (but don't change model here)
-            SAW_SEC_UNIQID.store(true, Ordering::Release);
-
             let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
             info!("SEC-UNIQID poll received, sending unique ID for {:?}", model);
             let uniqid = SecUniqid::for_model(model);
@@ -2187,18 +2241,7 @@ async fn sec_sign_timer_task() {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    // Wait for drone model auto-detection to complete (with timeout)
-    // If detection doesn't happen within 500ms, use default model (Air 3)
-    let detect_start = embassy_time::Instant::now();
-    while !DRONE_DETECTED.load(Ordering::Acquire) {
-        if detect_start.elapsed().as_millis() > 500 {
-            info!("Auto-detect timeout, using default model (Air 3)");
-            break;
-        }
-        Timer::after(Duration::from_millis(10)).await;
-    }
-
-    // Read model once after detection is complete
+    // Read drone model (set from flash at boot, or default Air 3S)
     let model = DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
     let (first_delay_ms, period_ms) = match model {
         DroneModel::Air3 => (
@@ -2276,6 +2319,7 @@ async fn sec_sign_timer_task() {
 /// Mode button task - hot-switches mode without reboot
 /// Выбор режима по количеству коротких нажатий:
 /// 1 нажатие → Emulation (зелёный), 2 → Passthrough (синий), 3 → PassthroughRaw (фиолетовый)
+/// 4 нажатия → PassthroughOffset (белый), 5 нажатий → выбор модели дрона (cyan)
 /// Использует RP2350-E9 Errata Workaround (Input Latch-up fix)
 #[embassy_executor::task]
 async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) {
@@ -2285,7 +2329,7 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
     // Инициализация GPIO
     flex.set_as_input();
     flex.set_pull(Pull::Down);
-    
+
     // Ждём 1с при старте для игнорирования power-on noise
     Timer::after(Duration::from_millis(1000)).await;
 
@@ -2295,15 +2339,89 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
 
     loop {
         Timer::after(Duration::from_millis(POLL_PERIOD_MS)).await;
-        
+
         let is_high = flex.is_high();
 
         // Проверка таймаута серии нажатий
         if click_count > 0 {
             if let Some(last_time) = last_click_time {
                 if last_time.elapsed().as_millis() >= MULTI_CLICK_TIMEOUT_MS {
-                    // Таймаут - применяем режим по количеству нажатий
-                    apply_mode_by_clicks(click_count, flash_mutex).await;
+                    if click_count == 5 {
+                        // ===== Фаза 2: выбор модели дрона =====
+                        IN_MODEL_SELECTION.store(true, Ordering::Release);
+                        info!("MODEL SELECT: entering model selection mode (5 clicks)");
+
+                        let mut model_clicks: u8 = 0;
+                        let mut model_last_click: Option<Instant> = None;
+                        let entry_time = Instant::now();
+                        let mut was_high_inner = flex.is_high();
+
+                        'model_select: loop {
+                            Timer::after(Duration::from_millis(POLL_PERIOD_MS)).await;
+                            let is_high_inner = flex.is_high();
+
+                            // Таймаут серии кликов (800ms) — модель выбрана
+                            if model_clicks > 0 {
+                                if let Some(last) = model_last_click {
+                                    if last.elapsed().as_millis() >= MULTI_CLICK_TIMEOUT_MS {
+                                        break 'model_select;
+                                    }
+                                }
+                            }
+
+                            // Общий таймаут (5с) без кликов — отмена
+                            if model_clicks == 0 && entry_time.elapsed().as_millis() >= MODEL_SELECT_TIMEOUT_MS {
+                                info!("MODEL SELECT: timeout, cancelled");
+                                break 'model_select;
+                            }
+
+                            // Детекция нажатия (аналогично основному циклу)
+                            if is_high_inner && !was_high_inner {
+                                info!("MODEL SELECT: edge detected (0->1), debouncing");
+                                Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+
+                                if flex.is_high() {
+                                    model_clicks = model_clicks.saturating_add(1).min(4);
+                                    info!("MODEL SELECT: click #{}", model_clicks);
+
+                                    // Ожидание отпускания (с E9 workaround, БЕЗ long press detection)
+                                    let mut high_count: u32 = 0;
+                                    loop {
+                                        if !flex.is_high() {
+                                            info!("MODEL SELECT: released!");
+                                            break;
+                                        }
+                                        Timer::after(Duration::from_millis(50)).await;
+                                        high_count += 1;
+
+                                        // E9 discharge kick каждые ~250мс (5 * 50мс)
+                                        if high_count.is_multiple_of(5) {
+                                            flex.set_as_output();
+                                            flex.set_low();
+                                            Timer::after(Duration::from_micros(50)).await;
+                                            flex.set_as_input();
+                                            flex.set_pull(Pull::Down);
+                                            Timer::after(Duration::from_micros(50)).await;
+                                        }
+                                    }
+
+                                    model_last_click = Some(Instant::now());
+                                }
+                            }
+                            was_high_inner = is_high_inner;
+                        }
+
+                        IN_MODEL_SELECTION.store(false, Ordering::Release);
+
+                        if model_clicks > 0 && model_clicks <= 4 {
+                            apply_model_by_clicks(model_clicks, flash_mutex).await;
+                        } else {
+                            info!("MODEL SELECT: no model selected");
+                        }
+                    } else {
+                        // ===== Фаза 1: выбор режима (1-4 клика) =====
+                        apply_mode_by_clicks(click_count, flash_mutex).await;
+                    }
                     click_count = 0;
                     last_click_time = None;
                 }
@@ -2316,7 +2434,7 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
             Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
 
             if flex.is_high() {
-                click_count = click_count.saturating_add(1).min(4);
+                click_count = click_count.saturating_add(1).min(5);
                 info!("button_task: click #{}", click_count);
 
                 // Ждём отпускания кнопки с E9 workaround и защитой от зависания
@@ -2428,6 +2546,36 @@ async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex)
             info!("Mode saved to flash");
         } else {
             warn!("Failed to save mode to flash");
+        }
+    }
+}
+
+/// Применяет модель дрона по количеству нажатий в режиме выбора модели
+/// 1 клик → Air 3, 2 → Mavic 4 Pro, 3 → Air 3S, 4 → Mavic 3 Pro
+async fn apply_model_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex) {
+    let new_model = match click_count {
+        1 => config::DroneModel::Air3,
+        2 => config::DroneModel::Mavic4Pro,
+        3 => config::DroneModel::Air3S,
+        4 => config::DroneModel::Mavic3Pro,
+        _ => return,
+    };
+
+    let old = config::DroneModel::from_u8(DRONE_MODEL.load(Ordering::Acquire));
+    DRONE_MODEL.store(new_model as u8, Ordering::Release);
+
+    info!("MODEL SELECT: {:?} -> {:?} (clicks={})", old, new_model, click_count);
+
+    // LED подтверждение: N вспышек белым
+    MODEL_CONFIRM_BLINKS.store(click_count, Ordering::Release);
+
+    // Сохраняем во flash
+    {
+        let mut flash = flash_mutex.lock().await;
+        if flash_storage::save_drone_model(&mut flash, new_model as u8) {
+            info!("Drone model saved to flash");
+        } else {
+            warn!("Failed to save drone model to flash");
         }
     }
 }

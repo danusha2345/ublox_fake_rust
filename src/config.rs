@@ -119,6 +119,8 @@ pub mod button {
     pub const POLL_PERIOD_MS: u64 = 20;
     /// Длительность удержания для запуска key extraction (мс)
     pub const LONG_PRESS_MS: u64 = 3000;
+    /// Таймаут режима выбора модели дрона без кликов (мс)
+    pub const MODEL_SELECT_TIMEOUT_MS: u64 = 5000;
 }
 
 /// Default coordinates (configurable)
