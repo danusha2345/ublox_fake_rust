@@ -353,7 +353,7 @@ pub fn modify_nav_svinfo(frame: &mut [u8]) {
 
 // ============================================================================
 // Coordinate Offset Functions for PassthroughOffset mode
-// Transforms: Saint Petersburg (59.9343°N, 30.3351°E) → Rachel, Nevada (37.6469°N, 115.7444°W)
+// Transforms: Saint Petersburg (59.9343°N, 30.3351°E) → Austin, Nevada (39.4933°N, 117.0686°W)
 // ============================================================================
 
 use crate::config::coordinate_offset::{

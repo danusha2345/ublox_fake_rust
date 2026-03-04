@@ -180,11 +180,11 @@ Timeout between clicks: 800ms. Hot-switch without reboot.
 
 PassthroughOffset works like Passthrough (spoof detection enabled), but applies a fixed coordinate offset to all NAV messages. The offset transforms coordinates from one region to another.
 
-**Current offset**: Saint Petersburg (59.9343°N, 30.3351°E) → Rachel, Nevada (37.6469°N, 115.7444°W)
+**Current offset**: Saint Petersburg (59.9343°N, 30.3351°E) → Austin, Nevada (39.4933°N, 117.0686°W)
 
 **Offset values** (in `config.rs`):
-- LAT_OFFSET_1E7 = -222,874,000 (1e-7 degrees)
-- LON_OFFSET_1E7 = -1,460,795,000 (1e-7 degrees)
+- LAT_OFFSET_1E7 = -204,410,000 (1e-7 degrees)
+- LON_OFFSET_1E7 = -1,474,037,000 (1e-7 degrees)
 - ECEF offset: pre-computed approximate values
 
 **Modified NAV messages**:
