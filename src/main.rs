@@ -164,6 +164,7 @@ static DIAG_CHANNEL_DROPS: AtomicU32 = AtomicU32::new(0); // GNSS_RX_CHANNEL ful
 static DIAG_LOCAL_BUF_DROPS: AtomicU32 = AtomicU32::new(0); // Local buffer overflow during SEC-SIGN
 static DIAG_SEC_SIGN_WAIT_MS: AtomicU32 = AtomicU32::new(0); // Last SEC-SIGN wait duration
 static DIAG_VALSET_COUNT: AtomicU32 = AtomicU32::new(0);     // CFG-VALSET messages received
+static DIAG_OFFSET_APPLIED: AtomicU32 = AtomicU32::new(0);  // Offset-modified frames per SEC-SIGN period
 
 /// Enable detailed per-message-type counters and VALSET key logging (set to true to diagnose)
 const DIAG_MSG_DETAIL: bool = false;
@@ -1096,7 +1097,10 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                 error!("UART TX SEC-SIGN error: {:?}", e);
                             }
-                            info!("SEC-SIGN sent ({} packets)", result.packet_count);
+                            info!("SEC-SIGN sent: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}]",
+                                  result.packet_count,
+                                  result.sha256_hash[0], result.sha256_hash[1],
+                                  result.sha256_hash[2], result.sha256_hash[3]);
                         }
                         // Clear flag (NAV/MON tasks poll this with yield_now)
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
@@ -1166,6 +1170,10 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                 error!("Passthrough SEC-SIGN TX error: {:?}", e);
                             }
+                            info!("SEC-SIGN sent: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}]",
+                                  result.packet_count,
+                                  result.sha256_hash[0], result.sha256_hash[1],
+                                  result.sha256_hash[2], result.sha256_hash[3]);
                         }
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                     }
@@ -1190,7 +1198,10 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                         // Signature ready - send it FIRST (before buffered packets)
                                         let wait_ms = wait_start.elapsed().as_millis() as u32;
                                         DIAG_SEC_SIGN_WAIT_MS.store(wait_ms, Ordering::Relaxed);
-                                        info!("SEC-SIGN wait={}ms buffered={} pkts", wait_ms, pending.len());
+                                        info!("SEC-SIGN wait={}ms buffered={} pkts hash=[{:02x}{:02x}{:02x}{:02x}]",
+                                              wait_ms, pending.len(),
+                                              result.sha256_hash[0], result.sha256_hash[1],
+                                              result.sha256_hash[2], result.sha256_hash[3]);
 
                                         let sec_sign_msg = SecSign {
                                             version: 0x01,
@@ -1482,6 +1493,7 @@ async fn gnss_processing_task() {
 
     // Dynamic offset for PassthroughOffset — computed once at first 3D GPS fix
     let mut dynamic_offset: Option<DynamicOffset> = None;
+    let mut first_offset_logged = false;
 
     // CNO buffer - accumulates CNO values from NAV-SAT messages
     let mut last_cno_values: heapless::Vec<u8, 16> = heapless::Vec::new();
@@ -1655,6 +1667,13 @@ async fn gnss_processing_task() {
                                 0x13 => apply_offset_nav_hpposecef(&mut frame, off),
                                 0x06 => apply_offset_nav_sol(&mut frame, off),
                                 _ => { offset_applied = false; }
+                            }
+                            if offset_applied {
+                                DIAG_OFFSET_APPLIED.fetch_add(1, Ordering::Relaxed);
+                                if !first_offset_logged {
+                                    first_offset_logged = true;
+                                    info!("First offset-modified frame: cls={:#04x} id={:#04x}", class, id);
+                                }
                             }
                             // Skip checksum if spoofed — spoof handler below recalculates after coordinate replacement
                             if offset_applied && !SPOOF_DETECTED.load(Ordering::Acquire) {
@@ -2369,7 +2388,9 @@ async fn sec_sign_timer_task() {
         };
 
         let _ = SEC_SIGN_REQUEST.try_send(request);
-        info!("SEC-SIGN requested for {} packets (TX paused)", count);
+        info!("SEC-SIGN req: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}] offset_mod={}",
+              count, hash[0], hash[1], hash[2], hash[3],
+              DIAG_OFFSET_APPLIED.swap(0, Ordering::Relaxed));
     }
 }
 
