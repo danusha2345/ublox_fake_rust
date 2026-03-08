@@ -124,14 +124,25 @@ pub mod button {
 }
 
 /// Default coordinates (configurable) — Golden Beach, FL
-/// Also used as target position for PassthroughOffset mode (dynamic offset computed at first GPS fix)
+/// Used by Emulation mode for fake GNSS data
 pub mod default_position {
     pub const LATITUDE: f64 = 25.966443;
     pub const LONGITUDE: f64 = -80.122371;
     pub const ALTITUDE_M: i32 = 100;
-    // Pre-computed for PassthroughOffset dynamic offset calculation
+    // Pre-computed for coordinate calculations
     pub const LAT_1E7: i32 = 259_664_430;    // (LATITUDE * 1e7) as i32
     pub const LON_1E7: i32 = -801_223_710;   // (LONGITUDE * 1e7) as i32
+    pub const ALT_MM: i32 = 100_000;          // ALTITUDE_M * 1000
+}
+
+/// Target coordinates for PassthroughOffset mode (mode 4) — Seney, Michigan
+/// Dynamic offset = offset_target - actual_gps_position (computed at first 3D fix)
+pub mod offset_target {
+    pub const LATITUDE: f64 = 46.3407;
+    pub const LONGITUDE: f64 = -85.9407;
+    pub const ALTITUDE_M: i32 = 100;
+    pub const LAT_1E7: i32 = 463_407_000;    // (LATITUDE * 1e7) as i32
+    pub const LON_1E7: i32 = -859_407_000;   // (LONGITUDE * 1e7) as i32
     pub const ALT_MM: i32 = 100_000;          // ALTITUDE_M * 1000
 }
 

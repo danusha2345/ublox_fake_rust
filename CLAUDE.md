@@ -144,19 +144,23 @@ cargo rp2354    # build for RP2354 (ELF only, no UF2)
 
 ### Coordinate System
 
-Default coordinates are set in `config.rs` and automatically converted to all required formats at startup:
+Two sets of coordinates in `config.rs`, converted to all required formats at startup:
 
 ```rust
 // config.rs
-pub mod default_position {
-    pub const LATITUDE: f64 = 37.6469;      // Rachel, Nevada
-    pub const LONGITUDE: f64 = -115.7444;
-    pub const ALTITUDE_M: i32 = 100;
+pub mod default_position {           // Emulation mode (mode 1)
+    pub const LATITUDE: f64 = 25.966443;    // Golden Beach, FL
+    pub const LONGITUDE: f64 = -80.122371;
+}
+pub mod offset_target {              // PassthroughOffset mode (mode 4)
+    pub const LATITUDE: f64 = 46.3407;      // Seney, Michigan
+    pub const LONGITUDE: f64 = -85.9407;
 }
 ```
 
 The `coordinates` module computes once at init:
-- `lat_1e7()`, `lon_1e7()` - for NAV-PVT, NAV-POSLLH (deg × 1e-7)
+- `lat_1e7()`, `lon_1e7()` - Emulation target (deg × 1e-7)
+- `offset_lat_1e7()`, `offset_lon_1e7()` - PassthroughOffset target
 - `alt_mm()` - altitude in mm
 - `ecef_x_cm()`, `ecef_y_cm()`, `ecef_z_cm()` - for NAV-POSECEF, NAV-SOL, NAV-HPPOSECEF
 
@@ -180,7 +184,7 @@ Timeout between clicks: 800ms. Hot-switch without reboot.
 
 PassthroughOffset works like Passthrough (spoof detection enabled), but applies a dynamic coordinate offset to all NAV messages. The offset is computed **once** at the first 3D GPS fix: `offset = default_position - actual_gps_position`. This means it works from **any location** — no hardcoded source/target offsets needed.
 
-**Target position**: `default_position` in `config.rs` (same coordinates used by Emulation mode)
+**Target position**: `offset_target` in `config.rs` (Seney, Michigan — separate from Emulation mode's `default_position`)
 
 **Dynamic offset computation** (in `gnss_processing_task`):
 1. Wait for first NAV-PVT with `fix_type >= 3` (3D fix) and `num_sv >= 4`
@@ -247,6 +251,8 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 **Bug fix (Jan 2026)**: Fixed false positive triggering during GPS re-acquisition after spoofing ends. Previously, `last_good` was overwritten during time recovery, making detector vulnerable to coordinate jumps. Now `last_good` is preserved and recovery warmup ignores coordinate anomalies.
 
 **Bug fix (Jan 2026 #2)**: Fixed false teleport detection when switching from Emulation to Passthrough mode. Added `SPOOF_DETECTOR_RESET` atomic flag that triggers detector reset via `apply_mode_by_clicks()`. This prevents the detector from seeing emulation coordinates as the previous position when real GNSS data starts arriving.
+
+**Bug fix (Mar 2026)**: Spoof detection bypassed during GPS signal gap. When a spoofer captures the GNSS module, it typically causes a brief loss of 3D fix (fix_type < 3). The detector ignores samples without 3D fix. If this gap exceeds 5 seconds (MAX_GAP_MS), the `GapReset` path fired — it updated `prev` to the spoofed position and returned **without checking teleportation, GNSS time, or clock drift**. Result: spoofed coordinates were silently accepted as the new reference. The next sample compared against the spoofed position → distance=0 → Normal. Detection only triggered later via clock drift (10+ seconds). Bug existed since the first spoof_detector commit (56f28f7). Fix: during gap, check distance from `last_good` (teleportation), system clock drift, and GNSS time jump. If any anomaly detected → immediate spoofing confirmation (no consecutive count required). Affects both Passthrough (mode 2) and PassthroughOffset (mode 4).
 
 **Known bug (Jan 2026)**: SEC-UNIQID race condition in drone auto-detection. When Mavic 4 Pro connects, it sends SEC-UNIQID poll BEFORE CFG-VALSET, but auto-detection triggers on CFG-VALSET. Result: Mavic 4 receives Air 3's chip ID (`0xE0 0x95 0x65 0x0F 0x2A` instead of `0xEB 0xB9 0x91 0x0F 0x2B`), causing signature rejection. **Workaround**: Set default `DRONE_MODEL` to target model in `main.rs` (currently Air 3S = 2). Auto-detection is skipped when Air 3S or Mavic 3 Pro is set manually.
 

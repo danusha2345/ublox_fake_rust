@@ -385,10 +385,47 @@ impl SpoofDetector {
         // Check for data gap
         let dt_ms = pos.time_ms.wrapping_sub(prev.time_ms);
         if dt_ms > thresholds::MAX_GAP_MS {
-            // Long gap - reset reference, don't trigger false positive
+            let mut gap_spoof = false;
+
+            // Check 1: Position jumped far from last_good after gap
+            if let Some(ref good) = self.last_good {
+                let dist_from_good = Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon);
+                if dist_from_good > thresholds::TELEPORT_M {
+                    warn!("TELEPORT after gap: {}m from last_good (gap={}ms)", dist_from_good as i32, dt_ms);
+                    gap_spoof = true;
+                }
+            }
+
+            // Check 2: Clock drift after gap (time-based detection even during gaps)
+            if let Some(ref gnss_time) = pos.gnss_time {
+                let (drift_spoof, _) = self.check_system_clock_drift(gnss_time, pos.time_ms);
+                if drift_spoof {
+                    warn!("CLOCK DRIFT after gap (gap={}ms)", dt_ms);
+                    gap_spoof = true;
+                }
+                // Check GNSS time jump
+                let (time_spoof, _) = self.check_gnss_time(gnss_time, pos.time_ms);
+                if time_spoof {
+                    warn!("GNSS TIME anomaly after gap (gap={}ms)", dt_ms);
+                    gap_spoof = true;
+                }
+            }
+
+            if gap_spoof {
+                self.total_anomalies += 1;
+                // Immediate confirmation for gap+teleport/time — no need for consecutive count
+                if !self.spoofed {
+                    self.spoofed = true;
+                    self.anomaly_count = thresholds::SPOOF_CONFIRM_COUNT;
+                    self.normal_count = 0;
+                    error!("SPOOFING CONFIRMED after gap (immediate)");
+                }
+                self.prev = Some(pos);
+                return if self.spoofed { AnalysisResult::Spoofed } else { AnalysisResult::Normal };
+            }
+
             info!("GPS gap detected ({}ms), resetting reference", dt_ms);
             self.prev = Some(pos);
-            // Don't update last_good - keep it for comparison after gap
             return AnalysisResult::GapReset;
         }
 

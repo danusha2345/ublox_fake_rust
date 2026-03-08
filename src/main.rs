@@ -376,7 +376,7 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro)
 /// Default is Air 3S. Auto-detection skipped when Air 3S is set manually.
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(2); // Air 3S (default)
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(2); // Air3S (default)
 
 
 /// Model selection mode active (for LED feedback: cyan blinking)
@@ -1351,6 +1351,7 @@ async fn diag_stats_task() {
             info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms ===",
                   rx_pkts, tx_pkts, in_flight, ch_drops, buf_drops, sec_wait);
         }
+
     }
 }
 
@@ -1627,15 +1628,15 @@ async fn gnss_processing_task() {
                             let (act_ex, act_ey, act_ez) = coordinates::llh_to_ecef_cm(act_lat, act_lon, act_alt);
                             // Target = default_position (cached at init)
                             let off = DynamicOffset {
-                                lat_1e7: coordinates::lat_1e7() - act_lat,
-                                lon_1e7: coordinates::lon_1e7() - act_lon,
-                                alt_mm: coordinates::alt_mm() - act_alt,
-                                ecef_x_cm: coordinates::ecef_x_cm() - act_ex,
-                                ecef_y_cm: coordinates::ecef_y_cm() - act_ey,
-                                ecef_z_cm: coordinates::ecef_z_cm() - act_ez,
+                                lat_1e7: coordinates::offset_lat_1e7() - act_lat,
+                                lon_1e7: coordinates::offset_lon_1e7() - act_lon,
+                                alt_mm: coordinates::offset_alt_mm() - act_alt,
+                                ecef_x_cm: coordinates::offset_ecef_x_cm() - act_ex,
+                                ecef_y_cm: coordinates::offset_ecef_y_cm() - act_ey,
+                                ecef_z_cm: coordinates::offset_ecef_z_cm() - act_ez,
                             };
                             info!("Dynamic offset locked: actual=({},{}) target=({},{}) dlat={} dlon={}",
-                                  act_lat, act_lon, coordinates::lat_1e7(), coordinates::lon_1e7(),
+                                  act_lat, act_lon, coordinates::offset_lat_1e7(), coordinates::offset_lon_1e7(),
                                   off.lat_1e7, off.lon_1e7);
                             dynamic_offset = Some(off);
                         }
