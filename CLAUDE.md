@@ -480,6 +480,13 @@ rp_pac::UART1.uartifls().write(|w| {
 
 Model selection: `DRONE_MODEL` static variable in `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro). Default: Air 3S (2). Auto-detection skipped when Air 3S or Mavic 3 Pro is set manually.
 
+**Note**: Mavic 4 Pro has two known private keys (different units have different keys):
+- Key 1 (hardcoded): `90 89 a2 18 14 a6 2f c3 3a f5 d6 eb 61 16 1c e1 86 36 f5 48 d0 71 d6 9f`
+- Key 2: `55 14 01 BC 89 05 7B E6 3C 84 13 FA 37 30 7F 88 B4 BE 42 73 3A AD FF DA`
+- Key 3: `1F DE D3 9B 4F F6 98 A1 95 D9 02 A2 69 0F 9A BB 8B 48 74 F9 B5 74 89 66`
+
+Each physical GNSS module has its own unique key burned into OTP. Use key extraction to get the correct key for a specific unit.
+
 **Implementation**: Pure Rust using `p192` crate primitives (no C dependencies)
 
 Algorithm:
