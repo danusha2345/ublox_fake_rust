@@ -100,6 +100,45 @@ cargo rp2350    # build for RP2350 (ELF only, no UF2)
 cargo rp2354    # build for RP2354 (ELF only, no UF2)
 ```
 
+## Host-Side Tests
+
+`spoof_detector.rs` is pure logic (no embassy/cortex-m deps) and can be tested on the host via a standalone crate in `tests_host/`. Uses a mock `defmt` crate (no-op macros) to satisfy `use defmt::*`.
+
+```bash
+make test                              # Run all 64 tests
+cd tests_host && cargo test            # Same, directly
+cd tests_host && cargo test vuln       # Only regression tests (Mar 2026 vulnerabilities)
+cd tests_host && cargo test -- -v      # Verbose output
+```
+
+**Structure** (zero firmware code changes):
+```
+tests_host/
+  .cargo/config.toml          # Override target to x86_64 (parent sets thumbv8m)
+  Cargo.toml                  # Standalone crate, NOT in workspace
+  defmt_mock/                 # Fake defmt: 5 no-op macros (info/warn/error/trace/debug)
+  src/lib.rs                  # #[path = "../../src/spoof_detector.rs"] + Debug impl
+  tests/test_spoof_detector.rs  # 64 tests, 12 groups
+```
+
+**Test groups** (64 tests):
+| Group | Tests | Coverage |
+|-------|-------|----------|
+| 0: Utilities | 8 | GnssTime, calc_distance, FixType |
+| 1: Basic flow | 6 | init, warmup, normal flight |
+| 2: Teleportation | 5 | >2km threshold, all directions |
+| 3: Speed | 2 | 31 vs 29 m/s boundary |
+| 4: GNSS time | 6 | forward/backward jumps, warmup suppression |
+| 5: Clock drift | 5 | calibration, 10s threshold, recovery |
+| 6: Recovery | 9 | coord (5+1 samples), time (immediate), warmup |
+| 7: Gap handling | 6 | >5s gap, gap+teleport/drift/time |
+| 8: Regressions | 6 | Mar 2026 vulns: immediate detect, last_good guard |
+| 9: last_good | 4 | Invariant: frozen during spoof, survives recovery |
+| 10: Complex | 4 | Spoof/recovery cycles, realistic attack |
+| 11: Reset | 2 | Clean state after reset |
+
+**Note**: Coord recovery requires 6 samples (not 5) — returning from spoofed position is itself a teleport that resets normal_count.
+
 ## Architecture
 
 ### Dual-core async design (Embassy)

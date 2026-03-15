@@ -1,6 +1,6 @@
 # Makefile for ublox_fake firmware
 
-.PHONY: all clean rp2040 rp2350 rp2354 flash flash-rp2354
+.PHONY: all clean rp2040 rp2350 rp2354 flash flash-rp2354 test
 
 # Default target
 all: rp2350
@@ -51,6 +51,11 @@ flash-rp2354:
 	cargo build --release --no-default-features --features rp2354 --target thumbv8m.main-none-eabihf
 	probe-rs run --chip RP2354 target/thumbv8m.main-none-eabihf/release/ublox_fake
 
+# Run host-side tests (spoof_detector)
+test:
+	cd tests_host && cargo test
+
 clean:
 	cargo clean
+	cd tests_host && cargo clean
 	rm -f *.uf2

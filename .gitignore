@@ -1,5 +1,6 @@
 # Build artifacts
 /target
+tests_host/target/
 
 # IDE
 .idea/

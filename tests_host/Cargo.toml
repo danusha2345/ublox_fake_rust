@@ -1,0 +1,9 @@
+[package]
+name = "spoof_detector_tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+defmt = { path = "defmt_mock" }
+heapless = "0.8"
+libm = "0.2"
