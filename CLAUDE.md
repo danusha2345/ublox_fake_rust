@@ -218,7 +218,7 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 - **Teleportation**: Position jump > 2km (increased from 500m to reduce false positives during GPS re-acquisition)
 - **Speed anomaly**: Ground speed > 30 m/s (108 km/h)
 - **GNSS time jump backwards**: Time going backwards > 1 second
-- **GNSS time jump forwards**: Unrealistic jump > 30 seconds
+- **GNSS time jump forwards**: Unrealistic jump > 5 seconds (matches MAX_GAP_MS)
 - **System clock drift**: GNSS time vs calibrated internal clock > 10 seconds
 
 **Disabled algorithms** (code kept for future use):
@@ -235,7 +235,7 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 **On spoofing detected**:
 1. Save last good coordinates (2 seconds before spoofing started) including ECEF (computed via `llh_to_ecef_cm()`)
 2. Replace coordinates with LAST_GOOD in ALL 5 positional NAV messages (PVT, POSLLH, POSECEF, HPPOSECEF, SOL)
-3. Degrade status: `num_sv=2`, `fix_type=0`, `flags=0`, zero velocity, high accuracy values (9999999)
+3. Degrade status: `num_sv=92` (impossible value as spoof marker), `fix_type=0`, `flags=0`, zero velocity, high accuracy values (9999999)
 4. NAV-STATUS, NAV-SAT, NAV-SVINFO: degrade fix/satellite counts
 5. LED: Fast blinking red (200ms cycle)
 6. Recalculate Fletcher-8 checksum after modification
@@ -277,14 +277,14 @@ When in passthrough mode, the device parses incoming UBX frames and detects GPS 
 **NAV messages modified during spoofing**:
 | Message | Size | Fields replaced/degraded |
 |---------|------|--------------------------|
-| NAV-PVT | 92B | lon, lat, height, hMSL → LAST_GOOD; velN/E/D → 0; fix_type=0, flags=0, num_sv=2 |
+| NAV-PVT | 92B | lon, lat, height, hMSL → LAST_GOOD; velN/E/D → 0; fix_type=0, flags=0, num_sv=92 |
 | NAV-POSLLH | 28B | lon, lat, height, hMSL → LAST_GOOD; hAcc/vAcc → 9999999 |
 | NAV-POSECEF | 20B | ecefX/Y/Z → LAST_GOOD_ECEF; pAcc → 9999999 |
 | NAV-HPPOSECEF | 28B | ecefX/Y/Z → LAST_GOOD_ECEF; Hp → 0; invalidEcef flag; pAcc → 9999999 |
-| NAV-SOL | 52B | ecefX/Y/Z → LAST_GOOD_ECEF; ecefVX/Y/Z → 0; gps_fix=0, num_sv=2; pAcc → 9999999 |
+| NAV-SOL | 52B | ecefX/Y/Z → LAST_GOOD_ECEF; ecefVX/Y/Z → 0; gps_fix=0, num_sv=92; pAcc → 9999999 |
 | NAV-STATUS | 16B | gps_fix=0, flags=0 |
-| NAV-SAT | 8+12n | num_svs=2 |
-| NAV-SVINFO | 8+12n | num_ch=2 |
+| NAV-SAT | 8+12n | num_svs=92 |
+| NAV-SVINFO | 8+12n | num_ch=92 |
 
 ### NAV Output Start Timing
 

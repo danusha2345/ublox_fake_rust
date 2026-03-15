@@ -53,9 +53,9 @@ pub mod thresholds {
 
     // ===== Time-based detection thresholds =====
 
-    /// Maximum realistic GNSS time jump forward in seconds (30s)
-    /// GPS receivers should maintain continuous time
-    pub const MAX_TIME_JUMP_FORWARD_S: i64 = 30;
+    /// Maximum realistic GNSS time jump forward in seconds (5s)
+    /// Must be >= MAX_GAP_MS/1000 to avoid false positives from brief GPS gaps
+    pub const MAX_TIME_JUMP_FORWARD_S: i64 = 5;
 
     /// Time jump backwards threshold (even 1s backwards is suspicious)
     /// Real GNSS time should never go backwards
