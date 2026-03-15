@@ -32,8 +32,9 @@ pub mod thresholds {
     /// Helps detect impossible acceleration changes
     pub const MAX_ACCEL_MS2: f32 = 20.0;
 
-    /// Minimum samples to confirm spoofing (2 = require consecutive anomalies)
-    pub const SPOOF_CONFIRM_COUNT: u8 = 2;
+    /// Minimum samples to confirm spoofing (1 = immediate detection)
+    /// With 2km teleport threshold, false positives are impossible in normal flight
+    pub const SPOOF_CONFIRM_COUNT: u8 = 1;
 
     /// Minimum normal samples to clear spoofing flag
     pub const NORMAL_CONFIRM_COUNT: u8 = 5;
@@ -579,8 +580,10 @@ impl SpoofDetector {
             self.spoofed = false;
             self.normal_count = 0;
             self.anomaly_count = 0;
-            // Update last_good position to current (we trust time-based recovery)
-            self.last_good = Some(pos.clone());
+            // DO NOT update last_good here — current position may still be spoofed
+            // (spoofer returned time to normal but coordinates remain shifted)
+            // last_good stays at pre-spoof position, recovery warmup + distance check
+            // will gradually update it if coordinates are truly clean
             // CRITICAL: Update last_good_gnss_time to prevent re-triggering spoof!
             if let Some(ref gnss_time) = pos.gnss_time {
                 self.last_good_gnss_time = Some(*gnss_time);
@@ -665,9 +668,18 @@ impl SpoofDetector {
                 }
             }
 
-            // Update last_good if not spoofed
+            // Update last_good if not spoofed AND position is within teleport threshold
+            // This prevents a spoofed position from becoming the new reference
             if !self.spoofed {
-                self.last_good = Some(pos.clone());
+                let should_update = if let Some(ref good) = self.last_good {
+                    let dist = Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon);
+                    dist < thresholds::TELEPORT_M
+                } else {
+                    true
+                };
+                if should_update {
+                    self.last_good = Some(pos.clone());
+                }
             }
         }
 
