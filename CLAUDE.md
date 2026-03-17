@@ -314,11 +314,11 @@ After 20 seconds from NAV output start, satellites become invalid (fix_type=0, n
 ### SEC-SIGN TX Pause
 
 `SEC_SIGN_IN_PROGRESS` atomic flag coordinates TX during ECDSA:
-1. `sec_sign_timer_task`: check flag not stuck → set flag → capture hash → signal Core1
+1. `sec_sign_timer_task`: if flag stuck → reuse it (no clear/set gap); else set flag → capture hash → signal Core1
 2. `nav_message_task` / `mon_message_task`: yield_now() loop until flag clear
 3. `uart_tx_task`: buffer packets during wait → send signature → clear flag
 
-**Stuck flag guard**: If `SEC_SIGN_IN_PROGRESS` still true on next ticker tick (~2s later), it's force-cleared with warning. Prevents indefinite stall from dropped `SEC_SIGN_RESULT` (Core1 `try_send` fail). Max SEC-SIGN gap = 4s.
+**Stuck flag guard**: If `SEC_SIGN_IN_PROGRESS` still true on next ticker tick (~2s later), flag is **not cleared** — left true and falls through to capture hash immediately (avoids TOCTOU window where TX task could sneak packets). Max SEC-SIGN gap = 2s.
 
 **MGA-ACK**: `send_ack(0x13, id)` only in Emulation mode. In Passthrough, real GNSS sends its own MGA-ACK (MGA-0x60). Generating duplicate ACKs flooded TX_CHANNEL and starved executor.
 

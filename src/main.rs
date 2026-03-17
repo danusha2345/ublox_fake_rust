@@ -783,7 +783,6 @@ async fn main(spawner: Spawner) {
     // sec_sign_timer_task moved to Core1 — avoids UART interrupt starvation on Core0
 
     // Button task for mode switching (no reboot!)
-    // Button task for mode switching (no reboot!)
     spawner.must_spawn(button_task(btn_flex, flash_mutex));
 
     // Diagnostic stats task (every 10 seconds)
@@ -1186,8 +1185,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                 error!("Passthrough SEC-SIGN TX error: {:?}", e);
                             }
-                            // Flush to ensure SEC-SIGN is physically transmitted before continuing
-                            let _ = tx.flush().await;
                             DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
                             info!("SEC-SIGN sent: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}]",
                                   result.packet_count,
@@ -1238,8 +1235,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                                 error!("Passthrough SEC-SIGN TX error: {:?}", e);
                                             }
-                                            // Flush to ensure SEC-SIGN is physically transmitted before continuing
-                                            let _ = tx.flush().await;
                                             DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
                                         }
                                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
@@ -2403,6 +2398,7 @@ async fn sec_sign_timer_task() {
 
         let mode = OperatingMode::load();
         if mode == OperatingMode::PassthroughRaw {
+            ticker.next().await;
             continue;  // SEC-SIGN timer skipped in Raw mode
         }
         // All other modes: Emulation, Passthrough, PassthroughOffset — always generate SEC-SIGN
@@ -2413,15 +2409,15 @@ async fn sec_sign_timer_task() {
         // Force-clear and fall through to generate SEC-SIGN on this tick.
         // This reduces max gap from 4s to 2s.
         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-            warn!("SEC-SIGN cycle stuck (>{}ms), force clearing", period_ms);
-            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-            // Don't skip — fall through to generate SEC-SIGN on this tick
+            warn!("SEC-SIGN cycle stuck (>{}ms), force clearing — reusing flag", period_ms);
+            // Don't clear+set — leave flag true to avoid TOCTOU window where TX task
+            // could sneak packets between store(false) and store(true)
+        } else {
+            // CRITICAL: Pause TX before capturing hash to prevent race condition
+            // Any packets sent after hash capture but before SEC-SIGN TX would not
+            // be included in the hash -> verification fails on receiver side
+            SEC_SIGN_IN_PROGRESS.store(true, Ordering::Release);
         }
-
-        // CRITICAL: Pause TX before capturing hash to prevent race condition
-        // Any packets sent after hash capture but before SEC-SIGN TX would not
-        // be included in the hash -> verification fails on receiver side
-        SEC_SIGN_IN_PROGRESS.store(true, Ordering::Release);
 
         // Get hash and count from global accumulator, reset it
         // Must capture BOTH atomically - packet count at same moment as hash
