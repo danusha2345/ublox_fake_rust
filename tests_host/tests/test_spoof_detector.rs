@@ -1205,18 +1205,19 @@ fn test_spoof_recovery_spoof_cycle() {
 }
 
 #[test]
-fn test_gradual_shift_not_detected() {
-    // Slow movement at 25 m/s (under 30 m/s threshold) — legitimate flight
+fn test_gradual_shift_short_is_normal() {
+    // Slow movement at 25 m/s within leash (< 5km) — legitimate flight, no detection
     let mut det = SpoofDetector::new();
     det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init
 
     let mut lat = BASE_LAT;
+    // 100 samples * 5m = 500m — well within leash
     for i in 1..=100 {
         // 25 m/s * 0.2s = 5m per sample → delta_lat = 5/111320*1e7 ≈ 449
         lat += 449;
         let r = det.analyze(pos(lat, BASE_LON, 1000 + i * 200));
         assert_eq!(r, AnalysisResult::Normal,
-            "gradual 25m/s movement should not be detected at sample {}", i);
+            "gradual 25m/s movement within leash should not be detected at sample {}", i);
     }
 }
 
@@ -1422,24 +1423,26 @@ fn test_last_good_check_catches_drift() {
 
 #[test]
 fn test_origin_drift_detected() {
-    // Bug 3: slow gradient drift >50km from origin → must be detected
+    // Bug 3: slow gradient drift >10km from origin → must be detected
     let mut det = SpoofDetector::new();
     det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init
 
     // Move 100m per step at 4s intervals = 25 m/s (under 30 m/s threshold)
     // 100m in 1e-7 degrees ≈ 8984
-    // Steps to 50km: 500
+    // Steps to 10km: 100
     let mut lat = BASE_LAT;
     let delta_per_step = 8984; // ~100m per step
     let step_ms = 4000u32; // 4s interval (under 5s gap threshold)
     let mut t = 1000 + step_ms;
-    for _ in 0..600 {
+    for _ in 0..150 {
         lat += delta_per_step;
         let r = det.analyze(pos(lat, BASE_LON, t));
         if r == AnalysisResult::Spoofed {
             let dist_km = calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) / 1000.0;
-            assert!(dist_km > 49.0,
-                "origin drift should only trigger near 50km, got {}km", dist_km);
+            // Leash freezes last_good at ~5km, then last_good_anomaly triggers at ~7km
+            // or origin_drift triggers at 10km — either way, detection before 10km
+            assert!(dist_km > 6.0,
+                "detection should happen after leash freeze, got {}km", dist_km);
             return; // Test passed
         }
         t += step_ms;
@@ -1450,15 +1453,15 @@ fn test_origin_drift_detected() {
 
 #[test]
 fn test_origin_normal_flight() {
-    // Bug 3 complement: normal flight <50km from origin → no false positive
+    // Normal flight within leash (< 5km) → no false positive
     let mut det = SpoofDetector::new();
     det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init
 
-    // Fly 10km at 25 m/s (well under 50km threshold)
+    // Fly 4km at 25 m/s (well under 5km leash)
     let mut lat = BASE_LAT;
     let delta_per_step = 449; // ~5m per step = 25 m/s at 200ms interval
     let mut t = 1200u32;
-    for i in 0..2000 {
+    for i in 0..800 {
         lat += delta_per_step;
         let r = det.analyze(pos(lat, BASE_LON, t));
         assert_eq!(r, AnalysisResult::Normal,
@@ -1466,9 +1469,9 @@ fn test_origin_normal_flight() {
             i, calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) as i32);
         t += 200;
     }
-    // Final distance: 2000 * 5m = 10km — well under 50km
+    // Final distance: 800 * 5m = 4km — within leash
     let dist = calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON);
-    assert!(dist < 11_000.0, "sanity: total distance should be ~10km, got {}m", dist);
+    assert!(dist < 5_000.0, "sanity: total distance should be ~4km, got {}m", dist);
 }
 
 #[test]
@@ -1488,5 +1491,147 @@ fn test_origin_reset() {
         let r = det.analyze(pos(new_lat + (i * 100), BASE_LON, 2000 + i as u32 * 200));
         assert_eq!(r, AnalysisResult::Normal,
             "flight from new origin after reset should be normal");
+    }
+}
+
+// ============================================================================
+// Group 13: Gradual drift + leash + altitude
+// ============================================================================
+
+/// Helper: create a Position with custom altitude
+fn pos_with_alt(lat: i32, lon: i32, alt_mm: i32, time_ms: u32) -> Position {
+    Position {
+        lat,
+        lon,
+        alt_mm,
+        time_ms,
+        fix_type: FixType::Fix3D,
+        h_acc_mm: 1000,
+        num_sv: 12,
+        pdop: 150,
+        gnss_time: None,
+        cno_values: heapless::Vec::new(),
+    }
+}
+
+#[test]
+fn test_leash_freezes_last_good() {
+    // Gradual drift at 25 m/s — leash freezes last_good at ~5km,
+    // then last_good_anomaly triggers when >2km from frozen last_good (~7km total)
+    let mut det = SpoofDetector::new();
+    det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init
+
+    let mut lat = BASE_LAT;
+    let delta_per_step = 449; // ~5m per step = 25 m/s at 200ms
+    let mut t = 1200u32;
+    let mut detected = false;
+
+    // Drift up to 10km (2000 samples * 5m)
+    for i in 0..2000 {
+        lat += delta_per_step;
+        let r = det.analyze(pos(lat, BASE_LON, t));
+        if r == AnalysisResult::Spoofed {
+            let dist_km = calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) / 1000.0;
+            // Should detect after leash freeze (~5km) + 2km drift from frozen last_good
+            assert!(dist_km > 5.0,
+                "detection too early at step {} ({}km), leash is 5km", i, dist_km);
+            assert!(dist_km < 10.0,
+                "detection too late at step {} ({}km), expected <10km", i, dist_km);
+            detected = true;
+            break;
+        }
+        t += 200;
+    }
+    assert!(detected, "gradual drift should be detected by leash mechanism");
+}
+
+#[test]
+fn test_leash_normal_short_flight() {
+    // Normal flight 3km and back — no false positive
+    let mut det = SpoofDetector::new();
+    det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init
+
+    let delta_per_step = 449; // ~5m per step
+    let mut t = 1200u32;
+
+    // Fly 3km out (600 steps)
+    let mut lat = BASE_LAT;
+    for i in 0..600 {
+        lat += delta_per_step;
+        let r = det.analyze(pos(lat, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Normal,
+            "outbound flight should be normal at step {} ({}m from origin)",
+            i, calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) as i32);
+        t += 200;
+    }
+
+    // Fly 3km back (600 steps)
+    for i in 0..600 {
+        lat -= delta_per_step;
+        let r = det.analyze(pos(lat, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Normal,
+            "return flight should be normal at step {} ({}m from origin)",
+            i, calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) as i32);
+        t += 200;
+    }
+}
+
+#[test]
+fn test_leash_dynamic_spoof_from_start() {
+    // Spoof starting at real position, gradual drift — should detect within 10km
+    let mut det = SpoofDetector::new();
+    det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init at real position
+
+    let mut lat = BASE_LAT;
+    let delta_per_step = 449; // ~5m per step = 25 m/s at 200ms
+    let mut t = 1200u32;
+    let mut detected = false;
+
+    for _ in 0..2000 {
+        lat += delta_per_step;
+        let r = det.analyze(pos(lat, BASE_LON, t));
+        if r == AnalysisResult::Spoofed {
+            let dist_km = calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) / 1000.0;
+            assert!(dist_km < 10.0,
+                "dynamic spoof detection should happen before 10km, got {}km", dist_km);
+            detected = true;
+            break;
+        }
+        t += 200;
+    }
+    assert!(detected, "dynamic spoof from start should be detected");
+}
+
+#[test]
+fn test_altitude_jump_detected() {
+    // Sudden altitude jump >10m in one sample (200ms) → Spoofed
+    let mut det = SpoofDetector::new();
+    let t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal altitude for several samples
+    for i in 0..5 {
+        let r = det.analyze(pos_with_alt(BASE_LAT, BASE_LON, 100_000, t + i * 200));
+        assert_eq!(r, AnalysisResult::Normal);
+    }
+
+    // Sudden altitude jump: 100m → 115m (15m jump, >10m threshold)
+    let r = det.analyze(pos_with_alt(BASE_LAT, BASE_LON, 115_000, t + 5 * 200));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "altitude jump of 15m in 200ms should be detected as spoofing");
+}
+
+#[test]
+fn test_normal_altitude_change() {
+    // Gradual altitude change ~1m per sample → Normal (no false positive)
+    let mut det = SpoofDetector::new();
+    let t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    let mut alt_mm = 100_000; // 100m
+    for i in 0..50 {
+        alt_mm += 1000; // +1m per sample (5 m/s vertical)
+        let r = det.analyze(pos_with_alt(BASE_LAT, BASE_LON, alt_mm, t + i * 200));
+        assert_eq!(r, AnalysisResult::Normal,
+            "gradual 1m/sample altitude change should not trigger at step {} (alt={}m)",
+            i, alt_mm / 1000);
     }
 }

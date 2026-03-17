@@ -21,10 +21,15 @@ pub mod thresholds {
     /// Increased from 5m to reduce false positives from GPS noise
     pub const TELEPORT_ALT_M: f32 = 10.0;
 
-    /// Maximum drift from origin position (first GPS fix) in meters (50km)
-    /// DJI max range ~30km, so 50km covers any legitimate flight
-    /// Detects slow gradient attacks that evade per-sample teleport checks
-    pub const MAX_DRIFT_FROM_ORIGIN_M: f32 = 50_000.0;
+    /// Maximum drift from origin position (first GPS fix) in meters (10km)
+    /// DJI typical flight 5-10km, max range ~30km. 10km covers 99%+ flights.
+    /// For longer flights, use PassthroughRaw mode.
+    pub const MAX_DRIFT_FROM_ORIGIN_M: f32 = 10_000.0;
+
+    /// Maximum distance from origin before last_good stops updating ("leash")
+    /// Prevents gradual spoofing from dragging last_good along with fake position.
+    /// Once frozen, further drift triggers last_good_anomaly (>2km from frozen last_good).
+    pub const MAX_LAST_GOOD_FROM_ORIGIN_M: f32 = 5_000.0;
 
     /// Maximum realistic speed in m/s (30 m/s = 108 km/h for racing drones)
     /// DJI FPV: 140 km/h in M mode, but typical flight ~60 km/h
@@ -522,10 +527,10 @@ impl SpoofDetector {
         // - During RECOVERY warmup, coordinate anomalies are ignored to prevent
         //   false positives from GPS re-acquisition jitter
         //
-        // Disabled: is_alt_anomaly, is_accel_anomaly, cno_anomaly
+        // Disabled: is_accel_anomaly, cno_anomaly
 
         // Coordinate anomalies - disabled during recovery warmup
-        let coord_anomaly = analysis.is_teleport || analysis.is_speed_anomaly;
+        let coord_anomaly = analysis.is_teleport || analysis.is_speed_anomaly || analysis.is_alt_anomaly;
         let coord_anomaly_effective = if in_recovery_warmup && !self.spoofed {
             false // Ignore coordinate jumps during GPS re-acquisition
         } else {
@@ -697,11 +702,17 @@ impl SpoofDetector {
 
             // Clear spoofing after enough normal samples
             if self.spoofed && self.normal_count >= thresholds::NORMAL_CONFIRM_COUNT {
-                // Additional check: are we back near last_good position?
+                // Additional check: are we back near last_good position AND within leash?
                 if let Some(ref good) = self.last_good {
                     let dist_from_good = Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon);
+                    let within_leash = if let Some(ref origin) = self.origin {
+                        Self::calc_distance(origin.lat, origin.lon, pos.lat, pos.lon)
+                            < thresholds::MAX_LAST_GOOD_FROM_ORIGIN_M
+                    } else {
+                        true
+                    };
 
-                    if dist_from_good < thresholds::TELEPORT_M {
+                    if dist_from_good < thresholds::TELEPORT_M && within_leash {
                         self.spoofed = false;
                         self.last_good = Some(pos.clone());
                         self.recovery_warmup_samples = 0; // Start recovery warmup
@@ -723,11 +734,17 @@ impl SpoofDetector {
             }
 
             // Update last_good if not spoofed AND position is within teleport threshold
-            // This prevents a spoofed position from becoming the new reference
+            // AND within leash distance from origin (prevents gradual spoofing drag)
             if !self.spoofed {
                 let should_update = if let Some(ref good) = self.last_good {
-                    let dist = Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon);
-                    dist < thresholds::TELEPORT_M
+                    let dist_from_good = Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon);
+                    let within_leash = if let Some(ref origin) = self.origin {
+                        Self::calc_distance(origin.lat, origin.lon, pos.lat, pos.lon)
+                            < thresholds::MAX_LAST_GOOD_FROM_ORIGIN_M
+                    } else {
+                        true
+                    };
+                    dist_from_good < thresholds::TELEPORT_M && within_leash
                 } else {
                     true
                 };
@@ -818,8 +835,7 @@ impl SpoofDetector {
             accel_ms2,
             is_teleport: distance_m > thresholds::TELEPORT_M,
             is_speed_anomaly: speed_ms > thresholds::MAX_SPEED_MS,
-            is_alt_anomaly: libm::fabsf(alt_diff_m) > thresholds::TELEPORT_ALT_M
-                || vertical_speed_ms > thresholds::MAX_VERTICAL_SPEED_MS,
+            is_alt_anomaly: libm::fabsf(alt_diff_m) > thresholds::TELEPORT_ALT_M,
             is_accel_anomaly: accel_ms2 > thresholds::MAX_ACCEL_MS2,
         }
     }

@@ -31,7 +31,7 @@ make rp2350                           # Build UF2 for RP2350
 make rp2354                           # Build UF2 for RP2354
 make flash                            # Flash via probe-rs (RP2350)
 make flash-rp2354                     # Flash via probe-rs (RP2354)
-make test                             # Run all 70 host-side tests
+make test                             # Run all 75 host-side tests
 
 cargo rb                              # run release binary (alias)
 cargo rp2350                          # build ELF only (alias)
@@ -43,13 +43,13 @@ cargo rp2354                          # build ELF only (alias)
 `spoof_detector.rs` is pure logic (no embassy/cortex-m deps) and can be tested on host via `tests_host/`.
 
 ```bash
-cd tests_host && cargo test            # All 70 tests
+cd tests_host && cargo test            # All 75 tests
 cd tests_host && cargo test vuln       # Only regression tests
 ```
 
 **Structure**: `tests_host/` is a standalone crate (NOT in workspace) with `defmt_mock/` (no-op macros) and `#[path]` to `../../src/spoof_detector.rs`.
 
-**Test groups** (70 tests):
+**Test groups** (75 tests):
 | Group | Tests | Coverage |
 |-------|-------|----------|
 | 0: Utilities | 8 | GnssTime, calc_distance, FixType |
@@ -65,6 +65,7 @@ cd tests_host && cargo test vuln       # Only regression tests
 | 10: Complex | 4 | Spoof/recovery cycles, realistic attack |
 | 11: Reset | 2 | Clean state after reset |
 | 12: Bug fixes | 6 | Time recovery+distance, last_good check, origin drift |
+| 13: Leash+altitude | 5 | Gradual drift, leash freeze, altitude jump |
 
 **Note**: Coord recovery requires 6 samples (not 5) — returning from spoofed position is itself a teleport that resets normal_count.
 
@@ -202,6 +203,7 @@ Dynamic offset computed **once** at first 3D GPS fix: `offset = offset_target - 
                                            │ coord_anomaly =                 │
                                            │   teleport(prev→curr >2km)      │
                                            │   OR speed(>30 m/s)             │
+                                           │   OR alt_jump(>10m/sample)      │
                                            │   [disabled in recovery warmup] │
                                            │                                 │
                                            │ time_anomaly =                  │
@@ -215,7 +217,7 @@ Dynamic offset computed **once** at first 3D GPS fix: `offset = offset_target - 
                                            │   [disabled in warmups]         │
                                            │                                 │
                                            │ origin_drift =                  │
-                                           │   dist(origin→curr) > 50km     │
+                                           │   dist(origin→curr) > 10km     │
                                            │   [disabled in startup warmup]  │
                                            └───────────────┬─────────────────┘
                                                            │
@@ -235,12 +237,14 @@ Dynamic offset computed **once** at first 3D GPS fix: `offset = offset_target - 
                                                         │                         │
                                                         │ if spoofed &&           │
                                                         │   normal_cnt>=5 &&      │
-                                                        │   dist(last_good)<2km:  │
+                                                        │   dist(last_good)<2km   │
+                                                        │   && within_leash:      │
                                                         │   spoofed=false         │
                                                         │   recovery_warmup=0     │
                                                         │                         │
                                                         │ if !spoofed &&          │
-                                                        │   dist(last_good)<2km:  │
+                                                        │   dist(last_good)<2km   │
+                                                        │   && within_leash:      │
                                                         │   last_good=curr        │
                                                         │                         │
                                                         │ prev=curr               │
@@ -249,8 +253,8 @@ Dynamic offset computed **once** at first 3D GPS fix: `offset = offset_target - 
 ```
 
 **Key state variables:**
-- `origin` — first GPS fix, never updated (only on `reset()`), anti-gradient-drift anchor
-- `last_good` — last trusted position, updated only when `!spoofed && dist < 2km`
+- `origin` — first GPS fix, never updated (only on `reset()`), anti-gradient-drift anchor + leash anchor
+- `last_good` — last trusted position, updated only when `!spoofed && dist < 2km && within_leash(origin, 5km)`
 - `prev` — previous sample, always updated (for velocity calculation)
 - `last_good_gnss_time` / `calibrated_at_system_ms` — time references, updated only when `!spoofed`
 
