@@ -977,14 +977,15 @@ fn test_vuln1_last_good_not_corrupted() {
 
 #[test]
 fn test_vuln2_time_recovery_last_good() {
-    // Time recovery must NOT overwrite last_good with spoofed position
+    // Bug 1 fix: Time recovery at far coordinates must NOT clear spoofed
+    // (time returned to normal, but coordinates are still >2km from last_good)
     let mut det = SpoofDetector::new();
     let base_gt = gnss_time(2026, 3, 15, 12, 0, 0, 1000);
     let (mut t, last_gt) = feed_warmup_with_time(&mut det, BASE_LAT, BASE_LON, 1000, base_gt);
 
     let good_before = det.last_good_position().unwrap();
 
-    // Spoof at different coordinates
+    // Spoof at different coordinates (>2km away)
     let spoofed_lat = BASE_LAT + DELTA_2001M_LAT;
     let bad_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
                            last_gt.hour, last_gt.min,
@@ -993,12 +994,14 @@ fn test_vuln2_time_recovery_last_good() {
     assert!(det.is_spoofed());
     t += 200;
 
-    // Time recovery at spoofed coordinates
+    // Time recovery at spoofed coordinates (far from last_good)
     let ok_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
                           last_gt.hour, last_gt.min,
                           last_gt.sec + 1, t);
     det.analyze(pos_with_time(spoofed_lat, BASE_LON, t, ok_gt));
-    assert!(!det.is_spoofed());
+    // Must STAY spoofed because position is far from last_good
+    assert!(det.is_spoofed(),
+        "time recovery at far coordinates must NOT clear spoofed state");
 
     // last_good must NOT be at spoofed position
     let good_after = det.last_good_position().unwrap();
@@ -1124,18 +1127,20 @@ fn test_last_good_survives_time_recovery() {
 
     let good_pre = det.last_good_position().unwrap();
 
-    // Spoof via time at different position
+    // Spoof via time at different position (>2km from last_good)
     let bad_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
                            last_gt.hour, last_gt.min,
                            last_gt.sec + 20, t);
-    det.analyze(pos_with_time(BASE_LAT + 100_000, BASE_LON, t, bad_gt));
+    det.analyze(pos_with_time(BASE_LAT + DELTA_2001M_LAT, BASE_LON, t, bad_gt));
     t += 200;
 
-    // Time recovery
+    // Time recovery at far position — stays spoofed (Bug 1 fix)
     let ok_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
                           last_gt.hour, last_gt.min,
                           last_gt.sec + 1, t);
-    det.analyze(pos_with_time(BASE_LAT + 100_000, BASE_LON, t, ok_gt));
+    det.analyze(pos_with_time(BASE_LAT + DELTA_2001M_LAT, BASE_LON, t, ok_gt));
+    assert!(det.is_spoofed(),
+        "time recovery at far position should NOT clear spoofed");
 
     let good_post = det.last_good_position().unwrap();
     assert_eq!(good_post.lat, good_pre.lat,
@@ -1319,4 +1324,169 @@ fn test_reset_during_spoofing() {
     // After reset, first sample is init again
     let r = det.analyze(pos(BASE_LAT, BASE_LON, t + 1000));
     assert_eq!(r, AnalysisResult::Initializing);
+}
+
+// ============================================================================
+// Group 12: Bug fixes (Mar 2026 — time recovery + last_good + origin drift)
+// ============================================================================
+
+#[test]
+fn test_time_recovery_far_position_stays_spoofed() {
+    // Bug 1: time ok + coords far from last_good → must stay spoofed
+    let mut det = SpoofDetector::new();
+    let base_gt = gnss_time(2026, 3, 15, 12, 0, 0, 1000);
+    let (mut t, last_gt) = feed_warmup_with_time(&mut det, BASE_LAT, BASE_LON, 1000, base_gt);
+
+    // Spoof: teleport + time jump
+    let spoofed_lat = BASE_LAT + DELTA_2001M_LAT;
+    let bad_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                           last_gt.hour, last_gt.min,
+                           last_gt.sec + 20, t);
+    det.analyze(pos_with_time(spoofed_lat, BASE_LON, t, bad_gt));
+    assert!(det.is_spoofed());
+    t += 200;
+
+    // Time recovery but still at spoofed coords (>2km from last_good)
+    let ok_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                          last_gt.hour, last_gt.min,
+                          last_gt.sec + 1, t);
+    let r = det.analyze(pos_with_time(spoofed_lat, BASE_LON, t, ok_gt));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "time recovery with far coords must return Spoofed");
+    assert!(det.is_spoofed(),
+        "must stay spoofed when coords are far from last_good");
+}
+
+#[test]
+fn test_time_recovery_near_position_clears_spoofed() {
+    // Bug 1 complement: time ok + coords near last_good → clear spoofed
+    let mut det = SpoofDetector::new();
+    let base_gt = gnss_time(2026, 3, 15, 12, 0, 0, 1000);
+    let (mut t, last_gt) = feed_warmup_with_time(&mut det, BASE_LAT, BASE_LON, 1000, base_gt);
+
+    // Spoof via time only (coords stay near base)
+    let bad_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                           last_gt.hour, last_gt.min,
+                           last_gt.sec + 20, t);
+    det.analyze(pos_with_time(BASE_LAT, BASE_LON, t, bad_gt));
+    assert!(det.is_spoofed());
+    t += 200;
+
+    // Time recovery at same (near) coords
+    let ok_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                          last_gt.hour, last_gt.min,
+                          last_gt.sec + 1, t);
+    let r = det.analyze(pos_with_time(BASE_LAT, BASE_LON, t, ok_gt));
+    assert_eq!(r, AnalysisResult::Normal,
+        "time recovery with near coords must return Normal");
+    assert!(!det.is_spoofed(),
+        "should clear spoofed when time + coords are ok");
+}
+
+#[test]
+fn test_last_good_check_catches_drift() {
+    // Bug 2: position far from last_good but near prev → must be detected after warmup
+    let mut det = SpoofDetector::new();
+    let base_gt = gnss_time(2026, 3, 15, 12, 0, 0, 1000);
+    let (mut t, last_gt) = feed_warmup_with_time(&mut det, BASE_LAT, BASE_LON, 1000, base_gt);
+
+    // Spoof via time only (position at base)
+    let bad_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                           last_gt.hour, last_gt.min,
+                           last_gt.sec + 20, t);
+    det.analyze(pos_with_time(BASE_LAT, BASE_LON, t, bad_gt));
+    assert!(det.is_spoofed());
+    t += 200;
+
+    // Time recovery at base (near last_good) → clears spoofed
+    let ok_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                          last_gt.hour, last_gt.min,
+                          last_gt.sec + 1, t);
+    det.analyze(pos_with_time(BASE_LAT, BASE_LON, t, ok_gt));
+    assert!(!det.is_spoofed());
+    t += 200;
+
+    // Recovery warmup: 10 samples at far position (>2km from last_good)
+    let far_lat = BASE_LAT + DELTA_2001M_LAT;
+    for _ in 0..10 {
+        t += 200;
+        det.analyze(pos(far_lat, BASE_LON, t));
+    }
+
+    // After warmup completes, next sample at far position triggers last_good check
+    t += 200;
+    let r = det.analyze(pos(far_lat, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "position far from last_good must be detected after warmup");
+}
+
+#[test]
+fn test_origin_drift_detected() {
+    // Bug 3: slow gradient drift >50km from origin → must be detected
+    let mut det = SpoofDetector::new();
+    det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init
+
+    // Move 100m per step at 4s intervals = 25 m/s (under 30 m/s threshold)
+    // 100m in 1e-7 degrees ≈ 8984
+    // Steps to 50km: 500
+    let mut lat = BASE_LAT;
+    let delta_per_step = 8984; // ~100m per step
+    let step_ms = 4000u32; // 4s interval (under 5s gap threshold)
+    let mut t = 1000 + step_ms;
+    for _ in 0..600 {
+        lat += delta_per_step;
+        let r = det.analyze(pos(lat, BASE_LON, t));
+        if r == AnalysisResult::Spoofed {
+            let dist_km = calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) / 1000.0;
+            assert!(dist_km > 49.0,
+                "origin drift should only trigger near 50km, got {}km", dist_km);
+            return; // Test passed
+        }
+        t += step_ms;
+    }
+    let dist_km = calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) / 1000.0;
+    panic!("Moved {}km from origin but no detection!", dist_km);
+}
+
+#[test]
+fn test_origin_normal_flight() {
+    // Bug 3 complement: normal flight <50km from origin → no false positive
+    let mut det = SpoofDetector::new();
+    det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init
+
+    // Fly 10km at 25 m/s (well under 50km threshold)
+    let mut lat = BASE_LAT;
+    let delta_per_step = 449; // ~5m per step = 25 m/s at 200ms interval
+    let mut t = 1200u32;
+    for i in 0..2000 {
+        lat += delta_per_step;
+        let r = det.analyze(pos(lat, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Normal,
+            "normal 25m/s flight should not trigger at step {} ({}m from origin)",
+            i, calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON) as i32);
+        t += 200;
+    }
+    // Final distance: 2000 * 5m = 10km — well under 50km
+    let dist = calc_dist(BASE_LAT, BASE_LON, lat, BASE_LON);
+    assert!(dist < 11_000.0, "sanity: total distance should be ~10km, got {}m", dist);
+}
+
+#[test]
+fn test_origin_reset() {
+    // Bug 3: origin should be reset on detector reset
+    let mut det = SpoofDetector::new();
+    det.analyze(pos(BASE_LAT, BASE_LON, 1000)); // init — origin set
+
+    det.reset();
+
+    // After reset, new origin should be at new position
+    let new_lat = BASE_LAT + 1_000_000; // ~11km away
+    det.analyze(pos(new_lat, BASE_LON, 2000)); // init — new origin
+
+    // Normal flight from new position should not trigger origin drift
+    for i in 1..=50 {
+        let r = det.analyze(pos(new_lat + (i * 100), BASE_LON, 2000 + i as u32 * 200));
+        assert_eq!(r, AnalysisResult::Normal,
+            "flight from new origin after reset should be normal");
+    }
 }

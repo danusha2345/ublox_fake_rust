@@ -21,6 +21,11 @@ pub mod thresholds {
     /// Increased from 5m to reduce false positives from GPS noise
     pub const TELEPORT_ALT_M: f32 = 10.0;
 
+    /// Maximum drift from origin position (first GPS fix) in meters (50km)
+    /// DJI max range ~30km, so 50km covers any legitimate flight
+    /// Detects slow gradient attacks that evade per-sample teleport checks
+    pub const MAX_DRIFT_FROM_ORIGIN_M: f32 = 50_000.0;
+
     /// Maximum realistic speed in m/s (30 m/s = 108 km/h for racing drones)
     /// DJI FPV: 140 km/h in M mode, but typical flight ~60 km/h
     pub const MAX_SPEED_MS: f32 = 30.0;
@@ -244,6 +249,10 @@ pub struct SpoofDetector {
     /// Last known good position (before spoofing)
     last_good: Option<Position>,
 
+    /// Origin position (first GPS fix, never updated except on reset)
+    /// Used to detect slow gradient drift attacks
+    origin: Option<Position>,
+
     /// Previous position (for velocity calculation)
     prev: Option<Position>,
 
@@ -314,6 +323,7 @@ impl SpoofDetector {
     pub const fn new() -> Self {
         Self {
             last_good: None,
+            origin: None,
             prev: None,
             last_good_gnss_time: None,
             velocity: VelocityState {
@@ -375,6 +385,7 @@ impl SpoofDetector {
             None => {
                 self.prev = Some(pos.clone());
                 self.last_good = Some(pos.clone());
+                self.origin = Some(pos.clone());
                 info!(
                     "Spoof detector initialized: lat={}, lon={}, alt={}mm",
                     pos.lat, pos.lon, pos.alt_mm
@@ -529,7 +540,41 @@ impl SpoofDetector {
             time_spoof || clock_drift_spoof
         };
 
-        let is_anomaly = coord_anomaly_effective || time_anomaly;
+        // Bug 2 fix: check distance from last_good (catches drift after GapReset or time recovery)
+        let last_good_anomaly = if !self.spoofed && !in_warmup && !in_recovery_warmup {
+            if let Some(ref good) = self.last_good {
+                let dist = Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon);
+                if dist > thresholds::TELEPORT_M {
+                    warn!("Position {}m from last_good", dist as i32);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Bug 3 fix: check distance from origin (catches slow gradient attacks)
+        let origin_drift_anomaly = if !self.spoofed && !in_warmup {
+            if let Some(ref origin) = self.origin {
+                let dist = Self::calc_distance(origin.lat, origin.lon, pos.lat, pos.lon);
+                if dist > thresholds::MAX_DRIFT_FROM_ORIGIN_M {
+                    warn!("Position {}m from origin (max {})", dist as i32, thresholds::MAX_DRIFT_FROM_ORIGIN_M as i32);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let is_anomaly = coord_anomaly_effective || time_anomaly || last_good_anomaly || origin_drift_anomaly;
 
         // Детальное логирование состояния детектора (trace — не выводится без явного включения)
         trace!(
@@ -575,28 +620,37 @@ impl SpoofDetector {
             trace!("POS_DBG: last_good=None");
         }
 
-        // NEW: Prioritize time-based recovery (stronger signal than coordinates)
+        // Time-based recovery: only clear spoofing if coordinates are near last_good
+        // This prevents Bug 1: spoofer returns time to normal but coordinates remain fake
         if (time_recovery || clock_drift_recovery) && self.spoofed {
-            self.spoofed = false;
-            self.normal_count = 0;
-            self.anomaly_count = 0;
-            // DO NOT update last_good here — current position may still be spoofed
-            // (spoofer returned time to normal but coordinates remain shifted)
-            // last_good stays at pre-spoof position, recovery warmup + distance check
-            // will gradually update it if coordinates are truly clean
-            // CRITICAL: Update last_good_gnss_time to prevent re-triggering spoof!
+            let near_last_good = if let Some(ref good) = self.last_good {
+                Self::calc_distance(good.lat, good.lon, pos.lat, pos.lon) < thresholds::TELEPORT_M
+            } else {
+                true
+            };
+
+            // Always recalibrate time (prevents re-triggering time anomaly)
             if let Some(ref gnss_time) = pos.gnss_time {
                 self.last_good_gnss_time = Some(*gnss_time);
-                // Also recalibrate system clock with new GNSS time
                 self.calibrated_at_system_ms = pos.time_ms;
                 self.calibrated_gnss_unix = gnss_time.to_unix_timestamp();
-                info!("Recalibrated system clock after recovery");
+                info!("Recalibrated system clock after time recovery");
             }
-            // Start recovery warmup to ignore coordinate jumps during GPS re-acquisition
-            self.recovery_warmup_samples = 0;
-            info!("Spoofing cleared by GNSS time/clock recovery - starting recovery warmup");
-            self.prev = Some(pos);
-            return AnalysisResult::Normal;
+
+            if near_last_good {
+                self.spoofed = false;
+                self.normal_count = 0;
+                self.anomaly_count = 0;
+                self.recovery_warmup_samples = 0;
+                info!("Spoofing cleared by time recovery + position near last_good");
+                self.prev = Some(pos);
+                return AnalysisResult::Normal;
+            } else {
+                // Time ok but coordinates still far from last_good → stay spoofed
+                info!("Time recovered but position still far from last_good - staying spoofed");
+                self.prev = Some(pos);
+                return AnalysisResult::Spoofed;
+            }
         }
 
         if is_anomaly {
@@ -774,6 +828,7 @@ impl SpoofDetector {
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.last_good = None;
+        self.origin = None;
         self.prev = None;
         self.last_good_gnss_time = None;
         self.velocity = VelocityState::default();

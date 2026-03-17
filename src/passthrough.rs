@@ -511,6 +511,30 @@ pub fn modify_nav_hpposecef_spoof(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ec
     frame[6 + 24..6 + 28].copy_from_slice(&9_999_999u32.to_le_bytes()); // pAcc
 }
 
+/// Modify NAV-VELECEF (0x01 0x11) during spoofing: zero velocity + degrade accuracy
+/// Payload: 20 bytes. ecefVX(4), ecefVY(8), ecefVZ(12), sAcc(16)
+pub fn modify_nav_velecef_spoof(frame: &mut [u8]) {
+    if frame.len() < 28 { return; }
+    frame[6 + 4..6 + 8].copy_from_slice(&0i32.to_le_bytes());   // ecefVX
+    frame[6 + 8..6 + 12].copy_from_slice(&0i32.to_le_bytes());  // ecefVY
+    frame[6 + 12..6 + 16].copy_from_slice(&0i32.to_le_bytes()); // ecefVZ
+    frame[6 + 16..6 + 20].copy_from_slice(&9_999_999u32.to_le_bytes()); // sAcc
+}
+
+/// Modify NAV-VELNED (0x01 0x12) during spoofing: zero velocity + degrade accuracy
+/// Payload: 36 bytes. velN(4), velE(8), velD(12), speed(16), gSpeed(20), heading(24), sAcc(28), cAcc(32)
+pub fn modify_nav_velned_spoof(frame: &mut [u8]) {
+    if frame.len() < 44 { return; }
+    frame[6 + 4..6 + 8].copy_from_slice(&0i32.to_le_bytes());   // velN
+    frame[6 + 8..6 + 12].copy_from_slice(&0i32.to_le_bytes());  // velE
+    frame[6 + 12..6 + 16].copy_from_slice(&0i32.to_le_bytes()); // velD
+    frame[6 + 16..6 + 20].copy_from_slice(&0u32.to_le_bytes()); // speed
+    frame[6 + 20..6 + 24].copy_from_slice(&0u32.to_le_bytes()); // gSpeed
+    frame[6 + 24..6 + 28].copy_from_slice(&0i32.to_le_bytes()); // heading
+    frame[6 + 28..6 + 32].copy_from_slice(&9_999_999u32.to_le_bytes()); // sAcc
+    frame[6 + 32..6 + 36].copy_from_slice(&9_999_999u32.to_le_bytes()); // cAcc
+}
+
 /// Modify NAV-SOL (0x01 0x06) during spoofing: replace ECEF coordinates + degrade status
 /// Payload: 52 bytes. gps_fix(10), ecefX(12), ecefY(16), ecefZ(20), pAcc(24), num_sv(47)
 pub fn modify_nav_sol_spoof(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: i32) {
