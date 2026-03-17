@@ -86,7 +86,6 @@ cd tests_host && cargo test vuln       # Only regression tests
 | `gnss_processing_task` | async | Parses UBX frames, spoof detection, forwards to GNSS_RX_CHANNEL |
 | `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (Timer::at for drift-free timing) |
 | `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS |
-| `sec_sign_timer_task` | 2-4s | Requests SEC-SIGN from Core1 |
 | `button_task` | async | Mode selection by click count (1/2/3/4 clicks) |
 
 ### Core1 Tasks
@@ -95,6 +94,7 @@ cd tests_host && cargo test vuln       # Only regression tests
 | `led_task` (RP2350) | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, red=spoof) |
 | `simple_led_task` (RP2354) | GPIO LED blink code (1-4 blinks = mode number, fast blink = spoof) |
 | `sec_sign_compute_task` | ECDSA signature computation (~59ms per signature) |
+| `sec_sign_timer_task` | Waits for FIRST_CONFIG_MILLIS or 2s fallback, then first_delay → immediate first SEC-SIGN → period ticker (moved from Core0 to avoid UART interrupt starvation) |
 
 ### Module Structure
 - `src/ubx/` - UBX protocol (`mod.rs`, `messages.rs`, `parser.rs`)
@@ -294,6 +294,10 @@ Dynamic offset computed **once** at first 3D GPS fix: `offset = offset_target - 
 | Air 3S | 780ms | 650ms |
 | Mavic 4 Pro | 400ms | 650ms |
 | Mavic 3 Pro | 780ms | 650ms |
+
+### SEC-SIGN Timer Start (Passthrough)
+
+In Passthrough/PassthroughOffset modes, `sec_sign_timer_task` triggers on `FIRST_CONFIG_MILLIS` (set by first drone UBX command, typically SEC-UNIQID at ~15ms after connect) with 2s fallback if no drone commands. After trigger, waits `first_delay` then fires first SEC-SIGN **immediately** (no extra period wait). Subsequent SEC-SIGN via `Ticker::every(period)` at loop bottom.
 
 After 20 seconds from NAV output start, satellites become invalid (fix_type=0, num_sv=1). Timer resets only on mode switch from Passthrough → Emulation.
 

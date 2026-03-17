@@ -165,6 +165,9 @@ static DIAG_LOCAL_BUF_DROPS: AtomicU32 = AtomicU32::new(0); // Local buffer over
 static DIAG_SEC_SIGN_WAIT_MS: AtomicU32 = AtomicU32::new(0); // Last SEC-SIGN wait duration
 static DIAG_VALSET_COUNT: AtomicU32 = AtomicU32::new(0);     // CFG-VALSET messages received
 static DIAG_OFFSET_APPLIED: AtomicU32 = AtomicU32::new(0);  // Offset-modified frames per SEC-SIGN period
+static DIAG_SEC_SIGN_REQ: AtomicU32 = AtomicU32::new(0);    // SEC-SIGN requests sent by timer
+static DIAG_SEC_SIGN_COMPUTED: AtomicU32 = AtomicU32::new(0); // SEC-SIGN results computed by Core1
+static DIAG_SEC_SIGN_TX: AtomicU32 = AtomicU32::new(0);     // SEC-SIGN packets sent via UART
 
 /// Enable detailed per-message-type counters and VALSET key logging (set to true to diagnose)
 const DIAG_MSG_DETAIL: bool = false;
@@ -676,6 +679,7 @@ async fn main(spawner: Spawner) {
             executor1.run(|spawner: embassy_executor::Spawner| {
                 spawner.must_spawn(led_task(pio0, dma_ch1, led_pin));
                 spawner.must_spawn(sec_sign_compute_task());
+                spawner.must_spawn(sec_sign_timer_task());
             });
         },
     );
@@ -689,6 +693,7 @@ async fn main(spawner: Spawner) {
             executor1.run(|spawner: embassy_executor::Spawner| {
                 spawner.must_spawn(simple_led_task(led_anode));
                 spawner.must_spawn(sec_sign_compute_task());
+                spawner.must_spawn(sec_sign_timer_task());
             });
         },
     );
@@ -713,6 +718,15 @@ async fn main(spawner: Spawner) {
         uart0_config,
     );
     let (uart0_tx, uart0_rx) = uart0.split();
+
+    // Increase UART0 TX (GPIO0) drive strength from default 4mA to 12mA
+    // Fixes signal integrity issues at 921600 baud over long wires
+    rp_pac::PADS_BANK0.gpio(0).modify(|w| {
+        w.set_drive(rp_pac::pads::vals::Drive::_12M_A);
+        w.set_pde(true);  // Pull-down enable — stabilizes TX line for drone UART RX
+        w.set_slewfast(true); // Fast slew rate for 921600 baud
+    });
+    info!("GPIO0 (UART0 TX): 12mA drive, pull-down, fast slew");
 
     // ========================================================================
     // UART1: External GNSS module input (RX=GPIO5)
@@ -766,7 +780,7 @@ async fn main(spawner: Spawner) {
     // Emulation tasks (check MODE internally, skip work in passthrough)
     spawner.must_spawn(nav_message_task());
     spawner.must_spawn(mon_message_task());
-    spawner.must_spawn(sec_sign_timer_task());
+    // sec_sign_timer_task moved to Core1 — avoids UART interrupt starvation on Core0
 
     // Button task for mode switching (no reboot!)
     // Button task for mode switching (no reboot!)
@@ -1049,7 +1063,8 @@ async fn sec_sign_compute_task() {
             packet_count: request.packet_count,
         };
 
-        let _ = SEC_SIGN_RESULT.try_send(result);
+        SEC_SIGN_RESULT.send(result).await;
+        DIAG_SEC_SIGN_COMPUTED.fetch_add(1, Ordering::Relaxed);
         info!("SEC-SIGN computation complete");
     }
 }
@@ -1097,6 +1112,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                 error!("UART TX SEC-SIGN error: {:?}", e);
                             }
+                            DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
                             info!("SEC-SIGN sent: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}]",
                                   result.packet_count,
                                   result.sha256_hash[0], result.sha256_hash[1],
@@ -1170,6 +1186,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                 error!("Passthrough SEC-SIGN TX error: {:?}", e);
                             }
+                            // Flush to ensure SEC-SIGN is physically transmitted before continuing
+                            let _ = tx.flush().await;
+                            DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
                             info!("SEC-SIGN sent: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}]",
                                   result.packet_count,
                                   result.sha256_hash[0], result.sha256_hash[1],
@@ -1219,6 +1238,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                             if let Err(e) = tx.write_all(&buf[..len]).await {
                                                 error!("Passthrough SEC-SIGN TX error: {:?}", e);
                                             }
+                                            // Flush to ensure SEC-SIGN is physically transmitted before continuing
+                                            let _ = tx.flush().await;
+                                            DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
                                         }
                                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                                         break;
@@ -1310,6 +1332,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     }
                     Err(_) => {
                         // Timeout - just loop to check mode
+                        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                            warn!("TX select3 timeout while SEC_SIGN_IN_PROGRESS=true!");
+                        }
                     }
                 }
             }
@@ -1353,6 +1378,10 @@ async fn diag_stats_task() {
         // Calculate in-flight packets (RX - TX)
         let in_flight = rx_pkts.saturating_sub(tx_pkts);
 
+        let sec_req = DIAG_SEC_SIGN_REQ.load(Ordering::Relaxed);
+        let sec_comp = DIAG_SEC_SIGN_COMPUTED.load(Ordering::Relaxed);
+        let sec_tx = DIAG_SEC_SIGN_TX.load(Ordering::Relaxed);
+
         if DIAG_MSG_DETAIL {
             let valset_cnt = DIAG_VALSET_COUNT.load(Ordering::Relaxed);
             info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms valset={} ===",
@@ -1362,6 +1391,8 @@ async fn diag_stats_task() {
             info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms ===",
                   rx_pkts, tx_pkts, in_flight, ch_drops, buf_drops, sec_wait);
         }
+        info!("=== SEC-SIGN pipeline: req={} computed={} tx={} lost={} ===",
+              sec_req, sec_comp, sec_tx, sec_req.saturating_sub(sec_tx));
 
     }
 }
@@ -2301,14 +2332,21 @@ async fn sec_sign_timer_task() {
     // Wait for message output to start
     // In Passthrough/PassthroughOffset modes, don't wait for MSG_OUTPUT_STARTED -
     // it's set by nav_message_task which requires first UBX command from host.
-    // Both modes use external GNSS and start SEC-SIGN timer after fixed 2s delay.
+    // Trigger on FIRST_CONFIG_MILLIS (set by first drone command, ~15ms after connect)
+    // with 2s fallback if no drone commands received.
     let start_time = embassy_time::Instant::now();
     loop {
         let mode = OperatingMode::load();
         if mode == OperatingMode::Passthrough || mode == OperatingMode::PassthroughOffset {
-            // In Passthrough/PassthroughOffset, wait a fixed delay then start
-            if start_time.elapsed().as_millis() >= 2000 {
-                info!("SEC-SIGN timer: Passthrough/Offset mode, starting after 2s delay");
+            // Trigger on first drone command (SEC-UNIQID poll ~15ms after connect)
+            // Fallback to 2s if no drone commands received
+            let first_config = FIRST_CONFIG_MILLIS.load(Ordering::Acquire);
+            if first_config != 0 || start_time.elapsed().as_millis() >= 2000 {
+                if first_config != 0 {
+                    info!("SEC-SIGN timer: Passthrough/Offset mode, triggered by first drone command");
+                } else {
+                    info!("SEC-SIGN timer: Passthrough/Offset mode, fallback after 2s (no drone commands)");
+                }
                 break;
             }
         } else if mode == OperatingMode::PassthroughRaw {
@@ -2348,11 +2386,10 @@ async fn sec_sign_timer_task() {
     // First signature after model-specific delay from NAV start
     Timer::after(Duration::from_millis(first_delay_ms)).await;
 
-    // Then at configured interval
+    // Then at configured interval (first SEC-SIGN fires immediately after first_delay,
+    // subsequent ones wait for the full period)
     let mut ticker = Ticker::every(Duration::from_millis(period_ms));
     loop {
-        ticker.next().await;
-
         // Drain stale hash if reset was requested (mode switch or spoof recovery)
         // Must be BEFORE mode-skip checks: in Passthrough without spoofing the loop
         // does `continue`, so stale data would persist and corrupt future signatures.
@@ -2373,12 +2410,12 @@ async fn sec_sign_timer_task() {
         // If previous SEC-SIGN cycle hasn't completed (signature not yet sent),
         // force-clear the stuck flag. Normal cycle completes in ~60ms; if flag is
         // still set after 2s (next tick), something went wrong (dropped result, etc.).
-        // Force-clear prevents indefinite stuckness. Max gap = 4s (this tick skipped,
-        // next tick processes normally).
+        // Force-clear and fall through to generate SEC-SIGN on this tick.
+        // This reduces max gap from 4s to 2s.
         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
             warn!("SEC-SIGN cycle stuck (>{}ms), force clearing", period_ms);
             SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-            continue;
+            // Don't skip — fall through to generate SEC-SIGN on this tick
         }
 
         // CRITICAL: Pause TX before capturing hash to prevent race condition
@@ -2404,10 +2441,14 @@ async fn sec_sign_timer_task() {
             packet_count: count,
         };
 
-        let _ = SEC_SIGN_REQUEST.try_send(request);
+        SEC_SIGN_REQUEST.send(request).await;
+        DIAG_SEC_SIGN_REQ.fetch_add(1, Ordering::Relaxed);
         info!("SEC-SIGN req: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}] offset_mod={}",
               count, hash[0], hash[1], hash[2], hash[3],
               DIAG_OFFSET_APPLIED.swap(0, Ordering::Relaxed));
+
+        // Wait for next period (at bottom so first SEC-SIGN fires immediately after first_delay)
+        ticker.next().await;
     }
 }
 
