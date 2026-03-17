@@ -252,6 +252,146 @@ PassthroughOffset works like Passthrough (spoof detection enabled), but applies 
 
 ### Spoof Detection in Passthrough Mode
 
+**Data flow**: UART1 RX → `uart1_rx_task` → `RAW_RX_CHANNEL` → `gnss_processing_task` (parse + detect + modify) → `GNSS_RX_CHANNEL` → `uart0_tx_task` → UART0 TX
+
+**Algorithm flowchart** (`SpoofDetector::analyze()`, called on every NAV-PVT at 5Hz):
+
+```
+                            ┌─────────────────┐
+                            │  NAV-PVT frame   │
+                            │  from GNSS (5Hz) │
+                            └────────┬─────────┘
+                                     │
+                              ┌──────▼──────┐
+                              │ has_3d_fix? │
+                              └──┬───────┬──┘
+                               NO│       │YES
+                    ┌────────────▼┐      │
+                    │ Initializing│      │
+                    │ (skip frame)│      │
+                    └─────────────┘      │
+                                  ┌──────▼──────┐
+                                  │ first sample?│
+                                  └──┬───────┬──┘
+                                   YES       │NO
+                     ┌─────────────▼─┐       │
+                     │ Set prev,     │       │
+                     │ last_good,    │       │
+                     │ origin        │       │
+                     │→ Initializing │       │
+                     └───────────────┘       │
+                                      ┌──────▼──────┐
+                                      │dt > 5s gap? │
+                                      └──┬───────┬──┘
+                                       YES       │NO
+                              ┌────────▼────────┐│
+                              │ GAP PATH:       ││
+                              │ check vs        ││
+                              │ last_good >2km? ││
+                              │ clock drift?    ││
+                              │ GNSS time jump? ││
+                              └──┬───────┬──────┘│
+                              ANY│    NONE│       │
+                             ┌───▼───┐ ┌──▼────┐  │
+                             │Spoofed│ │GapRest│  │
+                             │(immed)│ │prev=  │  │
+                             └───────┘ │curr   │  │
+                                       └───────┘  │
+               ┌──────────────────────────────────▼──────────────────────┐
+               │                    NORMAL PATH                          │
+               │  1. calculate_movement(prev→curr): dist, speed         │
+               │  2. check_gnss_time(): time_spoof, time_recovery       │
+               │  3. check_system_clock_drift(): drift_spoof, drift_rec │
+               └────────────────────────┬────────────────────────────────┘
+                                        │
+                   ┌────────────────────▼────────────────────┐
+                   │ TIME/CLOCK RECOVERY? (spoofed=true)     │
+                   │ time_recovery OR clock_drift_recovery   │
+                   └────┬──────────────────────────┬────────┘
+                      YES                          │NO
+               ┌───────▼────────┐                  │
+               │dist(last_good, │                  │
+               │    curr) < 2km?│                  │
+               └──┬──────────┬──┘                  │
+                YES        NO│                     │
+         ┌──────▼──────┐ ┌──▼───────────┐         │
+         │spoofed=false│ │stay spoofed  │         │
+         │warmup reset │ │recalibrate   │         │
+         │→ Normal     │ │time only     │         │
+         └─────────────┘ │→ Spoofed     │         │
+                         └──────────────┘         │
+                                           ┌──────▼──────────────────────────┐
+                                           │ COMPUTE ANOMALY FLAGS:          │
+                                           │                                 │
+                                           │ coord_anomaly =                 │
+                                           │   teleport(prev→curr >2km)      │
+                                           │   OR speed(>30 m/s)             │
+                                           │   [disabled in recovery warmup] │
+                                           │                                 │
+                                           │ time_anomaly =                  │
+                                           │   time_jump_back(>1s)           │
+                                           │   OR time_jump_fwd(>5s)         │
+                                           │   OR clock_drift(>10s)          │
+                                           │   [disabled in startup warmup]  │
+                                           │                                 │
+                                           │ last_good_anomaly =             │
+                                           │   dist(last_good→curr) > 2km   │
+                                           │   [disabled in warmups]         │
+                                           │                                 │
+                                           │ origin_drift =                  │
+                                           │   dist(origin→curr) > 50km     │
+                                           │   [disabled in startup warmup]  │
+                                           └───────────────┬─────────────────┘
+                                                           │
+                                                    ┌──────▼──────┐
+                                                    │ ANY anomaly?│
+                                                    └──┬───────┬──┘
+                                                     YES       │NO
+                                              ┌───────▼──────┐ │
+                                              │ anomaly_cnt++│ │
+                                              │ if cnt>=1:   │ │
+                                              │ spoofed=true │ │
+                                              │ → Spoofed    │ │
+                                              └──────────────┘ │
+                                                        ┌──────▼──────────────────┐
+                                                        │ NORMAL SAMPLE:          │
+                                                        │ normal_cnt++            │
+                                                        │                         │
+                                                        │ if spoofed &&           │
+                                                        │   normal_cnt>=5 &&      │
+                                                        │   dist(last_good)<2km:  │
+                                                        │   spoofed=false         │
+                                                        │   recovery_warmup=0     │
+                                                        │                         │
+                                                        │ if !spoofed &&          │
+                                                        │   dist(last_good)<2km:  │
+                                                        │   last_good=curr        │
+                                                        │                         │
+                                                        │ prev=curr               │
+                                                        │ → Normal or Spoofed     │
+                                                        └─────────────────────────┘
+```
+
+**Key state variables:**
+- `origin` — first GPS fix, never updated (only on `reset()`), anti-gradient-drift anchor
+- `last_good` — last trusted position, updated only when `!spoofed && dist < 2km`
+- `prev` — previous sample, always updated (for velocity calculation)
+- `last_good_gnss_time` — last trusted GNSS time, updated only when `!spoofed`
+- `calibrated_at_system_ms` / `calibrated_gnss_unix` — system clock ↔ GNSS time mapping
+
+**Warmup phases:**
+- **Startup warmup** (10 samples, ~2s): time checks disabled (need calibration), coord checks active
+- **Recovery warmup** (10 samples, ~2s): coord + last_good checks disabled (GPS re-acquisition jitter), time checks active
+
+**What happens in `gnss_processing_task` after `analyze()` returns:**
+
+| Result | `SPOOF_DETECTED` | NAV modification | LED |
+|--------|-------------------|------------------|-----|
+| `Normal` | `false` (after 5s timer) | offset only (Mode 4) | blue/white |
+| `Spoofed` | `true` (immediate) | coords→LAST_GOOD, vel→0, status degraded, +offset | red blink |
+| `Initializing` | unchanged | none | unchanged |
+| `GapReset` | unchanged | none | unchanged |
+
 When in passthrough mode, the device parses incoming UBX frames and detects GPS spoofing:
 
 **Active detection algorithms** (in `spoof_detector.rs`):
