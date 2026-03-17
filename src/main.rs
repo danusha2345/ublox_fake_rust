@@ -2043,9 +2043,12 @@ async fn handle_ubx_command(cmd: &ubx::UbxCommand) {
         }
         ubx::UbxCommand::Mga { id } => {
             // MGA-* messages: AssistNow assistance data upload
-            // Real u-blox modules ACK these messages
-            debug!("MGA message received: id=0x{:02X}", id);
-            send_ack(0x13, *id);
+            // Only ACK in Emulation mode — in Passthrough the real GNSS module sends its own MGA-ACK
+            let mode = OperatingMode::load();
+            if mode == OperatingMode::Emulation {
+                debug!("MGA message received: id=0x{:02X}", id);
+                send_ack(0x13, *id);
+            }
         }
         ubx::UbxCommand::Poll { class, id } => {
             info!("Unhandled poll: class=0x{:02X} id=0x{:02X}", class, id);
@@ -2367,6 +2370,17 @@ async fn sec_sign_timer_task() {
         }
         // All other modes: Emulation, Passthrough, PassthroughOffset — always generate SEC-SIGN
 
+        // If previous SEC-SIGN cycle hasn't completed (signature not yet sent),
+        // force-clear the stuck flag. Normal cycle completes in ~60ms; if flag is
+        // still set after 2s (next tick), something went wrong (dropped result, etc.).
+        // Force-clear prevents indefinite stuckness. Max gap = 4s (this tick skipped,
+        // next tick processes normally).
+        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+            warn!("SEC-SIGN cycle stuck (>{}ms), force clearing", period_ms);
+            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+            continue;
+        }
+
         // CRITICAL: Pause TX before capturing hash to prevent race condition
         // Any packets sent after hash capture but before SEC-SIGN TX would not
         // be included in the hash -> verification fails on receiver side
@@ -2606,6 +2620,9 @@ async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex)
         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
         info!("Cleared spoof detection state (entering raw passthrough)");
     }
+
+    // Drain stale messages from TX_CHANNEL (e.g. NAV-VELNED fragments from Emulation)
+    while TX_CHANNEL.try_receive().is_ok() {}
 
     // Stale hashes from previous mode would corrupt first signature
     SEC_SIGN_ACC_NEEDS_RESET.store(true, Ordering::Release);
