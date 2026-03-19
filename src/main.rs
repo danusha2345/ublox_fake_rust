@@ -1260,8 +1260,11 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                     }
                     Ok(Either3::Second(msg)) => {
-                        // If flag became true during select3 — still send this one packet (1-2ms, negligible)
-                        // then next iteration pre-check will wait for result
+                        // Race guard: if flag became true between pre-check and select3,
+                        // DO NOT send — drone would see packet not covered by SEC-SIGN hash
+                        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                            continue; // Drop 1 packet — next iteration waits for SEC-SIGN result
+                        }
                         let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                         if is_sec_sign {
                             if let Err(e) = tx.write_all(&msg).await {
