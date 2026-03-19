@@ -311,16 +311,19 @@ After 20 seconds from NAV output start, satellites become invalid (fix_type=0, n
 - `uart1_rx_task` and `gnss_processing_task` split for overrun prevention
 - UART1 FIFO RX threshold: 1/4 (4 bytes) via `rp_pac` — prevents hardware overrun at 921600 baud
 - Non-UBX data (NMEA) drained by `take_non_ubx_data()`, not forwarded to hash
-- ECDSA ~59ms (opt-level=3 for crypto crates). During SEC-SIGN wait: local buffering via `select()` pattern.
+- ECDSA ~59ms (opt-level=3 for crypto crates). During SEC-SIGN wait: `uart0_tx_task` stops consuming GNSS_RX_CHANNEL, packets stay queued (depth 128, ~5 pkts during ECDSA — no overflow risk).
 
-**CRITICAL**: `uart0_tx_task` must do `write_all()` BEFORE `lock().await + accumulate()` — holding SEC_SIGN_ACC lock during UART write causes sec_sign_timer_task to miss ticks.
+**CRITICAL**: `uart0_tx_task` must `accumulate()` BEFORE `write_all()` to prevent hash race with `sec_sign_timer_task` on Core1. Lock is held briefly (not during `write_all`) so timer task is not blocked.
 
 ### SEC-SIGN TX Pause
 
 `SEC_SIGN_IN_PROGRESS` atomic flag coordinates TX during ECDSA:
-1. `sec_sign_timer_task`: if flag stuck → reuse it (no clear/set gap); else set flag → capture hash → signal Core1
+1. `sec_sign_timer_task`: if flag stuck → reuse it (no clear/set gap); else set flag → capture hash → `try_send()` request to Core1 (non-blocking, drops if full)
 2. `nav_message_task` / `mon_message_task`: yield_now() loop until flag clear
-3. `uart_tx_task`: buffer packets during wait → send signature → clear flag
+3. `uart0_tx_task`: pre-check flag at loop top → if true, wait ONLY for `SEC_SIGN_RESULT` (100ms timeout, no channel consumption) → send signature → clear flag
+4. `sec_sign_compute_task` (Core1): `try_send()` result back (non-blocking, drops if full)
+
+**Non-blocking channels**: Both `SEC_SIGN_REQUEST.send()` and `SEC_SIGN_RESULT.send()` use `try_send()` to prevent cascading deadlocks. If channels are full, request/result is dropped and retried on next tick.
 
 **Stuck flag guard**: If `SEC_SIGN_IN_PROGRESS` still true on next ticker tick (~2s later), flag is **not cleared** — left true and falls through to capture hash immediately (avoids TOCTOU window where TX task could sneak packets). Max SEC-SIGN gap = 2s.
 

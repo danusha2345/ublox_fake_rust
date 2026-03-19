@@ -161,8 +161,8 @@ static SEC_SIGN_ACC_NEEDS_RESET: AtomicBool = AtomicBool::new(false);
 static DIAG_RX_PACKETS: AtomicU32 = AtomicU32::new(0);   // Packets received from UART1
 static DIAG_TX_PACKETS: AtomicU32 = AtomicU32::new(0);   // Packets sent to UART0
 static DIAG_CHANNEL_DROPS: AtomicU32 = AtomicU32::new(0); // GNSS_RX_CHANNEL full drops
-static DIAG_LOCAL_BUF_DROPS: AtomicU32 = AtomicU32::new(0); // Local buffer overflow during SEC-SIGN
-static DIAG_SEC_SIGN_WAIT_MS: AtomicU32 = AtomicU32::new(0); // Last SEC-SIGN wait duration
+static DIAG_SEC_SIGN_REQ_DROPS: AtomicU32 = AtomicU32::new(0); // SEC-SIGN requests dropped (channel full)
+static DIAG_SEC_SIGN_RES_DROPS: AtomicU32 = AtomicU32::new(0); // SEC-SIGN results dropped (channel full)
 static DIAG_VALSET_COUNT: AtomicU32 = AtomicU32::new(0);     // CFG-VALSET messages received
 static DIAG_OFFSET_APPLIED: AtomicU32 = AtomicU32::new(0);  // Offset-modified frames per SEC-SIGN period
 static DIAG_SEC_SIGN_REQ: AtomicU32 = AtomicU32::new(0);    // SEC-SIGN requests sent by timer
@@ -380,7 +380,7 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro)
 /// Default is Air 3S. Auto-detection skipped when Air 3S is set manually.
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(2); // Air3S (default)
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air3 (default)
 
 
 /// Model selection mode active (for LED feedback: cyan blinking)
@@ -1062,7 +1062,10 @@ async fn sec_sign_compute_task() {
             packet_count: request.packet_count,
         };
 
-        SEC_SIGN_RESULT.send(result).await;
+        if SEC_SIGN_RESULT.try_send(result).is_err() {
+            DIAG_SEC_SIGN_RES_DROPS.fetch_add(1, Ordering::Relaxed);
+            warn!("SEC_SIGN_RESULT full — dropping result (TX task backlogged)");
+        }
         DIAG_SEC_SIGN_COMPUTED.fetch_add(1, Ordering::Relaxed);
         info!("SEC-SIGN computation complete");
     }
@@ -1087,14 +1090,50 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
 
         match mode {
             OperatingMode::Emulation => {
-                // Emulation: wait for TX_CHANNEL or SEC-SIGN result
+                // PRIORITY: if SEC-SIGN in progress, wait ONLY for result
+                // Do NOT consume TX_CHANNEL — packets stay queued, NAV/MON tasks are paused anyway
+                if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                    match embassy_time::with_timeout(
+                        Duration::from_millis(100),
+                        SEC_SIGN_RESULT.receive(),
+                    ).await {
+                        Ok(result) => {
+                            let sec_sign_msg = SecSign {
+                                version: 0x01,
+                                reserved1: 0,
+                                msg_cnt: result.packet_count,
+                                sha256_hash: result.sha256_hash,
+                                session_id: result.session_id,
+                                signature_r: result.signature.r,
+                                signature_s: result.signature.s,
+                            };
+                            let mut buf = [0u8; 128];
+                            let len = sec_sign_msg.build(&mut buf);
+                            if len > 0 {
+                                if let Err(e) = tx.write_all(&buf[..len]).await {
+                                    error!("UART TX SEC-SIGN error: {:?}", e);
+                                }
+                                DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
+                                info!("SEC-SIGN sent: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}]",
+                                      result.packet_count,
+                                      result.sha256_hash[0], result.sha256_hash[1],
+                                      result.sha256_hash[2], result.sha256_hash[3]);
+                            }
+                            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                        }
+                        Err(_) => {} // ECDSA still computing, loop back to check mode
+                    }
+                    continue;
+                }
+
+                // NORMAL: select3 only when flag=false
                 match select3(
                     SEC_SIGN_RESULT.receive(),
                     TX_CHANNEL.receive(),
                     GNSS_RX_CHANNEL.receive(), // Drain passthrough channel if any
                 ).await {
                     Either3::First(result) => {
-                        // SEC-SIGN result received - send signature
+                        // SEC-SIGN result (flag became true between pre-check and select3)
                         let sec_sign_msg = SecSign {
                             version: 0x01,
                             reserved1: 0,
@@ -1104,7 +1143,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             signature_r: result.signature.r,
                             signature_s: result.signature.s,
                         };
-
                         let mut buf = [0u8; 128];
                         let len = sec_sign_msg.build(&mut buf);
                         if len > 0 {
@@ -1117,36 +1155,31 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                                   result.sha256_hash[0], result.sha256_hash[1],
                                   result.sha256_hash[2], result.sha256_hash[3]);
                         }
-                        // Clear flag (NAV/MON tasks poll this with yield_now)
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                     }
                     Either3::Second(msg) => {
-                        // Regular emulation message
+                        // If flag became true during select3 — drop packet (emulation, next epoch in 200ms)
                         if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-                            if TX_CHANNEL.try_send(msg).is_err() {
-                                error!("Failed to re-queue message during SEC-SIGN!");
-                            }
                             continue;
                         }
-
                         // Invariant: hash ONLY messages that were actually sent
                         let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                         if is_sec_sign {
-                            // SEC-SIGN delimiter: no accumulation, no lock
                             if let Err(e) = tx.write_all(&msg).await {
                                 error!("UART TX error: {:?}", e);
                                 continue;
                             }
                         } else {
-                            // Send first, then lock briefly for accumulation (same pattern as Passthrough fix)
-                            // SEC_SIGN_IN_PROGRESS flag prevents new messages during hash capture
+                            // Accumulate BEFORE write_all to prevent race with sec_sign_timer_task on Core1.
+                            {
+                                let mut acc = SEC_SIGN_ACC.lock().await;
+                                if let Some(ref mut accumulator) = *acc {
+                                    accumulator.accumulate(&msg);
+                                }
+                            }
                             if let Err(e) = tx.write_all(&msg).await {
                                 error!("UART TX error: {:?}", e);
                                 continue;
-                            }
-                            let mut acc = SEC_SIGN_ACC.lock().await;
-                            if let Some(ref mut accumulator) = *acc {
-                                accumulator.accumulate(&msg);
                             }
                         }
                     }
@@ -1156,9 +1189,43 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                 }
             }
             OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
-                // Passthrough mode with SEC-SIGN generation (both Spoof and Normal)
-                // PassthroughOffset has same TX logic, offset is applied in gnss_processing_task
-                // Use timeout to limit blocking time to 100ms for mode switching check
+                // PRIORITY: if SEC-SIGN in progress, wait ONLY for result
+                // Do NOT consume GNSS_RX_CHANNEL — packets stay in channel (depth 128, ~5 pkts during 47ms ECDSA)
+                if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
+                    match embassy_time::with_timeout(
+                        Duration::from_millis(100),
+                        SEC_SIGN_RESULT.receive(),
+                    ).await {
+                        Ok(result) => {
+                            let sec_sign_msg = SecSign {
+                                version: 0x01,
+                                reserved1: 0,
+                                msg_cnt: result.packet_count,
+                                sha256_hash: result.sha256_hash,
+                                session_id: result.session_id,
+                                signature_r: result.signature.r,
+                                signature_s: result.signature.s,
+                            };
+                            let mut buf = [0u8; 128];
+                            let len = sec_sign_msg.build(&mut buf);
+                            if len > 0 {
+                                if let Err(e) = tx.write_all(&buf[..len]).await {
+                                    error!("Passthrough SEC-SIGN TX error: {:?}", e);
+                                }
+                                DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
+                                info!("SEC-SIGN sent: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}]",
+                                      result.packet_count,
+                                      result.sha256_hash[0], result.sha256_hash[1],
+                                      result.sha256_hash[2], result.sha256_hash[3]);
+                            }
+                            SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
+                        }
+                        Err(_) => {} // ECDSA still computing, loop back to check mode
+                    }
+                    continue;
+                }
+
+                // NORMAL: select3 only when flag=false
                 match embassy_time::with_timeout(
                     Duration::from_millis(100),
                     select3(
@@ -1168,7 +1235,7 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     )
                 ).await {
                     Ok(Either3::First(result)) => {
-                        // SEC-SIGN computed - send it
+                        // SEC-SIGN result (flag became true between pre-check and select3)
                         let sec_sign_msg = SecSign {
                             version: 0x01,
                             reserved1: 0,
@@ -1178,7 +1245,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                             signature_r: result.signature.r,
                             signature_s: result.signature.s,
                         };
-
                         let mut buf = [0u8; 128];
                         let len = sec_sign_msg.build(&mut buf);
                         if len > 0 {
@@ -1194,103 +1260,8 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
                     }
                     Ok(Either3::Second(msg)) => {
-                        // If SEC-SIGN is in progress, buffer packets locally while waiting
-                        // This prevents GNSS_RX_CHANNEL overflow during ~59ms ECDSA computation
-                        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-                            let wait_start = embassy_time::Instant::now();
-
-                            // Local buffer for packets during signature wait
-                            // 72 slots handles ~66ms of GNSS data (vs ~59ms ECDSA), covers high satellite count (32+ sats)
-                            let mut pending: heapless::Vec<heapless::Vec<u8, 1280>, 72> = heapless::Vec::new();
-                            let _ = pending.push(msg); // First packet goes to buffer
-
-                            // Keep draining channel while waiting for signature (non-blocking!)
-                            loop {
-                                match select(
-                                    SEC_SIGN_RESULT.receive(),
-                                    GNSS_RX_CHANNEL.receive(),
-                                ).await {
-                                    Either::First(result) => {
-                                        // Signature ready - send it FIRST (before buffered packets)
-                                        let wait_ms = wait_start.elapsed().as_millis() as u32;
-                                        DIAG_SEC_SIGN_WAIT_MS.store(wait_ms, Ordering::Relaxed);
-                                        info!("SEC-SIGN wait={}ms buffered={} pkts hash=[{:02x}{:02x}{:02x}{:02x}]",
-                                              wait_ms, pending.len(),
-                                              result.sha256_hash[0], result.sha256_hash[1],
-                                              result.sha256_hash[2], result.sha256_hash[3]);
-
-                                        let sec_sign_msg = SecSign {
-                                            version: 0x01,
-                                            reserved1: 0,
-                                            msg_cnt: result.packet_count,
-                                            sha256_hash: result.sha256_hash,
-                                            session_id: result.session_id,
-                                            signature_r: result.signature.r,
-                                            signature_s: result.signature.s,
-                                        };
-
-                                        let mut buf = [0u8; 128];
-                                        let len = sec_sign_msg.build(&mut buf);
-                                        if len > 0 {
-                                            if let Err(e) = tx.write_all(&buf[..len]).await {
-                                                error!("Passthrough SEC-SIGN TX error: {:?}", e);
-                                            }
-                                            DIAG_SEC_SIGN_TX.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        SEC_SIGN_IN_PROGRESS.store(false, Ordering::Release);
-                                        break;
-                                    }
-                                    Either::Second(next_msg) => {
-                                        // Another packet arrived - buffer it
-                                        let msg_len = next_msg.len();
-                                        if pending.push(next_msg).is_err() {
-                                            let drops = DIAG_LOCAL_BUF_DROPS.fetch_add(1, Ordering::Relaxed);
-                                            warn!("LOCAL_BUF overflow! size={} drops={}", msg_len, drops + 1);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Now send all buffered packets AFTER the signature
-                            // Always accumulate — SEC-SIGN always generated in Passthrough/PassthroughOffset
-                            for buffered_msg in pending.into_iter() {
-                                let is_sec_sign = buffered_msg.len() >= 4
-                                    && buffered_msg[2] == 0x27 && buffered_msg[3] == 0x04;
-                                if is_sec_sign {
-                                    if let Err(e) = tx.write_all(&buffered_msg).await {
-                                        error!("Passthrough TX error (buffered): {:?}", e);
-                                        continue;
-                                    }
-                                } else {
-                                    let is_ubx = buffered_msg.len() >= 2 && buffered_msg[0] == 0xB5 && buffered_msg[1] == 0x62;
-                                    if is_ubx {
-                                        // UBX frame: send first, then lock briefly for hash accumulate
-                                        if let Err(e) = tx.write_all(&buffered_msg).await {
-                                            error!("Passthrough TX error (buffered): {:?}", e);
-                                            continue;
-                                        }
-                                        let mut acc = SEC_SIGN_ACC.lock().await;
-                                        if let Some(ref mut accumulator) = *acc {
-                                            accumulator.accumulate(&buffered_msg);
-                                        }
-                                    } else {
-                                        // Non-UBX data: send but do NOT accumulate in hash
-                                        if let Err(e) = tx.write_all(&buffered_msg).await {
-                                            error!("Passthrough TX error (buffered non-UBX): {:?}", e);
-                                            continue;
-                                        }
-                                    }
-                                }
-                                if DIAG_MSG_DETAIL && buffered_msg.len() >= 4 && buffered_msg[0] == 0xB5 && buffered_msg[1] == 0x62 {
-                                    diag_msg_counts::inc_tx(buffered_msg[2], buffered_msg[3]);
-                                }
-                                DIAG_TX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                            }
-                            continue; // Skip normal msg handling (already processed)
-                        }
-
-                        // Normal path (no SEC-SIGN in progress)
-                        // Always accumulate — SEC-SIGN always generated in Passthrough/PassthroughOffset
+                        // If flag became true during select3 — still send this one packet (1-2ms, negligible)
+                        // then next iteration pre-check will wait for result
                         let is_sec_sign = msg.len() >= 4 && msg[2] == 0x27 && msg[3] == 0x04;
                         if is_sec_sign {
                             if let Err(e) = tx.write_all(&msg).await {
@@ -1300,14 +1271,16 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                         } else {
                             let is_ubx = msg.len() >= 2 && msg[0] == 0xB5 && msg[1] == 0x62;
                             if is_ubx {
-                                // UBX frame: send first, then lock briefly for hash accumulate
+                                // UBX frame: accumulate BEFORE write_all to prevent race with Core1
+                                {
+                                    let mut acc = SEC_SIGN_ACC.lock().await;
+                                    if let Some(ref mut accumulator) = *acc {
+                                        accumulator.accumulate(&msg);
+                                    }
+                                }
                                 if let Err(e) = tx.write_all(&msg).await {
                                     error!("Passthrough TX error: {:?}", e);
                                     continue;
-                                }
-                                let mut acc = SEC_SIGN_ACC.lock().await;
-                                if let Some(ref mut accumulator) = *acc {
-                                    accumulator.accumulate(&msg);
                                 }
                             } else {
                                 // Non-UBX data (NMEA, etc.): send but do NOT accumulate in hash
@@ -1327,9 +1300,6 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     }
                     Err(_) => {
                         // Timeout - just loop to check mode
-                        if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
-                            warn!("TX select3 timeout while SEC_SIGN_IN_PROGRESS=true!");
-                        }
                     }
                 }
             }
@@ -1367,8 +1337,8 @@ async fn diag_stats_task() {
         let rx_pkts = DIAG_RX_PACKETS.load(Ordering::Relaxed);
         let tx_pkts = DIAG_TX_PACKETS.load(Ordering::Relaxed);
         let ch_drops = DIAG_CHANNEL_DROPS.load(Ordering::Relaxed);
-        let buf_drops = DIAG_LOCAL_BUF_DROPS.load(Ordering::Relaxed);
-        let sec_wait = DIAG_SEC_SIGN_WAIT_MS.load(Ordering::Relaxed);
+        let req_drops = DIAG_SEC_SIGN_REQ_DROPS.load(Ordering::Relaxed);
+        let res_drops = DIAG_SEC_SIGN_RES_DROPS.load(Ordering::Relaxed);
 
         // Calculate in-flight packets (RX - TX)
         let in_flight = rx_pkts.saturating_sub(tx_pkts);
@@ -1379,12 +1349,12 @@ async fn diag_stats_task() {
 
         if DIAG_MSG_DETAIL {
             let valset_cnt = DIAG_VALSET_COUNT.load(Ordering::Relaxed);
-            info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms valset={} ===",
-                  rx_pkts, tx_pkts, in_flight, ch_drops, buf_drops, sec_wait, valset_cnt);
+            info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} req_drops={} res_drops={} valset={} ===",
+                  rx_pkts, tx_pkts, in_flight, ch_drops, req_drops, res_drops, valset_cnt);
             diag_msg_counts::log_and_reset();
         } else {
-            info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} buf_drops={} sec_wait={}ms ===",
-                  rx_pkts, tx_pkts, in_flight, ch_drops, buf_drops, sec_wait);
+            info!("=== DIAG: RX={} TX={} in_flight={} ch_drops={} req_drops={} res_drops={} ===",
+                  rx_pkts, tx_pkts, in_flight, ch_drops, req_drops, res_drops);
         }
         info!("=== SEC-SIGN pipeline: req={} computed={} tx={} lost={} ===",
               sec_req, sec_comp, sec_tx, sec_req.saturating_sub(sec_tx));
@@ -2437,7 +2407,10 @@ async fn sec_sign_timer_task() {
             packet_count: count,
         };
 
-        SEC_SIGN_REQUEST.send(request).await;
+        if SEC_SIGN_REQUEST.try_send(request).is_err() {
+            DIAG_SEC_SIGN_REQ_DROPS.fetch_add(1, Ordering::Relaxed);
+            warn!("SEC_SIGN_REQUEST full — dropping request (Core1 backlogged)");
+        }
         DIAG_SEC_SIGN_REQ.fetch_add(1, Ordering::Relaxed);
         info!("SEC-SIGN req: pkts={} hash=[{:02x}{:02x}{:02x}{:02x}] offset_mod={}",
               count, hash[0], hash[1], hash[2], hash[3],
