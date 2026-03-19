@@ -591,7 +591,7 @@ async fn main(spawner: Spawner) {
             DRONE_MODEL.store(model_byte, Ordering::Release);
             info!("Loaded drone model from flash: {:?}", config::DroneModel::from_u8(model_byte));
         } else {
-            info!("No saved drone model, using default (Air 3S)");
+            info!("No saved drone model, using default ({:?})", config::DroneModel::from_u8(DRONE_MODEL.load(Ordering::Relaxed)));
         }
 
         // Save firmware version to flash (skips write if unchanged)
