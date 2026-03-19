@@ -323,7 +323,7 @@ After 20 seconds from NAV output start, satellites become invalid (fix_type=0, n
 3. `uart0_tx_task`: **two-layer guard** — pre-check flag at loop top → if true, wait ONLY for `SEC_SIGN_RESULT` (100ms timeout, no channel consumption) → send signature → clear flag. **Additionally**, both Emulation and Passthrough branches re-check flag after `select3` returns a GNSS/NAV packet — if flag became true during `select3` await, packet is dropped (`continue`) to prevent hash mismatch (packet sent to drone but not covered by SEC-SIGN hash).
 4. `sec_sign_compute_task` (Core1): `try_send()` result back (non-blocking, drops if full)
 
-**Packet drop cost**: The post-select3 guard drops ~1 GNSS packet per 2s SEC-SIGN cycle. Measured: 68 RXM-RAWX + 1 MGA-ACK out of 17777 packets (0.39%) over 300s. All NAV-* messages pass through with zero loss. RXM-RAWX (raw measurements) is the largest packet and most likely to hit the race window.
+**Packet drop cost**: The post-select3 guard drops ~1 GNSS packet per 2s SEC-SIGN cycle. Measured over 20min (68029 packets, 597 SEC-SIGN cycles): 59 RXM-RAWX (1.0%) + 6 NAV-PVT (0.1%) + 1 MGA-ACK — total 0.1% loss. RXM-RAWX (largest packet) hits the race window most often; NAV-PVT drops are rare (~1 per 200s). All other NAV-* types: zero loss.
 
 **Non-blocking channels**: Both `SEC_SIGN_REQUEST.send()` and `SEC_SIGN_RESULT.send()` use `try_send()` to prevent cascading deadlocks. If channels are full, request/result is dropped and retried on next tick.
 
