@@ -41,7 +41,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_io_async::{Read, Write};
 use panic_probe as _;
 use static_cell::StaticCell;
@@ -168,6 +168,11 @@ static DIAG_OFFSET_APPLIED: AtomicU32 = AtomicU32::new(0);  // Offset-modified f
 static DIAG_SEC_SIGN_REQ: AtomicU32 = AtomicU32::new(0);    // SEC-SIGN requests sent by timer
 static DIAG_SEC_SIGN_COMPUTED: AtomicU32 = AtomicU32::new(0); // SEC-SIGN results computed by Core1
 static DIAG_SEC_SIGN_TX: AtomicU32 = AtomicU32::new(0);     // SEC-SIGN packets sent via UART
+static BOOT_DURATION_MS: AtomicU32 = AtomicU32::new(0);         // Boot duration in ms (for deferred log)
+// Boot key extraction details (for deferred log since probe-rs connects late)
+static BOOT_KEY_MODE: AtomicU8 = AtomicU8::new(0);       // 0=skip, 1=manual, 2=auto
+static BOOT_KEY_RESULT: AtomicU8 = AtomicU8::new(0);     // 0=not attempted, 1=success, 2=no_gnss, 3=failed
+static BOOT_KEY_EXTRACT_MS: AtomicU32 = AtomicU32::new(0); // Time spent in key extraction (ms)
 
 /// Enable detailed per-message-type counters and VALSET key logging (set to true to diagnose)
 const DIAG_MSG_DETAIL: bool = false;
@@ -471,6 +476,11 @@ impl OperatingMode {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+    let boot_t0 = Instant::now();
+
+    info!("========================================");
+    info!("BOOT: ublox_fake starting...");
+    info!("========================================");
 
     // Initialize coordinate conversion (LLH -> ECEF) from config
     coordinates::init();
@@ -489,12 +499,16 @@ async fn main(spawner: Spawner) {
     // FORCE_KEY_EXTRACT debug flag.
     // If triggered → run PIO extraction BEFORE UART init (GPIO0/GPIO5 free).
     // ========================================================================
+    info!("BOOT [{}ms]: key extraction phase start", boot_t0.elapsed().as_millis());
     let (extracted_key, extraction_attempted) = {
         let mut flash_tmp = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
         let request = flash_storage::load_and_clear_extract_request(&mut flash_tmp);
         let has_flash_key = flash_storage::load_key(&mut flash_tmp).is_some();
         drop(flash_tmp);
         let p = unsafe { embassy_rp::Peripherals::steal() };
+
+        info!("BOOT [{}ms]: flash_key={}, manual_request={}, force={}",
+            boot_t0.elapsed().as_millis(), has_flash_key, request, FORCE_KEY_EXTRACT);
 
         let should_manual = request || FORCE_KEY_EXTRACT;
         if FORCE_KEY_EXTRACT {
@@ -503,17 +517,30 @@ async fn main(spawner: Spawner) {
 
         if should_manual {
             // Long-press or debug: manual extraction (5 attempts, 2s wait)
-            info!("KEY EXTRACT: manual extraction (request={}, force={})", request, FORCE_KEY_EXTRACT);
+            BOOT_KEY_MODE.store(1, Ordering::Release);
+            let t_ext = Instant::now();
+            info!("BOOT [{}ms]: → manual extraction", boot_t0.elapsed().as_millis());
             let key = key_extract::extract(p.PIO1, p.PIN_1, p.UART1, p.PIN_5).await;
             let _p = unsafe { embassy_rp::Peripherals::steal() };
+            BOOT_KEY_EXTRACT_MS.store(t_ext.elapsed().as_millis() as u32, Ordering::Release);
+            BOOT_KEY_RESULT.store(if key.is_some() { 1 } else { 3 }, Ordering::Release);
+            info!("BOOT [{}ms]: manual extraction result: {}", boot_t0.elapsed().as_millis(),
+                if key.is_some() { "SUCCESS" } else { "FAILED" });
             (key, true)
         } else if !has_flash_key {
             // No key in flash: auto extraction (2 attempts, NMEA detection)
-            info!("KEY EXTRACT: no key in flash, trying auto extraction...");
+            BOOT_KEY_MODE.store(2, Ordering::Release);
+            let t_ext = Instant::now();
+            info!("BOOT [{}ms]: → auto extraction (no key in flash)", boot_t0.elapsed().as_millis());
             let key = key_extract::auto_extract(p.PIO1, p.PIN_1, p.UART1, p.PIN_5).await;
             let _p = unsafe { embassy_rp::Peripherals::steal() };
+            BOOT_KEY_EXTRACT_MS.store(t_ext.elapsed().as_millis() as u32, Ordering::Release);
+            BOOT_KEY_RESULT.store(if key.is_some() { 1 } else { 2 }, Ordering::Release);
+            info!("BOOT [{}ms]: auto extraction result: {}", boot_t0.elapsed().as_millis(),
+                if key.is_some() { "SUCCESS" } else { "no GNSS or failed" });
             (key, false) // no LED feedback for auto mode
         } else {
+            info!("BOOT [{}ms]: → skip extraction (key in flash)", boot_t0.elapsed().as_millis());
             (None, false)
         }
     };
@@ -571,6 +598,7 @@ async fn main(spawner: Spawner) {
     let p = unsafe { embassy_rp::Peripherals::steal() };
 
     // Initialize flash for mode persistence
+    info!("BOOT [{}ms]: flash init + load config", boot_t0.elapsed().as_millis());
     let flash = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
     let flash_mutex = FLASH_CELL.init(Mutex::new(flash));
 
@@ -619,9 +647,9 @@ async fn main(spawner: Spawner) {
         // Save freshly extracted key (from key extraction mode at boot)
         if let Some(ref key) = extracted_key {
             if flash_storage::save_key(&mut flash, key) {
-                info!("Freshly extracted key saved to flash");
+                info!("BOOT [{}ms]: freshly extracted key saved to flash", boot_t0.elapsed().as_millis());
             } else {
-                error!("FAILED to save extracted key to flash!");
+                error!("BOOT [{}ms]: FAILED to save extracted key!", boot_t0.elapsed().as_millis());
             }
             unsafe { sec_sign::set_flash_key(*key); }
         }
@@ -777,7 +805,14 @@ async fn main(spawner: Spawner) {
     // Spawn all tasks - they check MODE internally for hot-switching
     // ========================================================================
     let mode = OperatingMode::load();
-    info!("Starting in {:?} mode (hot-switchable)", mode);
+    let boot_ms = boot_t0.elapsed().as_millis() as u32;
+    BOOT_DURATION_MS.store(boot_ms, Ordering::Release);
+    info!("========================================");
+    info!("BOOT [{}ms]: init complete, starting tasks", boot_ms);
+    info!("  mode: {:?}", mode);
+    info!("  drone: {:?}", config::DroneModel::from_u8(DRONE_MODEL.load(Ordering::Relaxed)));
+    info!("  key: {}", if sec_sign::has_flash_key() { "flash" } else { "hardcoded" });
+    info!("========================================");
 
     // Core communication tasks (always running)
     spawner.must_spawn(uart0_tx_task(uart0_tx));
@@ -1342,8 +1377,38 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
 #[embassy_executor::task]
 async fn diag_stats_task() {
     let mut ticker = embassy_time::Ticker::every(Duration::from_secs(10));
+    let mut first_tick = true;
     loop {
         ticker.next().await;
+
+        // Deferred boot summary — probe-rs is connected by now
+        if first_tick {
+            first_tick = false;
+            let boot_ms = BOOT_DURATION_MS.load(Ordering::Relaxed);
+            let mode = OperatingMode::load();
+            let model = config::DroneModel::from_u8(DRONE_MODEL.load(Ordering::Relaxed));
+            let key_src = if sec_sign::has_flash_key() { "flash" } else { "hardcoded" };
+            let key_mode = BOOT_KEY_MODE.load(Ordering::Relaxed);
+            let key_result = BOOT_KEY_RESULT.load(Ordering::Relaxed);
+            let extract_str = match (key_mode, key_result) {
+                (0, _) => "skipped (key in flash)",
+                (1, 1) => "manual: SUCCESS",
+                (1, _) => "manual: FAILED",
+                (2, 1) => "auto: SUCCESS (GNSS found, key extracted)",
+                (2, 2) => "auto: no GNSS detected (timeout)",
+                (2, _) => "auto: GNSS found but key extraction failed",
+                _ => "unknown",
+            };
+            info!("========================================");
+            info!("BOOT SUMMARY (deferred, boot took {}ms)", boot_ms);
+            info!("  firmware: {}", version::FW_VERSION);
+            info!("  mode: {:?}", mode);
+            info!("  drone: {:?}", model);
+            info!("  key source: {}", key_src);
+            let extract_ms = BOOT_KEY_EXTRACT_MS.load(Ordering::Relaxed);
+            info!("  extraction: {} ({}ms)", extract_str, extract_ms);
+            info!("========================================");
+        }
 
         let rx_pkts = DIAG_RX_PACKETS.load(Ordering::Relaxed);
         let tx_pkts = DIAG_TX_PACKETS.load(Ordering::Relaxed);

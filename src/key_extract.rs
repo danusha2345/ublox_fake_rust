@@ -226,18 +226,32 @@ pub async fn auto_extract(
     });
 
     // ---- NMEA detection: wait for any data from GNSS module -----------------
+    // Retry on framing/break errors (common at UART startup before GNSS stabilizes)
     let mut detect_buf = [0u8; 64];
-    match with_timeout(
-        Duration::from_millis(AUTO_GNSS_DETECT_TIMEOUT_MS),
-        uart_rx.read(&mut detect_buf),
-    ).await {
-        Ok(Ok(n)) => {
-            info!("AUTO KEY: GNSS detected ({} bytes in {}ms)", n, t0.elapsed().as_millis());
+    let detect_deadline = Instant::now() + Duration::from_millis(AUTO_GNSS_DETECT_TIMEOUT_MS);
+    let mut gnss_detected = false;
+    loop {
+        let remaining = detect_deadline.saturating_duration_since(Instant::now());
+        if remaining.as_millis() == 0 {
+            break;
         }
-        _ => {
-            info!("AUTO KEY: no GNSS detected ({}ms timeout), skipping", AUTO_GNSS_DETECT_TIMEOUT_MS);
-            return None;
+        match with_timeout(remaining, uart_rx.read(&mut detect_buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                info!("AUTO KEY: GNSS detected ({} bytes in {}ms)", n, t0.elapsed().as_millis());
+                gnss_detected = true;
+                break;
+            }
+            Ok(Err(e)) => {
+                // Framing/break error — retry within timeout
+                warn!("AUTO KEY: UART error during detect: {:?}, retrying...", e);
+                continue;
+            }
+            _ => break, // timeout or zero bytes
         }
+    }
+    if !gnss_detected {
+        info!("AUTO KEY: no GNSS detected ({}ms timeout), skipping", AUTO_GNSS_DETECT_TIMEOUT_MS);
+        return None;
     }
 
     // Flush remaining NMEA data

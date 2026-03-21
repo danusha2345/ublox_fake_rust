@@ -56,6 +56,11 @@ pub unsafe fn set_flash_key(key: [u8; 24]) {
     FLASH_KEY_STORAGE = Some(key);
 }
 
+/// Check if a flash-loaded key is set.
+pub fn has_flash_key() -> bool {
+    unsafe { FLASH_KEY_STORAGE.is_some() }
+}
+
 /// Get private key for specified drone model.
 /// Returns flash-stored key if available, otherwise falls back to hardcoded constants.
 pub fn get_private_key(model: DroneModel) -> [u8; 24] {

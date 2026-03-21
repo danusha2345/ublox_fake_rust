@@ -385,10 +385,32 @@ Key offset: 175 (Air 3, Mavic 4 Pro) or 115 (Air 3S, Mavic 3 Pro — no CFG-RINV
 
 Extracts 24-byte SEC-SIGN private key from real u-blox GNSS module via CFG-0x41 poll.
 
+### Auto extraction (at boot)
+
+If no key exists in flash, `auto_extract()` runs automatically at boot:
+1. Detects GNSS module by waiting for NMEA data on UART1 (500ms timeout)
+2. Retries on framing/break errors (common at UART startup)
+3. Sends CFG-0x41 poll, reads response (2 attempts × 500ms)
+4. Extracts and saves key to flash
+
+**Timings** (measured): GNSS detected ~120-280ms, key extracted in ~430-600ms total.
+If no GNSS connected — 500ms timeout, falls back to hardcoded keys.
+If key already in flash — skipped entirely (0ms overhead).
+
+### Manual extraction (long-press)
+
 **Trigger**: Long button press (3+ sec) → flash flag → reboot → extraction at boot.
-**HW**: TX via PIO1 on GPIO1, RX via UART1 on GPIO5. 5 attempts × 2s timeout.
+5 attempts × 2s timeout. LED feedback (green=success, red=fail).
+
+### Common
+
+**HW**: TX via PIO1 on GPIO1, RX via UART1 on GPIO5.
 **Storage**: Flash Last-1 sector (magic `0x4B455953` "KEYS"). Overrides hardcoded keys.
-**Debug**: `FORCE_KEY_EXTRACT` in `main.rs` forces extraction on every boot.
+**Debug**: `FORCE_KEY_EXTRACT` in `main.rs` forces manual extraction on every boot.
+
+### Boot log (deferred)
+
+Boot details are saved to atomics and output via `diag_stats_task` at first tick (~10s after boot), since probe-rs cannot attach before power-on when the board is powered by the drone.
 
 ## Diagnostic Mode
 
