@@ -179,6 +179,125 @@ pub async fn extract(
 }
 
 // ============================================================================
+// Auto-extraction: silent key extraction at boot (no long-press needed)
+// ============================================================================
+
+const AUTO_GNSS_DETECT_TIMEOUT_MS: u64 = 500;
+const AUTO_POLL_TIMEOUT_MS: u64 = 500;
+const AUTO_MAX_ATTEMPTS: u8 = 2;
+
+/// Auto-extract key at boot: detect GNSS via NMEA, poll CFG-0x41, extract key.
+/// Returns None if no GNSS connected (timeout) or key not found.
+/// Must be called BEFORE main UART init — GPIO1 and GPIO5 must be free.
+pub async fn auto_extract(
+    pio1: Peri<'static, PIO1>,
+    tx_pin: Peri<'static, PIN_1>,
+    uart1: Peri<'static, UART1>,
+    rx_pin: Peri<'static, PIN_5>,
+) -> Option<[u8; 24]> {
+    let t0 = Instant::now();
+    info!("AUTO KEY: attempting silent key extraction...");
+
+    // ---- Initialize PIO1 TX on GPIO1 ----------------------------------------
+    let Pio { mut common, sm0, .. } = Pio::new(pio1, Pio1Irqs);
+    let tx_program = PioUartTxProgram::new(&mut common);
+    let mut uart_tx: PioUartTx<'_, PIO1, 0> =
+        PioUartTx::new(DEFAULT_BAUDRATE, &mut common, sm0, tx_pin, &tx_program);
+
+    // ---- Initialize Hardware UART1 RX on GPIO5 ------------------------------
+    static AUTO_RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+    let rx_buf = AUTO_RX_BUF.init([0u8; 1024]);
+
+    let mut uart_config = UartConfig::default();
+    uart_config.baudrate = DEFAULT_BAUDRATE;
+
+    let mut uart_rx = BufferedUartRx::new(
+        uart1,
+        crate::Irqs,
+        rx_pin,
+        rx_buf,
+        uart_config,
+    );
+
+    // Set FIFO RX threshold to 1/4
+    rp_pac::UART1.uartifls().write(|w| {
+        w.set_rxiflsel(0b001);
+        w.set_txiflsel(0b000);
+    });
+
+    // ---- NMEA detection: wait for any data from GNSS module -----------------
+    let mut detect_buf = [0u8; 64];
+    match with_timeout(
+        Duration::from_millis(AUTO_GNSS_DETECT_TIMEOUT_MS),
+        uart_rx.read(&mut detect_buf),
+    ).await {
+        Ok(Ok(n)) => {
+            info!("AUTO KEY: GNSS detected ({} bytes in {}ms)", n, t0.elapsed().as_millis());
+        }
+        _ => {
+            info!("AUTO KEY: no GNSS detected ({}ms timeout), skipping", AUTO_GNSS_DETECT_TIMEOUT_MS);
+            return None;
+        }
+    }
+
+    // Flush remaining NMEA data
+    let mut flush_buf = [0u8; 256];
+    loop {
+        match with_timeout(Duration::from_millis(100), uart_rx.read(&mut flush_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+
+    // ---- Send CFG-0x41 poll + capture response ------------------------------
+    for attempt in 1..=AUTO_MAX_ATTEMPTS {
+        info!("AUTO KEY: attempt {}/{}", attempt, AUTO_MAX_ATTEMPTS);
+
+        // Send CFG-0x41 poll via PIO TX
+        for &b in &CFG41_POLL {
+            uart_tx.write_u8(b).await;
+        }
+
+        // Read response
+        let mut raw = [0u8; 1024];
+        let mut count: usize = 0;
+        let t_rx = Instant::now();
+
+        loop {
+            if t_rx.elapsed().as_millis() >= AUTO_POLL_TIMEOUT_MS { break; }
+            if count >= raw.len() { break; }
+
+            let remaining = raw.len() - count;
+            match with_timeout(
+                Duration::from_millis(200),
+                uart_rx.read(&mut raw[count..count + remaining]),
+            ).await {
+                Ok(Ok(n)) if n > 0 => {
+                    count += n;
+                }
+                _ => {
+                    if count > 0 { break; }
+                }
+            }
+        }
+
+        info!("AUTO KEY: captured {} bytes in {}ms", count, t_rx.elapsed().as_millis());
+
+        if let Some(key) = find_cfg41_in_buffer(&raw[..count]) {
+            let total_ms = t0.elapsed().as_millis();
+            info!("AUTO KEY: SUCCESS in {}ms (attempt {})", total_ms, attempt);
+            return Some(key);
+        }
+
+        warn!("AUTO KEY: CFG-0x41 not found (attempt {})", attempt);
+    }
+
+    let total_ms = t0.elapsed().as_millis();
+    warn!("AUTO KEY: failed after {} attempts ({}ms)", AUTO_MAX_ATTEMPTS, total_ms);
+    None
+}
+
+// ============================================================================
 // Offline buffer search — find CFG-0x41 in raw captured bytes
 // ============================================================================
 

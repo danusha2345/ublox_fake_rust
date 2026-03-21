@@ -492,19 +492,27 @@ async fn main(spawner: Spawner) {
     let (extracted_key, extraction_attempted) = {
         let mut flash_tmp = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
         let request = flash_storage::load_and_clear_extract_request(&mut flash_tmp);
+        let has_flash_key = flash_storage::load_key(&mut flash_tmp).is_some();
         drop(flash_tmp);
         let p = unsafe { embassy_rp::Peripherals::steal() };
 
-        let should_extract = request || FORCE_KEY_EXTRACT;
+        let should_manual = request || FORCE_KEY_EXTRACT;
         if FORCE_KEY_EXTRACT {
             warn!("KEY EXTRACT: FORCE_KEY_EXTRACT=true (debug mode)");
         }
 
-        if should_extract {
-            info!("KEY EXTRACT: running extraction (request={}, force={})", request, FORCE_KEY_EXTRACT);
+        if should_manual {
+            // Long-press or debug: manual extraction (5 attempts, 2s wait)
+            info!("KEY EXTRACT: manual extraction (request={}, force={})", request, FORCE_KEY_EXTRACT);
             let key = key_extract::extract(p.PIO1, p.PIN_1, p.UART1, p.PIN_5).await;
             let _p = unsafe { embassy_rp::Peripherals::steal() };
             (key, true)
+        } else if !has_flash_key {
+            // No key in flash: auto extraction (2 attempts, NMEA detection)
+            info!("KEY EXTRACT: no key in flash, trying auto extraction...");
+            let key = key_extract::auto_extract(p.PIO1, p.PIN_1, p.UART1, p.PIN_5).await;
+            let _p = unsafe { embassy_rp::Peripherals::steal() };
+            (key, false) // no LED feedback for auto mode
         } else {
             (None, false)
         }
