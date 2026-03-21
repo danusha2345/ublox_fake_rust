@@ -38,16 +38,8 @@ const MAX_ATTEMPTS: u8 = 5;
 // ---- Key location constants -----------------------------------------------
 
 const SEC_KEY_TAG: u8 = 0xA6;
-const SEC_KEY_LEN: u8 = 0x18;
+const SEC_KEY_LEN: u8 = 0x18; // 24 bytes
 const KEY_LEN: usize = 24;
-
-/// Air 3S / Mavic 3 Pro layout: A6 18 header at payload[113].
-const KEY_HEADER_OFFSET_AIR3S: usize = 113;
-const KEY_DATA_OFFSET_AIR3S: usize = KEY_HEADER_OFFSET_AIR3S + 2;
-
-/// Air 3 / Mavic 4 Pro layout: A6 18 header at payload[173].
-const KEY_HEADER_OFFSET_AIR3: usize = 173;
-const KEY_DATA_OFFSET_AIR3: usize = KEY_HEADER_OFFSET_AIR3 + 2;
 
 // ============================================================================
 // Public API
@@ -374,17 +366,8 @@ fn dump_payload(payload: &[u8]) {
 }
 
 fn extract_key(payload: &[u8]) -> Option<[u8; KEY_LEN]> {
-    info!("KEY EXTRACT: searching for A6 18 key header...");
+    info!("KEY EXTRACT: scanning payload for A6 18 key header...");
 
-    if let Some(key) = try_key_at(payload, KEY_HEADER_OFFSET_AIR3S, KEY_DATA_OFFSET_AIR3S, "Air3S/Mavic3Pro") {
-        return Some(key);
-    }
-    if let Some(key) = try_key_at(payload, KEY_HEADER_OFFSET_AIR3, KEY_DATA_OFFSET_AIR3, "Air3/Mavic4Pro") {
-        return Some(key);
-    }
-
-    // Fallback: scan for A6 18 anywhere
-    warn!("KEY EXTRACT: known offsets miss, scanning payload for A6 18...");
     for i in 0..payload.len().saturating_sub(1 + KEY_LEN) {
         if payload[i] == SEC_KEY_TAG && payload[i + 1] == SEC_KEY_LEN {
             let data_start = i + 2;
@@ -393,7 +376,7 @@ fn extract_key(payload: &[u8]) -> Option<[u8; KEY_LEN]> {
             let mut key = [0u8; KEY_LEN];
             key.copy_from_slice(&payload[data_start..data_end]);
             if validate_key_bytes(&key) {
-                info!("KEY EXTRACT: key via scan at payload[{}..{}]", data_start, data_end);
+                info!("KEY EXTRACT: found key at payload[{}..{}]", data_start, data_end);
                 log_key_full(&key);
                 return Some(key);
             }
@@ -402,25 +385,6 @@ fn extract_key(payload: &[u8]) -> Option<[u8; KEY_LEN]> {
 
     error!("KEY EXTRACT: private key not found in payload");
     None
-}
-
-fn try_key_at(payload: &[u8], header_offset: usize, data_offset: usize, name: &str) -> Option<[u8; KEY_LEN]> {
-    let data_end = data_offset + KEY_LEN;
-    if header_offset + 1 >= payload.len() || data_end > payload.len() {
-        return None;
-    }
-    if payload[header_offset] != SEC_KEY_TAG || payload[header_offset + 1] != SEC_KEY_LEN {
-        return None;
-    }
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&payload[data_offset..data_end]);
-    if !validate_key_bytes(&key) {
-        warn!("KEY EXTRACT: {} header matched but key invalid", name);
-        return None;
-    }
-    info!("KEY EXTRACT: {} layout, key OK", name);
-    log_key_full(&key);
-    Some(key)
 }
 
 fn validate_key_bytes(key: &[u8; KEY_LEN]) -> bool {
