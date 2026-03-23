@@ -363,9 +363,6 @@ pub struct DynamicOffset {
     pub lat_1e7: i32,
     pub lon_1e7: i32,
     pub alt_mm: i32,
-    pub ecef_x_cm: i32,
-    pub ecef_y_cm: i32,
-    pub ecef_z_cm: i32,
 }
 
 /// Apply coordinate offset to NAV-PVT (0x01 0x07)
@@ -402,49 +399,36 @@ pub fn apply_offset_nav_posllh(frame: &mut [u8], off: &DynamicOffset) {
     frame[6 + 16..6 + 20].copy_from_slice(&h_msl.saturating_add(off.alt_mm).to_le_bytes());
 }
 
-/// Apply coordinate offset to NAV-POSECEF (0x01 0x01)
-/// Payload: 20 bytes
-/// Offsets: ecefX=4-7 (i32 cm), ecefY=8-11 (i32 cm), ecefZ=12-15 (i32 cm)
-pub fn apply_offset_nav_posecef(frame: &mut [u8], off: &DynamicOffset) {
+/// Replace ECEF coordinates in NAV-POSECEF (0x01 0x01) with absolute values
+/// computed from offset LLH via llh_to_ecef_cm() for LLH/ECEF consistency.
+/// Payload: 20 bytes. ecefX(4-7), ecefY(8-11), ecefZ(12-15)
+pub fn replace_ecef_nav_posecef(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: i32) {
     if frame.len() < 28 { return; }
-
-    let ecef_x = i32::from_le_bytes([frame[6 + 4], frame[6 + 5], frame[6 + 6], frame[6 + 7]]);
-    let ecef_y = i32::from_le_bytes([frame[6 + 8], frame[6 + 9], frame[6 + 10], frame[6 + 11]]);
-    let ecef_z = i32::from_le_bytes([frame[6 + 12], frame[6 + 13], frame[6 + 14], frame[6 + 15]]);
-
-    frame[6 + 4..6 + 8].copy_from_slice(&ecef_x.saturating_add(off.ecef_x_cm).to_le_bytes());
-    frame[6 + 8..6 + 12].copy_from_slice(&ecef_y.saturating_add(off.ecef_y_cm).to_le_bytes());
-    frame[6 + 12..6 + 16].copy_from_slice(&ecef_z.saturating_add(off.ecef_z_cm).to_le_bytes());
+    frame[6 + 4..6 + 8].copy_from_slice(&ecef_x.to_le_bytes());
+    frame[6 + 8..6 + 12].copy_from_slice(&ecef_y.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&ecef_z.to_le_bytes());
 }
 
-/// Apply coordinate offset to NAV-HPPOSECEF (0x01 0x13)
-/// Payload: 28 bytes
-/// Offsets: ecefX=8-11 (i32 cm), ecefY=12-15 (i32 cm), ecefZ=16-19 (i32 cm)
-pub fn apply_offset_nav_hpposecef(frame: &mut [u8], off: &DynamicOffset) {
+/// Replace ECEF coordinates in NAV-HPPOSECEF (0x01 0x13) with absolute values + zero HP bytes.
+/// Payload: 28 bytes. ecefX(8-11), ecefY(12-15), ecefZ(16-19), HP bytes(20-22)
+pub fn replace_ecef_nav_hpposecef(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: i32) {
     if frame.len() < 36 { return; }
-
-    let ecef_x = i32::from_le_bytes([frame[6 + 8], frame[6 + 9], frame[6 + 10], frame[6 + 11]]);
-    let ecef_y = i32::from_le_bytes([frame[6 + 12], frame[6 + 13], frame[6 + 14], frame[6 + 15]]);
-    let ecef_z = i32::from_le_bytes([frame[6 + 16], frame[6 + 17], frame[6 + 18], frame[6 + 19]]);
-
-    frame[6 + 8..6 + 12].copy_from_slice(&ecef_x.saturating_add(off.ecef_x_cm).to_le_bytes());
-    frame[6 + 12..6 + 16].copy_from_slice(&ecef_y.saturating_add(off.ecef_y_cm).to_le_bytes());
-    frame[6 + 16..6 + 20].copy_from_slice(&ecef_z.saturating_add(off.ecef_z_cm).to_le_bytes());
+    frame[6 + 8..6 + 12].copy_from_slice(&ecef_x.to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&ecef_y.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&ecef_z.to_le_bytes());
+    // Zero high-precision extension bytes (sub-cm residuals meaningless after recomputation)
+    frame[6 + 20] = 0; // ecefXHp
+    frame[6 + 21] = 0; // ecefYHp
+    frame[6 + 22] = 0; // ecefZHp
 }
 
-/// Apply coordinate offset to NAV-SOL (0x01 0x06)
-/// Payload: 52 bytes
-/// Offsets: ecefX=12-15 (i32 cm), ecefY=16-19 (i32 cm), ecefZ=20-23 (i32 cm)
-pub fn apply_offset_nav_sol(frame: &mut [u8], off: &DynamicOffset) {
+/// Replace ECEF coordinates in NAV-SOL (0x01 0x06) with absolute values.
+/// Payload: 52 bytes. ecefX(12-15), ecefY(16-19), ecefZ(20-23)
+pub fn replace_ecef_nav_sol(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: i32) {
     if frame.len() < 60 { return; }
-
-    let ecef_x = i32::from_le_bytes([frame[6 + 12], frame[6 + 13], frame[6 + 14], frame[6 + 15]]);
-    let ecef_y = i32::from_le_bytes([frame[6 + 16], frame[6 + 17], frame[6 + 18], frame[6 + 19]]);
-    let ecef_z = i32::from_le_bytes([frame[6 + 20], frame[6 + 21], frame[6 + 22], frame[6 + 23]]);
-
-    frame[6 + 12..6 + 16].copy_from_slice(&ecef_x.saturating_add(off.ecef_x_cm).to_le_bytes());
-    frame[6 + 16..6 + 20].copy_from_slice(&ecef_y.saturating_add(off.ecef_y_cm).to_le_bytes());
-    frame[6 + 20..6 + 24].copy_from_slice(&ecef_z.saturating_add(off.ecef_z_cm).to_le_bytes());
+    frame[6 + 12..6 + 16].copy_from_slice(&ecef_x.to_le_bytes());
+    frame[6 + 16..6 + 20].copy_from_slice(&ecef_y.to_le_bytes());
+    frame[6 + 20..6 + 24].copy_from_slice(&ecef_z.to_le_bytes());
 }
 
 // ============================================================================

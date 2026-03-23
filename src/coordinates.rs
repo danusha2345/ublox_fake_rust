@@ -150,14 +150,7 @@ pub fn offset_lat_1e7() -> i32 { unsafe { OFFSET_TARGET.lat_1e7 } }
 pub fn offset_lon_1e7() -> i32 { unsafe { OFFSET_TARGET.lon_1e7 } }
 #[inline]
 pub fn offset_alt_mm() -> i32 { unsafe { OFFSET_TARGET.alt_mm } }
-#[inline]
-pub fn offset_ecef_x_cm() -> i32 { unsafe { OFFSET_TARGET.ecef_x_cm } }
-#[inline]
-pub fn offset_ecef_y_cm() -> i32 { unsafe { OFFSET_TARGET.ecef_y_cm } }
-#[inline]
-pub fn offset_ecef_z_cm() -> i32 { unsafe { OFFSET_TARGET.ecef_z_cm } }
-
-/// Runtime LLH → ECEF conversion (for spoof detection LAST_GOOD coordinates)
+/// Runtime LLH → ECEF conversion (for spoof detection LAST_GOOD coordinates and per-frame offset)
 /// Uses f64 trig (software-emulated on Cortex-M33, ~50µs per call — acceptable for rare spoof events)
 pub fn llh_to_ecef_cm(lat_1e7: i32, lon_1e7: i32, alt_mm: i32) -> (i32, i32, i32) {
     let lat_rad = (lat_1e7 as f64 * 1e-7_f64).to_radians();

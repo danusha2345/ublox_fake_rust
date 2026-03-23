@@ -130,7 +130,7 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 │    └─ NAV-PVT, STATUS, DOP... │                                 │
 │    └─ Timer::at (без дрейфа)  │                                 │
 │                               │                                 │
-│  sec_sign_timer_task (2-4s)   │                                 │
+│  sec_sign_timer_task (2s)     │                                 │
 │    └─ Запрос SEC-SIGN         │                                 │
 │                               │                                 │
 │  button_task                  │                                 │
@@ -187,7 +187,7 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 - Координаты по умолчанию: настраиваемы в `config.rs`
 - 18 спутников: 9 GPS + 3 SBAS + 6 Galileo
 - 3D fix с DOP=1.0
-- SEC-SIGN подпись: Air 3 = каждые 4 сек, Air 3S / Mavic 4 Pro = каждые 2 сек
+- SEC-SIGN подпись: каждые 2 сек для всех моделей (Air 3, Air 3S, Mavic 4 Pro, Mavic 3 Pro)
 
 LED индикация в режиме Emulation:
 - **Зелёный**: валидные спутники (первые 20 сек)
@@ -256,16 +256,19 @@ LED индикация в режиме Emulation:
 - Работает из **любой точки мира** — целевая точка = `default_position` из `config.rs`
 - Детекция спуфинга анализирует **оригинальные** координаты (до смещения)
 - SEC-SIGN генерируется нашим таймером (как в Passthrough)
+- До вычисления смещения координатные сообщения **подавляются** (защита от утечки реальных координат)
 
 **Модифицируемые NAV сообщения**:
 
-| Сообщение | Применяемые смещения |
-|-----------|---------------------|
-| NAV-PVT | lon, lat, height, hMSL |
-| NAV-POSLLH | lon, lat, height, hMSL |
-| NAV-POSECEF | ecefX, ecefY, ecefZ |
-| NAV-HPPOSECEF | ecefX, ecefY, ecefZ |
-| NAV-SOL | ecefX, ecefY, ecefZ |
+| Сообщение | Метод смещения |
+|-----------|---------------|
+| NAV-PVT | линейный LLH offset (lon, lat, height, hMSL) |
+| NAV-POSLLH | линейный LLH offset (lon, lat, height, hMSL) |
+| NAV-POSECEF | пересчёт ECEF из offset-LLH через `llh_to_ecef_cm()` |
+| NAV-HPPOSECEF | пересчёт ECEF из offset-LLH + обнуление HP-байтов |
+| NAV-SOL | пересчёт ECEF из offset-LLH через `llh_to_ecef_cm()` |
+
+ECEF-координаты пересчитываются на каждом фрейме для геометрической согласованности с LLH (функция `llh_to_ecef` нелинейна — фиксированный ECEF offset расходится с LLH на больших расстояниях).
 
 Смещения настраиваются в `config.rs` → модуль `coordinate_offset`.
 
@@ -382,7 +385,7 @@ LED индикация в режиме Emulation:
 
 | Модель | Константа | Период SEC-SIGN | Config→NAV delay |
 |--------|-----------|-----------------|------------------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 секунды | 700ms |
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 2 секунды | 700ms |
 | DJI Air 3S | `PRIVATE_KEY_AIR3S` | 2 секунды | 780ms |
 | DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400ms |
 | DJI Mavic 3 Pro | `PRIVATE_KEY_MAVIC3PRO` | 2 секунды | 780ms |
@@ -467,7 +470,7 @@ pub const DEFAULT_BAUDRATE: u32 = 921600;
 pub const NAV_MEAS_PERIOD_MS: u32 = 200;  // 5Hz
 pub const NAV_RATE: u32 = 1;
 pub const MON_PERIOD_MS: u64 = 1000;      // 1Hz
-pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;   // Air 3: каждые 4 сек
+pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 2000;   // Air 3: каждые 2 сек
 pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;  // Air 3S: каждые 2 сек
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
 pub const SEC_SIGN_PERIOD_MAVIC3PRO_MS: u64 = 2000; // Mavic 3 Pro: каждые 2 сек

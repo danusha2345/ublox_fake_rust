@@ -120,12 +120,21 @@ Mode persisted to flash. Button: 1-4 clicks → mode 0-3. Timeout: 800ms. Hot-sw
 
 ### PassthroughOffset Mode
 
-Dynamic offset computed **once** at first 3D GPS fix: `offset = offset_target - actual_gps_position`. Target: `offset_target` in `config.rs` (Seney, Michigan). Offset applied to NAV-PVT, POSLLH, POSECEF, HPPOSECEF, SOL.
+Dynamic offset computed **once** at first 3D GPS fix. Target: `offset_target` in `config.rs` (Seney, Michigan).
+
+**LLH offset** (NAV-PVT, NAV-POSLLH): linear `offset = target - actual`, applied via addition. Always exact.
+
+**ECEF offset** (NAV-POSECEF, NAV-HPPOSECEF, NAV-SOL): recomputed per-frame from offset LLH via `llh_to_ecef_cm()` (~50µs). This ensures geometric consistency — a fixed additive ECEF offset diverges because `llh_to_ecef` is non-linear (different latitude → different meters/degree).
+
+**Startup protection**: coordinate-bearing messages (0x07, 0x02, 0x01, 0x13, 0x06) are suppressed until offset is computed (prevents real coordinate leak during first 0-2 epochs before 3D fix).
 
 **Important rules**:
 - Spoof detection uses **original** coordinates. Offset applied only to output.
 - Offset applied ALWAYS (even during spoofing), BEFORE spoof modification.
+- During spoofing: LAST_GOOD ECEF also recomputed from offset LLH for consistency.
 - SEC-SIGN: always generate our own in Passthrough modes (real GNSS SEC-SIGN filtered).
+- `DynamicOffset` struct contains only LLH fields (lat_1e7, lon_1e7, alt_mm). No ECEF fields.
+- `cached_offset_llh` caches the latest offset LLH for ECEF recomputation within same epoch.
 
 ### Spoof Detection in Passthrough Mode
 
@@ -355,7 +364,7 @@ After 20 seconds from NAV output start, satellites become invalid (fix_type=0, n
 
 | Drone Model | ID | First Delay | Period |
 |-------------|-----|-------------|--------|
-| Air 3 | 0 | 1000ms | 4s |
+| Air 3 | 0 | 1000ms | 2s |
 | Mavic 4 Pro | 1 | 650ms | 2s |
 | Air 3S | 2 | 650ms | 2s |
 | Mavic 3 Pro | 3 | 650ms | 2s |

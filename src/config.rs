@@ -83,7 +83,7 @@ pub mod timers {
     /// First SEC-SIGN delay after NAV start for Mavic 4 Pro (real: ~614ms)
     pub const SEC_SIGN_FIRST_MAVIC4_MS: u64 = 650;
     /// SEC-SIGN interval for DJI Air 3
-    pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;
+    pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 2000;
     /// SEC-SIGN interval for DJI Mavic 4 Pro
     pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000;
     /// Delay from first config to NAV start for Air 3 (real: 666ms)

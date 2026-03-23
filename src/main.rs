@@ -1553,8 +1553,8 @@ async fn gnss_processing_task() {
         modify_nav_pvt_spoof, modify_nav_posllh_spoof, modify_nav_posecef_spoof,
         modify_nav_hpposecef_spoof, modify_nav_sol_spoof,
         modify_nav_velecef_spoof, modify_nav_velned_spoof,
-        apply_offset_nav_pvt, apply_offset_nav_posllh, apply_offset_nav_posecef,
-        apply_offset_nav_hpposecef, apply_offset_nav_sol,
+        apply_offset_nav_pvt, apply_offset_nav_posllh,
+        replace_ecef_nav_posecef, replace_ecef_nav_hpposecef, replace_ecef_nav_sol,
         recalc_checksum,
     };
     use spoof_detector::{SpoofDetector, Position, AnalysisResult, FixType};
@@ -1566,6 +1566,7 @@ async fn gnss_processing_task() {
 
     // Dynamic offset for PassthroughOffset — computed once at first 3D GPS fix
     let mut dynamic_offset: Option<DynamicOffset> = None;
+    let mut cached_offset_llh: Option<(i32, i32, i32)> = None; // (lat, lon, height_mm) after offset
     let mut first_offset_logged = false;
 
     // CNO buffer - accumulates CNO values from NAV-SAT messages
@@ -1609,6 +1610,7 @@ async fn gnss_processing_task() {
                 SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                 // Reset dynamic offset — will be recomputed at next 3D fix
                 dynamic_offset = None;
+                cached_offset_llh = None;
             }
 
             let parser = parser.as_mut().unwrap();
@@ -1709,16 +1711,12 @@ async fn gnss_processing_task() {
                             let act_lat = i32::from_le_bytes([frame[6+28], frame[6+29], frame[6+30], frame[6+31]]);
                             let act_lon = i32::from_le_bytes([frame[6+24], frame[6+25], frame[6+26], frame[6+27]]);
                             let act_alt = i32::from_le_bytes([frame[6+36], frame[6+37], frame[6+38], frame[6+39]]);
-                            // Compute ECEF for actual position (~50µs, one-time)
-                            let (act_ex, act_ey, act_ez) = coordinates::llh_to_ecef_cm(act_lat, act_lon, act_alt);
-                            // Target = default_position (cached at init)
+                            // LLH offset only — ECEF is recomputed per-frame from offset LLH
+                            // for geometric consistency (llh_to_ecef is non-linear)
                             let off = DynamicOffset {
                                 lat_1e7: coordinates::offset_lat_1e7() - act_lat,
                                 lon_1e7: coordinates::offset_lon_1e7() - act_lon,
                                 alt_mm: coordinates::offset_alt_mm() - act_alt,
-                                ecef_x_cm: coordinates::offset_ecef_x_cm() - act_ex,
-                                ecef_y_cm: coordinates::offset_ecef_y_cm() - act_ey,
-                                ecef_z_cm: coordinates::offset_ecef_z_cm() - act_ez,
                             };
                             info!("Dynamic offset locked: actual=({},{}) target=({},{}) dlat={} dlon={}",
                                   act_lat, act_lon, coordinates::offset_lat_1e7(), coordinates::offset_lon_1e7(),
@@ -1728,17 +1726,43 @@ async fn gnss_processing_task() {
                     }
 
                     // Apply coordinate offset in PassthroughOffset mode (before spoof modification)
-                    // This ensures real coordinates are NEVER leaked without offset, even during spoofing.
+                    // LLH messages: linear offset (always exact).
+                    // ECEF messages: recompute from offset LLH via llh_to_ecef_cm() for geometric consistency.
                     // Spoof detection above used original coordinates; offset is applied to output only.
                     if apply_offset && class == 0x01 {
                         if let Some(ref off) = dynamic_offset {
                             let mut offset_applied = true;
                             match id {
-                                0x07 => apply_offset_nav_pvt(&mut frame, off),
-                                0x02 => apply_offset_nav_posllh(&mut frame, off),
-                                0x01 => apply_offset_nav_posecef(&mut frame, off),
-                                0x13 => apply_offset_nav_hpposecef(&mut frame, off),
-                                0x06 => apply_offset_nav_sol(&mut frame, off),
+                                0x07 => {
+                                    apply_offset_nav_pvt(&mut frame, off);
+                                    // Cache offset LLH for ECEF recomputation (ellipsoidal height at offset 32)
+                                    let lat = i32::from_le_bytes([frame[6+28], frame[6+29], frame[6+30], frame[6+31]]);
+                                    let lon = i32::from_le_bytes([frame[6+24], frame[6+25], frame[6+26], frame[6+27]]);
+                                    let h = i32::from_le_bytes([frame[6+32], frame[6+33], frame[6+34], frame[6+35]]);
+                                    cached_offset_llh = Some((lat, lon, h));
+                                }
+                                0x02 => {
+                                    apply_offset_nav_posllh(&mut frame, off);
+                                    // Also cache from POSLLH (ellipsoidal height at offset 12)
+                                    let lat = i32::from_le_bytes([frame[6+8], frame[6+9], frame[6+10], frame[6+11]]);
+                                    let lon = i32::from_le_bytes([frame[6+4], frame[6+5], frame[6+6], frame[6+7]]);
+                                    let h = i32::from_le_bytes([frame[6+12], frame[6+13], frame[6+14], frame[6+15]]);
+                                    cached_offset_llh = Some((lat, lon, h));
+                                }
+                                0x01 | 0x13 | 0x06 => {
+                                    // ECEF: recompute from cached offset LLH for consistency
+                                    if let Some((lat, lon, alt)) = cached_offset_llh {
+                                        let (ex, ey, ez) = coordinates::llh_to_ecef_cm(lat, lon, alt);
+                                        match id {
+                                            0x01 => replace_ecef_nav_posecef(&mut frame, ex, ey, ez),
+                                            0x13 => replace_ecef_nav_hpposecef(&mut frame, ex, ey, ez),
+                                            _ => replace_ecef_nav_sol(&mut frame, ex, ey, ez),
+                                        }
+                                    } else {
+                                        // No LLH cached yet — suppress to avoid leaking real ECEF
+                                        continue;
+                                    }
+                                }
                                 _ => { offset_applied = false; }
                             }
                             if offset_applied {
@@ -1751,6 +1775,12 @@ async fn gnss_processing_task() {
                             // Skip checksum if spoofed — spoof handler below recalculates after coordinate replacement
                             if offset_applied && !SPOOF_DETECTED.load(Ordering::Acquire) {
                                 recalc_checksum(&mut frame);
+                            }
+                        } else {
+                            // Offset not yet computed — suppress coordinate messages to prevent real coordinate leak
+                            match id {
+                                0x07 | 0x02 | 0x01 | 0x13 | 0x06 => continue,
+                                _ => {}
                             }
                         }
                     }
@@ -1776,11 +1806,11 @@ async fn gnss_processing_task() {
                         } else {
                             (good_lat, good_lon, good_alt)
                         };
-                        let (rep_ex, rep_ey, rep_ez) = if let Some(ref off) = dynamic_offset {
-                            (good_ecef_x.saturating_add(off.ecef_x_cm),
-                             good_ecef_y.saturating_add(off.ecef_y_cm),
-                             good_ecef_z.saturating_add(off.ecef_z_cm))
+                        let (rep_ex, rep_ey, rep_ez) = if dynamic_offset.is_some() {
+                            // PassthroughOffset: recompute ECEF from offset LLH for consistency
+                            coordinates::llh_to_ecef_cm(rep_lat, rep_lon, rep_alt)
                         } else {
+                            // Passthrough (no offset): use raw ECEF from LAST_GOOD
                             (good_ecef_x, good_ecef_y, good_ecef_z)
                         };
 
