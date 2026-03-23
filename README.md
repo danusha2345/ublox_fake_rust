@@ -1,6 +1,6 @@
 # u-blox GNSS M10 Emulator (Rust/Embassy)
 
-Эмулятор GNSS приёмника u-blox серии M10 на микроконтроллере RP2350.
+Эмулятор GNSS приёмника u-blox серии M10 на микроконтроллерах RP2350/RP2354.
 Написан на Rust с использованием асинхронного фреймворка Embassy.
 
 > **Примечание**: RP2040 больше не поддерживается — требуется ~221 KB RAM для буферов, что превышает доступные 264 KB.
@@ -31,7 +31,7 @@
 - **MCU**: RP2350A / RP2354A (Spotpear RP2350-Core-A или аналогичные)
   - RP2350A: внешняя QSPI flash
   - RP2354A: 2 МБ встроенной flash (рекомендуется)
-- **Flash**: 2 МБ
+- **Flash**: 4 МБ (RP2350, внешняя QSPI) / 2 МБ (RP2354, встроенная)
 - **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
 - **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
 - **LED RP2350**: WS2812B на GPIO25 (цветовая индикация)
@@ -116,8 +116,8 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 │    └─ SEC_SIGN_RESULT обрабо. │  sec_sign_compute_task          │
 │                               │    └─ ECDSA P-192 подпись       │
 │  uart0_rx_task                │                                 │
-│    └─ UBX парсер              │  mon_message_task (1Hz)         │
-│    └─ CFG команды             │    └─ MON-HW, RF, COMMS         │
+│    └─ UBX парсер              │  sec_sign_timer_task (2s)       │
+│    └─ CFG команды             │    └─ Запрос SEC-SIGN           │
 │                               │                                 │
 │  uart1_rx_task                │                                 │
 │    └─ UART1 RX → RAW_RX_CH   │                                 │
@@ -130,8 +130,8 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 │    └─ NAV-PVT, STATUS, DOP... │                                 │
 │    └─ Timer::at (без дрейфа)  │                                 │
 │                               │                                 │
-│  sec_sign_timer_task (2s)     │                                 │
-│    └─ Запрос SEC-SIGN         │                                 │
+│  mon_message_task (1Hz)       │                                 │
+│    └─ MON-HW, RF, COMMS       │                                 │
 │                               │                                 │
 │  button_task                  │                                 │
 │    └─ Переключение режимов    │                                 │
@@ -148,20 +148,19 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 | `SEC_SIGN_REQUEST` | Core0 → Core1 | Запрос вычисления подписи |
 | `SEC_SIGN_RESULT` | Core1 → Core0 | Результат вычисления (r, s) |
 | `SEC_SIGN_IN_PROGRESS` | Атомик | Пауза TX во время вычисления |
-| `SEC_SIGN_DONE` | Signal | Уведомление о завершении SEC-SIGN |
 | `MODE` | Атомик | Текущий режим работы |
 
 ### Поток данных SEC-SIGN
 
 ```
-1. nav_message_task (Core0) / mon_message_task (Core1)
+1. nav_message_task (Core0) / mon_message_task (Core0)
    └─→ TX_CHANNEL (сериализованные UBX)
 
 2. uart0_tx_task (Core0)
    ├─→ UART0 TX (отправка)
    └─→ SecSignAccumulator.accumulate() (SHA256)
 
-3. sec_sign_timer_task (каждые 2-4 сек)
+3. sec_sign_timer_task (Core1, каждые 2 сек)
    ├─ SEC_SIGN_IN_PROGRESS = true (пауза TX)
    ├─ Захват SHA256 хэша + msg_count
    └─→ SEC_SIGN_REQUEST (→ Core1)
@@ -212,7 +211,7 @@ LED индикация в режиме Emulation:
 | Телепортация | > 2000 м | Резкий скачок позиции |
 | Скорость | > 30 м/с | Нереалистичная скорость (108 км/ч) |
 | Прыжок GNSS времени назад | > 1 сек | Время не должно идти назад |
-| Прыжок GNSS времени вперёд | > 30 сек | Нереалистичный скачок времени |
+| Прыжок GNSS времени вперёд | > 5 сек | Нереалистичный скачок времени |
 | Дрейф системных часов | > 10 сек | Расхождение GNSS и внутренних часов |
 
 **Отключённые (код сохранён):**
@@ -222,7 +221,7 @@ LED индикация в режиме Emulation:
 
 **При обнаружении спуфинга:**
 1. Сохраняются последние хорошие координаты (2 сек до атаки)
-2. Модифицируются ВСЕ NAV сообщения: `num_sv=2`, `fix_type=0`, `flags=0`
+2. Модифицируются ВСЕ NAV сообщения: `num_sv=92` (spoof marker), `fix_type=0`, `flags=0`
 3. LED моргает красным (цикл 200 мс)
 4. Пересчитывается Fletcher-8 checksum
 5. **SEC-SIGN** всегда генерируется нашим таймером (входящий SEC-SIGN от реального GNSS фильтруется)
@@ -390,7 +389,7 @@ ECEF-координаты пересчитываются на каждом фр�
 | DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400ms |
 | DJI Mavic 3 Pro | `PRIVATE_KEY_MAVIC3PRO` | 2 секунды | 780ms |
 
-Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro)
+Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3 **по умолчанию**, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro). Модель также загружается из flash (устанавливается кнопкой).
 
 ### CFG-0x41 (OTP / DJI Proprietary)
 
@@ -475,10 +474,14 @@ pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;  // Air 3S: каждые 2 се�
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
 pub const SEC_SIGN_PERIOD_MAVIC3PRO_MS: u64 = 2000; // Mavic 3 Pro: каждые 2 сек
 
-// Координаты по умолчанию (автоматически конвертируются в ECEF)
-pub const LATITUDE: f64 = 37.6469;      // Rachel, Nevada
-pub const LONGITUDE: f64 = -115.7444;
+// Координаты по умолчанию — Emulation (автоматически конвертируются в ECEF)
+pub const LATITUDE: f64 = 25.966443;    // Golden Beach, FL
+pub const LONGITUDE: f64 = -80.122371;
 pub const ALTITUDE_M: i32 = 100;
+
+// Целевые координаты — PassthroughOffset (offset_target)
+pub const LATITUDE: f64 = 46.3407;      // Seney, Michigan
+pub const LONGITUDE: f64 = -85.9407;
 ```
 
 При изменении координат в `config.rs` автоматически обновляются все NAV сообщения:
@@ -513,7 +516,8 @@ ublox_fake_rust/
     ├── led.rs              # WS2812 LED драйвер (обёртка над embassy-rp)
     ├── passthrough.rs      # UBX парсер, буфер позиций, модификация NAV
     ├── spoof_detector.rs   # Алгоритмы детекции GPS-спуфинга
-    └── flash_storage.rs    # Сохранение режима во flash
+    ├── flash_storage.rs    # Сохранение режима и ключей во flash
+    └── key_extract.rs      # Извлечение SEC-SIGN ключей из реального GNSS
 ```
 
 ## Зависимости
@@ -521,7 +525,7 @@ ublox_fake_rust/
 | Крейт | Версия | Назначение |
 |-------|--------|------------|
 | embassy-executor | 0.9 | Асинхронный runtime |
-| embassy-rp | 0.9 | HAL для RP2040/RP2350 |
+| embassy-rp | 0.9 | HAL для RP2350/RP2354 |
 | embassy-sync | 0.7 | Channel, Signal, Mutex |
 | embassy-time | 0.5 | Timer, Ticker |
 | embassy-futures | 0.1 | select, yield_now |
@@ -550,9 +554,10 @@ ublox_fake_rust/
 
 ## Известные ограничения
 
-1. **Координаты статичны** — настраиваются в `config.rs`, но не меняются во время работы (нет симуляции движения)
+1. **Координаты эмуляции статичны** — настраиваются в `config.rs`, но не меняются во время работы (нет симуляции движения). В PassthroughOffset координаты динамические.
 2. **Нет GPS week rollover** — week hardcoded (2349)
 3. **Один LED** — нет отдельной индикации ошибок (только цвет и мигание)
+4. **Mavic 4 Pro** — уникальные ключи на каждый экземпляр. Используйте авто-извлечение ключей при загрузке.
 
 ## Лицензия
 
@@ -560,7 +565,7 @@ MIT
 
 ## Автор
 
-Daniil, 2025
+Daniil, 2025-2026
 
 ---
 
