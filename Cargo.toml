@@ -36,6 +36,9 @@ subtle = { version = "2.5", default-features = false }
 # Heapless collections (no_std)
 heapless = "0.9"
 
+# Math functions for no_std (sqrt, fabs, etc.)
+libm = "0.2"
+
 # Static cell for multicore
 static_cell = "2"
 portable-atomic = { version = "1", features = ["critical-section"] }
@@ -49,9 +52,6 @@ smart-leds = "0.4"
 # Async IO traits (must match embassy-rp version)
 embedded-io-async = "0.6"
 
-# Math functions for coordinate conversion (no_std)
-libm = "0.2"
-
 # Direct register access for baudrate change
 rp-pac = { version = "7", features = ["rp235x"] }
 
@@ -59,6 +59,7 @@ rp-pac = { version = "7", features = ["rp235x"] }
 default = ["rp2350"]
 rp2040 = ["embassy-rp/rp2040"]
 rp2350 = ["embassy-rp/rp235xa", "embassy-rp/imagedef-secure-exe"]
+rp2354 = ["rp2350"]  # RP2354 uses same HAL as RP2350, different pin config
 
 [profile.dev]
 debug = 2
@@ -70,7 +71,7 @@ lto = true
 opt-level = "z"       # Maximum size optimization (was "s")
 codegen-units = 1     # Better optimization, slower build
 
-# Speed-optimize crypto crates (ECDSA was ~700ms with opt-level="z", now ~67ms)
+# Speed-optimize crypto crates (ECDSA is ~700ms with "z", measured ~59ms with "3")
 [profile.release.package.p192]
 opt-level = 3
 
@@ -81,6 +82,27 @@ opt-level = 3
 opt-level = 3
 
 [profile.release.package.subtle]
+opt-level = 3
+
+[profile.release.package.crypto-bigint]
+opt-level = 3
+
+[profile.release.package.elliptic-curve]
+opt-level = 3
+
+[profile.release.package.primeorder]
+opt-level = 3
+
+[profile.release.package.ff]
+opt-level = 3
+
+[profile.release.package.group]
+opt-level = 3
+
+[profile.release.package.digest]
+opt-level = 3
+
+[profile.release.package.block-buffer]
 opt-level = 3
 
 [[bin]]

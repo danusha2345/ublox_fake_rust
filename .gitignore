@@ -1,1 +1,17 @@
+# Build artifacts
 /target
+tests_host/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.bak
+*.tmp

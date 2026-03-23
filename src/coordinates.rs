@@ -29,6 +29,16 @@ static mut CACHED: CachedCoords = CachedCoords {
     ecef_z_cm: 0,
 };
 
+/// Cached offset target coordinates (for PassthroughOffset mode)
+static mut OFFSET_TARGET: CachedCoords = CachedCoords {
+    lat_1e7: 0,
+    lon_1e7: 0,
+    alt_mm: 0,
+    ecef_x_cm: 0,
+    ecef_y_cm: 0,
+    ecef_z_cm: 0,
+};
+
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize cached coordinates from config (call once at startup)
@@ -64,6 +74,35 @@ pub fn init() {
         CACHED.ecef_x_cm = (x_m * 100.0) as i32;
         CACHED.ecef_y_cm = (y_m * 100.0) as i32;
         CACHED.ecef_z_cm = (z_m * 100.0) as i32;
+    }
+
+    // Compute offset target coordinates (Seney, Michigan)
+    {
+        use crate::config::offset_target as ot;
+
+        let lat_rad = ot::LATITUDE.to_radians();
+        let lon_rad = ot::LONGITUDE.to_radians();
+
+        let sin_lat = sin(lat_rad);
+        let cos_lat = cos(lat_rad);
+        let sin_lon = sin(lon_rad);
+        let cos_lon = cos(lon_rad);
+
+        let n = WGS84_A / sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat);
+        let alt_m = ot::ALTITUDE_M as f64;
+
+        let x_m = (n + alt_m) * cos_lat * cos_lon;
+        let y_m = (n + alt_m) * cos_lat * sin_lon;
+        let z_m = (n * (1.0 - WGS84_E2) + alt_m) * sin_lat;
+
+        unsafe {
+            OFFSET_TARGET.lat_1e7 = (ot::LATITUDE * 1e7) as i32;
+            OFFSET_TARGET.lon_1e7 = (ot::LONGITUDE * 1e7) as i32;
+            OFFSET_TARGET.alt_mm = ot::ALTITUDE_M * 1000;
+            OFFSET_TARGET.ecef_x_cm = (x_m * 100.0) as i32;
+            OFFSET_TARGET.ecef_y_cm = (y_m * 100.0) as i32;
+            OFFSET_TARGET.ecef_z_cm = (z_m * 100.0) as i32;
+        }
     }
 }
 
@@ -101,4 +140,33 @@ pub fn ecef_y_cm() -> i32 {
 #[inline]
 pub fn ecef_z_cm() -> i32 {
     unsafe { CACHED.ecef_z_cm }
+}
+
+// === Offset target getters (for PassthroughOffset mode) ===
+
+#[inline]
+pub fn offset_lat_1e7() -> i32 { unsafe { OFFSET_TARGET.lat_1e7 } }
+#[inline]
+pub fn offset_lon_1e7() -> i32 { unsafe { OFFSET_TARGET.lon_1e7 } }
+#[inline]
+pub fn offset_alt_mm() -> i32 { unsafe { OFFSET_TARGET.alt_mm } }
+/// Runtime LLH → ECEF conversion (for spoof detection LAST_GOOD coordinates and per-frame offset)
+/// Uses f64 trig (software-emulated on Cortex-M33, ~50µs per call — acceptable for rare spoof events)
+pub fn llh_to_ecef_cm(lat_1e7: i32, lon_1e7: i32, alt_mm: i32) -> (i32, i32, i32) {
+    let lat_rad = (lat_1e7 as f64 * 1e-7_f64).to_radians();
+    let lon_rad = (lon_1e7 as f64 * 1e-7_f64).to_radians();
+
+    let sin_lat = sin(lat_rad);
+    let cos_lat = cos(lat_rad);
+    let sin_lon = sin(lon_rad);
+    let cos_lon = cos(lon_rad);
+
+    let n = WGS84_A / sqrt(1.0 - WGS84_E2 * sin_lat * sin_lat);
+    let alt_m = alt_mm as f64 / 1000.0;
+
+    let x_cm = ((n + alt_m) * cos_lat * cos_lon * 100.0) as i32;
+    let y_cm = ((n + alt_m) * cos_lat * sin_lon * 100.0) as i32;
+    let z_cm = ((n * (1.0 - WGS84_E2) + alt_m) * sin_lat * 100.0) as i32;
+
+    (x_cm, y_cm, z_cm)
 }

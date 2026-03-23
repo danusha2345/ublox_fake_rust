@@ -3,11 +3,15 @@
 Эмулятор GNSS приёмника u-blox серии M10 на микроконтроллере RP2350.
 Написан на Rust с использованием асинхронного фреймворка Embassy.
 
+> **Примечание**: RP2040 больше не поддерживается — требуется ~221 KB RAM для буферов, что превышает доступные 264 KB.
+
 ## Назначение
 
-Устройство эмулирует работу GNSS приёмника u-blox и может работать в двух режимах:
+Устройство эмулирует работу GNSS приёмника u-blox и может работать в четырёх режимах:
 - **Emulation** — генерация фиктивных GNSS данных с криптографической подписью SEC-SIGN
-- **Passthrough** — прозрачная ретрансляция данных от реального GNSS модуля
+- **Passthrough** — ретрансляция данных от реального GNSS модуля с детекцией GPS-спуфинга
+- **PassthroughRaw** — прозрачная ретрансляция данных без какой-либо обработки
+- **PassthroughOffset** — ретрансляция с подменой координат и детекцией спуфинга
 
 Основное применение — тестирование и исследование систем, использующих u-blox GNSS с аутентификацией SEC-SIGN (например, дроны DJI).
 
@@ -15,7 +19,7 @@
 
 - Полная реализация протокола UBX (17 NAV сообщений, 4 MON сообщения, SEC-SIGN)
 - Криптографическая подпись ECDSA SECP192R1 (чистый Rust, без C зависимостей)
-- Поддержка приватных ключей DJI Air 3 и Mavic 4 Pro
+- Поддержка приватных ключей DJI Air 3, Air 3S, Mavic 4 Pro и Mavic 3 Pro
 - Двухядерная асинхронная архитектура Embassy
 - Hot-switch режимов без перезагрузки
 - Сохранение режима во flash память
@@ -24,14 +28,15 @@
 
 ## Аппаратные требования
 
-- **MCU**: RP2350A (Spotpear RP2350-Core-A)
+- **MCU**: RP2350A / RP2354A (Spotpear RP2350-Core-A или аналогичные)
+  - RP2350A: внешняя QSPI flash
+  - RP2354A: 2 МБ встроенной flash (рекомендуется)
 - **Flash**: 2 МБ
-- **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод по умолчанию)
-- **UART1**: TX=GPIO4 (не используется), RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
-- **LED**: WS2812B на GPIO16 (RP2350-Core-A)
-- **Кнопка**: GPIO11 (вход), GPIO10 (питание) — переключение режимов
-
-**Настройка пинов**: все GPIO пины можно изменить в файле [`src/config.rs`](src/config.rs) (модуль `pins`).
+- **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
+- **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
+- **LED RP2350**: WS2812B на GPIO25 (цветовая индикация)
+- **LED RP2354**: Simple GPIO LED на GPIO11/GPIO12 (blink code индикация)
+- **Кнопка**: GPIO14 (вход), GPIO13 (питание) — для RP2350 и RP2354
 
 ## Сборка и прошивка
 
@@ -56,8 +61,11 @@ cargo install elf2uf2-rs
 **ВАЖНО:** Всегда используйте Makefile для сборки UF2!
 
 ```bash
-# Сборка UF2 для RP2350
+# Сборка UF2 для RP2350 (внешняя QSPI flash)
 make rp2350
+
+# Сборка UF2 для RP2354 (встроенная 2MB flash)
+make rp2354
 
 # Очистка
 make clean
@@ -65,7 +73,7 @@ make clean
 
 #### Почему Makefile, а не ручная конвертация?
 
-`elf2uf2-rs` по умолчанию генерирует UF2 с Family ID для RP2040 (`0xe48bff56`).
+`elf2uf2-rs` по умолчанию генерирует UF2 с неправильным Family ID.
 Для RP2350 требуется патчинг Family ID на `0xe48bff59`.
 
 Makefile автоматически:
@@ -80,12 +88,15 @@ Makefile автоматически:
 ```bash
 # Способ 1: UF2 через BOOTSEL (без отладчика)
 # 1. Зажать кнопку BOOT и подключить USB
-# 2. Скопировать ublox_fake_rp2350.uf2 на появившийся диск RPI-RP2
+# 2. Скопировать ublox_fake_rp2350.uf2 (или rp2354) на появившийся диск RPI-RP2
 
 # Способ 2: Через probe-rs (требуется отладочный адаптер)
-make flash
-# или
-cargo run --release
+make flash          # RP2350 (по умолчанию)
+make flash-rp2354   # RP2354 (встроенная flash)
+
+# или напрямую
+cargo run --release                                                              # RP2350
+CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo run --release  # RP2354
 ```
 
 ## Архитектура
@@ -94,12 +105,12 @@ cargo run --release
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         RP2350/RP2040                           │
+│                            RP2350                               │
 ├───────────────────────────────┬─────────────────────────────────┤
 │           CORE 0              │            CORE 1               │
 │      (Embassy Executor)       │       (Embassy Executor)        │
 ├───────────────────────────────┼─────────────────────────────────┤
-│  uart0_tx_task                │  led_task (500ms)               │
+│  uart0_tx_task                │  led_task (100ms)               │
 │    └─ TX_CHANNEL → UART0 TX   │    └─ WS2812B управление        │
 │    └─ SHA256 накопление       │                                 │
 │    └─ SEC_SIGN_RESULT обрабо. │  sec_sign_compute_task          │
@@ -109,13 +120,17 @@ cargo run --release
 │    └─ CFG команды             │    └─ MON-HW, RF, COMMS         │
 │                               │                                 │
 │  uart1_rx_task                │                                 │
-│    └─ Внешний GNSS вход       │                                 │
+│    └─ UART1 RX → RAW_RX_CH   │                                 │
+│                               │                                 │
+│  gnss_processing_task         │                                 │
+│    └─ RAW_RX → парсинг UBX   │                                 │
+│    └─ Spoof detect → GNSS_RX  │                                 │
 │                               │                                 │
 │  nav_message_task (5Hz)       │                                 │
 │    └─ NAV-PVT, STATUS, DOP... │                                 │
 │    └─ Timer::at (без дрейфа)  │                                 │
 │                               │                                 │
-│  sec_sign_timer_task (2-4s)   │                                 │
+│  sec_sign_timer_task (2s)     │                                 │
 │    └─ Запрос SEC-SIGN         │                                 │
 │                               │                                 │
 │  button_task                  │                                 │
@@ -128,7 +143,8 @@ cargo run --release
 | Канал/Сигнал | Направление | Назначение |
 |--------------|-------------|------------|
 | `TX_CHANNEL` (32 msg) | Tasks → uart0_tx | Очередь UBX сообщений для отправки |
-| `GNSS_RX_CHANNEL` | uart1_rx → uart0_tx | Данные от внешнего GNSS (passthrough) |
+| `RAW_RX_CHANNEL` (64×256B) | uart1_rx → gnss_processing | Сырые байты от UART1 |
+| `GNSS_RX_CHANNEL` (128 msg) | gnss_processing → uart0_tx | Распарсенные UBX фреймы (passthrough) |
 | `SEC_SIGN_REQUEST` | Core0 → Core1 | Запрос вычисления подписи |
 | `SEC_SIGN_RESULT` | Core1 → Core0 | Результат вычисления (r, s) |
 | `SEC_SIGN_IN_PROGRESS` | Атомик | Пауза TX во время вычисления |
@@ -171,23 +187,110 @@ cargo run --release
 - Координаты по умолчанию: настраиваемы в `config.rs`
 - 18 спутников: 9 GPS + 3 SBAS + 6 Galileo
 - 3D fix с DOP=1.0
-- SEC-SIGN подпись: Air 3 = каждые 4 сек, Mavic 4 Pro = каждые 2 сек
+- SEC-SIGN подпись: каждые 2 сек для всех моделей (Air 3, Air 3S, Mavic 4 Pro, Mavic 3 Pro)
 
 LED индикация в режиме Emulation:
 - **Зелёный**: валидные спутники (первые 20 сек)
 - **Жёлтый**: невалидные спутники (после 20 сек)
 
-### Passthrough (LED синий)
+### Passthrough (LED синий / моргающий красный)
 
-Прозрачная ретрансляция:
+Ретрансляция данных от реального GNSS с защитой от спуфинга:
 - Вход: UART1 RX (GPIO5) от реального GNSS
 - Выход: UART0 TX (GPIO0) к хосту
 - UBX команды от хоста обрабатываются (настройки сохраняются)
+- **100% надёжность передачи** (FIFO threshold optimization, tested 5 min @ 921600 baud)
+
+#### Детекция GPS-спуфинга
+
+В режиме passthrough устройство анализирует входящий поток UBX и детектирует аномалии:
+
+**Активные алгоритмы:**
+
+| Алгоритм | Порог | Описание |
+|----------|-------|----------|
+| Телепортация | > 2000 м | Резкий скачок позиции |
+| Скорость | > 30 м/с | Нереалистичная скорость (108 км/ч) |
+| Прыжок GNSS времени назад | > 1 сек | Время не должно идти назад |
+| Прыжок GNSS времени вперёд | > 30 сек | Нереалистичный скачок времени |
+| Дрейф системных часов | > 10 сек | Расхождение GNSS и внутренних часов |
+
+**Отключённые (код сохранён):**
+- Высота (скачок > 10м) — отключено
+- Ускорение (> 20 м/с²) — отключено
+- CNO аномалия (одинаковый уровень сигнала) — отключено
+
+**При обнаружении спуфинга:**
+1. Сохраняются последние хорошие координаты (2 сек до атаки)
+2. Модифицируются ВСЕ NAV сообщения: `num_sv=2`, `fix_type=0`, `flags=0`
+3. LED моргает красным (цикл 200 мс)
+4. Пересчитывается Fletcher-8 checksum
+5. **SEC-SIGN** всегда генерируется нашим таймером (входящий SEC-SIGN от реального GNSS фильтруется)
+
+**Восстановление:**
+- **Time-based recovery**: при возврате GNSS времени к ожидаемому значению (±5 сек от проекции)
+- **Coordinate-based recovery**: 5 секунд чистых данных + возврат к исходной позиции (< 2000м)
+- При восстановлении перекалибровываются системные часы с новым GNSS временем
+- Сбрасывается хэш-аккумулятор SEC_SIGN_ACC
+- Возврат к нормальной ретрансляции
+
+Реализация: `spoof_detector.rs` (алгоритмы), `passthrough.rs` (UBX парсер, модификация)
+
+### PassthroughRaw (LED пурпурный)
+
+Полностью прозрачная ретрансляция данных без какой-либо обработки:
+- Вход: UART1 RX (GPIO5) от реального GNSS
+- Выход: UART0 TX (GPIO0) к хосту
+- **Без парсинга UBX фреймов**
+- **Без детекции спуфинга**
+- **Без модификации данных**
+- SEC-SIGN проходит от реального модуля без изменений
+
+Используйте этот режим когда нужна чистая ретрансляция без вмешательства.
+
+### PassthroughOffset (LED белый / моргающий красный)
+
+Ретрансляция с подменой координат и детекцией спуфинга:
+- Работает как Passthrough, но применяет динамическое смещение координат ко всем NAV сообщениям
+- **Смещение** вычисляется один раз при первом 3D GPS-фиксе: `offset = default_position - actual_position`
+- Работает из **любой точки мира** — целевая точка = `default_position` из `config.rs`
+- Детекция спуфинга анализирует **оригинальные** координаты (до смещения)
+- SEC-SIGN генерируется нашим таймером (как в Passthrough)
+- До вычисления смещения координатные сообщения **подавляются** (защита от утечки реальных координат)
+
+**Модифицируемые NAV сообщения**:
+
+| Сообщение | Метод смещения |
+|-----------|---------------|
+| NAV-PVT | линейный LLH offset (lon, lat, height, hMSL) |
+| NAV-POSLLH | линейный LLH offset (lon, lat, height, hMSL) |
+| NAV-POSECEF | пересчёт ECEF из offset-LLH через `llh_to_ecef_cm()` |
+| NAV-HPPOSECEF | пересчёт ECEF из offset-LLH + обнуление HP-байтов |
+| NAV-SOL | пересчёт ECEF из offset-LLH через `llh_to_ecef_cm()` |
+
+ECEF-координаты пересчитываются на каждом фрейме для геометрической согласованности с LLH (функция `llh_to_ecef` нелинейна — фиксированный ECEF offset расходится с LLH на больших расстояниях).
+
+Смещения настраиваются в `config.rs` → модуль `coordinate_offset`.
 
 ### Переключение режимов
 
-- **Кнопка**: нажатие переключает режим (hot-switch без перезагрузки)
-- **Индикация**: LED мигает зелёным/жёлтым (Emulation) или синим (Passthrough)
+- **Кнопка**: выбор режима по количеству коротких нажатий (таймаут 800мс между нажатиями):
+  - **1 нажатие** → Emulation
+  - **2 нажатия** → Passthrough
+  - **3 нажатия** → PassthroughRaw
+  - **4 нажатия** → PassthroughOffset
+- **Индикация LED (RP2350 — WS2812B цветной)**:
+  - Зелёный/жёлтый — Emulation (жёлтый = спутники невалидны)
+  - Синий — Passthrough
+  - Пурпурный — PassthroughRaw
+  - Белый — PassthroughOffset
+  - Быстро моргающий красный — спуфинг обнаружен
+- **Индикация LED (RP2354 — простой GPIO, blink code)**:
+  - 1 вспышка — Emulation
+  - 2 вспышки — Passthrough
+  - 3 вспышки — PassthroughRaw
+  - 4 вспышки — PassthroughOffset
+  - Быстрое непрерывное мигание — спуфинг обнаружен
 - **Персистентность**: режим сохраняется во flash и восстанавливается после питания
 
 ### Таймер невалидных спутников (20 сек)
@@ -203,10 +306,9 @@ LED индикация в режиме Emulation:
 | NAV-SVINFO | 1 спутник, низкое качество |
 
 Таймер сбрасывается **только** при:
-- Переключении режима Passthrough → Emulation (кнопка)
+- Переключении в режим Emulation (кнопкой)
 
-> [!NOTE]
-> Команда CFG-RST от дрона **НЕ** сбрасывает таймер 20 секунд.
+**Примечание:** CFG-RST от дрона **не** сбрасывает таймер (это сделано намеренно).
 
 ## Поддерживаемые UBX сообщения
 
@@ -281,16 +383,14 @@ LED индикация в режиме Emulation:
 
 ### Приватные ключи и тайминги
 
-| Модель | Константа | Период SEC-SIGN | Задержка до NAV |
-|--------|-----------|-----------------|-----------------|
-| DJI Air 3 | `PRIVATE_KEY_AIR3` | 4 секунды | 700 мс |
-| DJI Mavic 4 Pro (по умолчанию) | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400 мс |
+| Модель | Константа | Период SEC-SIGN | Config→NAV delay |
+|--------|-----------|-----------------|------------------|
+| DJI Air 3 | `PRIVATE_KEY_AIR3` | 2 секунды | 700ms |
+| DJI Air 3S | `PRIVATE_KEY_AIR3S` | 2 секунды | 780ms |
+| DJI Mavic 4 Pro | `PRIVATE_KEY_MAVIC4PRO` | 2 секунды | 400ms |
+| DJI Mavic 3 Pro | `PRIVATE_KEY_MAVIC3PRO` | 2 секунды | 780ms |
 
-**Настройка модели дрона**:
-- Изменить константу `DRONE_MODEL` в [`src/main.rs`](src/main.rs#L168) (строка 168)
-- Значения: `0` = Air 3, `1` = Mavic 4 Pro
-- По умолчанию: `1` (DJI Mavic 4 Pro)
-- Приватные ключи хранятся в [`src/sec_sign.rs`](src/sec_sign.rs)
+Выбор модели: переменная `DRONE_MODEL` в `main.rs` (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro)
 
 ### CFG-0x41 (OTP / DJI Proprietary)
 
@@ -315,11 +415,13 @@ B5 62 06 41 [len] 04 01 A4 [size] [hash:4] 28 EF 12 05 [config_data] [checksum]
 | 2. ROM Patch #1 | 26 | 28 | file 0x82, ARM Thumb-2 код |
 | 3. ROM Patch #2 | 54 | 42 | file 0x83, ARM Thumb-2 код |
 | 4. CFG-SIGNAL | 96 | ~20 | group 0x31, конфиг сигналов |
-| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory |
+| 5. CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory (Air 3 / Mavic 4 Pro) |
 | 6. SEC/KEY | ~166 | 26 | group 0xA6, **Приватный ключ** |
 | 7. CFG-UART1 | ~192 | 10 | group 0x52, baudrate |
 | 8. CFG-CLOCK | ~202 | 40 | group 0xA4, частоты |
 | 9. Padding | ~242 | 14 | 0xFF заполнение |
+
+**Примечание**: Air 3S и Mavic 3 Pro используют другой шаблон CFG-0x41 **без секции CFG-RINV**. Ключ расположен на offset 115 (вместо 175). Mavic 3 Pro дополнительно не содержит секций CFG-UART1/CFG-CLOCK (всё 0xFF после ключа).
 
 **Секция 5 - CFG-RINV (Remote Inventory)**:
 ```
@@ -353,64 +455,12 @@ A4 20 01
 - Получения ключей из других дронов для анализа
 
 **Реализация**: `src/ubx/messages.rs` → `Cfg41`, `cfg41_templates`
-- `PRIVATE_KEY_OFFSET = 175` - смещение для вставки ключа в шаблон
+- `PRIVATE_KEY_OFFSET = 175` — смещение для вставки ключа в шаблон (Air 3, Mavic 4 Pro)
+- `PRIVATE_KEY_OFFSET_AIR3S = 115` — смещение для Air 3S и Mavic 3 Pro (нет CFG-RINV секции)
 
 ## Конфигурация
 
-### Настройка пинов GPIO ([`src/config.rs`](src/config.rs))
-
-```rust
-// UART0: к дрону/хосту
-pub const UART0_TX: u8 = 0;
-pub const UART0_RX: u8 = 1;
-
-// UART1: от внешнего GNSS модуля (passthrough source)
-pub const UART1_TX: u8 = 4;   // не используется, но резервируется
-pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
-
-// Mode button (перенесено с GPIO5/6)
-pub const MODE_BTN_PWR: u8 = 6;
-pub const MODE_BTN_INPUT: u8 = 7;
-
-// WS2812B LED (RP2350-Core-A: GPIO16)
-pub const WS2812_LED: u8 = 16;
-```
-
-> [!NOTE]
-> **Реальные пины в main.rs**: Кнопка использует GPIO10 (PWR) и GPIO11 (INPUT) из-за RP2350-E9 workaround
-
-> [!TIP]
-> **Изменение WS2812 LED пина**: Пин светодиода настраивается через **type alias** в одном месте!
-> 
-> Измените в [`src/main.rs`](src/main.rs#L70) строку ~70:
-> ```rust
-> type WS2812LedPin = embassy_rp::peripherals::PIN_16;  // <- Измените PIN_XX
-> ```
-> Пример для GPIO25: `type WS2812LedPin = embassy_rp::peripherals::PIN_25;`
-
-### Настройка модели дрона ([`src/main.rs`](src/main.rs#L168))
-
-```rust
-/// Drone model for SEC-SIGN key selection (0 = Air3, 1 = Mavic4Pro)
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // Mavic 4 Pro по умолчанию
-```
-
-**Изменить модель**: замените `1` на `0` для Air 3
-
-### Настройка размера flash памяти ([`src/config.rs`](src/config.rs#L8))
-
-```rust
-/// Flash memory size in bytes
-/// Изменить для плат с другим размером flash (например, 4MB = 4 * 1024 * 1024)
-pub const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2MB (Spotpear RP2350-Core-A)
-```
-
-**Важно**: При изменении размера памяти офсет для записи конфигурации во flash автоматически пересчитывается в [`src/flash_storage.rs`](src/flash_storage.rs)
-- Для 2MB: офсет = `0x1FE000` (сектор 510 из 512)
-- Для 4MB: офсет = `0x3FE000` (сектор 1022 из 1024)
-
-### Константы времени и координат ([`src/config.rs`](src/config.rs))
-
+### config.rs
 
 ```rust
 // UART baudrate
@@ -420,12 +470,13 @@ pub const DEFAULT_BAUDRATE: u32 = 921600;
 pub const NAV_MEAS_PERIOD_MS: u32 = 200;  // 5Hz
 pub const NAV_RATE: u32 = 1;
 pub const MON_PERIOD_MS: u64 = 1000;      // 1Hz
-pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;   // Air 3: каждые 4 сек
+pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 2000;   // Air 3: каждые 2 сек
+pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;  // Air 3S: каждые 2 сек
 pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 сек
+pub const SEC_SIGN_PERIOD_MAVIC3PRO_MS: u64 = 2000; // Mavic 3 Pro: каждые 2 сек
 
 // Координаты по умолчанию (автоматически конвертируются в ECEF)
-// Rachel, Nevada: 37°38'49"N 115°44'40"W
-pub const LATITUDE: f64 = 37.6469;
+pub const LATITUDE: f64 = 37.6469;      // Rachel, Nevada
 pub const LONGITUDE: f64 = -115.7444;
 pub const ALTITUDE_M: i32 = 100;
 ```
@@ -446,7 +497,8 @@ pub const ALTITUDE_M: i32 = 100;
 ```
 ublox_fake_rust/
 ├── Cargo.toml              # Зависимости и настройки сборки
-├── build.rs                # Build script (генерирует memory.x в OUT_DIR)
+├── build.rs                # Build script (memory.x генерация)
+├── memory.x                # Linker script для RP2350
 ├── .cargo/config.toml      # Cargo настройки (target, runner)
 ├── CLAUDE.md               # Документация для Claude Code
 └── src/
@@ -459,7 +511,8 @@ ublox_fake_rust/
     │   └── parser.rs       # State machine парсер входящих команд
     ├── sec_sign.rs         # ECDSA P-192 подпись, SHA256 аккумулятор
     ├── led.rs              # WS2812 LED драйвер (обёртка над embassy-rp)
-    ├── passthrough.rs      # PIO UART passthrough (GPIO→GPIO)
+    ├── passthrough.rs      # UBX парсер, буфер позиций, модификация NAV
+    ├── spoof_detector.rs   # Алгоритмы детекции GPS-спуфинга
     └── flash_storage.rs    # Сохранение режима во flash
 ```
 
@@ -479,8 +532,7 @@ ublox_fake_rust/
 | pio | 0.3 | PIO макрос (**критично: версия 0.3!**) |
 | heapless | 0.9 | Статические коллекции |
 | libm | 0.2 | Математика для LLH→ECEF (sin, cos, sqrt) |
-| defmt | 1.0 | Отладочный вывод |
-| defmt-rtt | 1.1 | RTT транспорт для defmt |
+| defmt + defmt-rtt | 1.0+ | Отладочный вывод |
 
 ### Критичные версии
 
@@ -500,8 +552,7 @@ ublox_fake_rust/
 
 1. **Координаты статичны** — настраиваются в `config.rs`, но не меняются во время работы (нет симуляции движения)
 2. **Нет GPS week rollover** — week hardcoded (2349)
-3. **Passthrough без фильтрации** — все данные ретранслируются как есть
-4. **Один LED** — нет отдельной индикации ошибок
+3. **Один LED** — нет отдельной индикации ошибок (только цвет и мигание)
 
 ## Лицензия
 

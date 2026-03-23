@@ -30,7 +30,7 @@
 | 0x24 | **CFG-NAV5** | var | Настройки навигационного движка. Просто ACK. |
 | 0x39 | **CFG-ITFM** | var | Мониторинг помех/джамминга. Просто ACK. |
 | 0x3E | **CFG-GNSS** | var | Конфигурация GNSS систем. Просто ACK. |
-| 0x41 | **CFG-0x41** | 0 (poll) | **DJI проприетарная**: возвращает 256 байт с приватным ключом SEC-SIGN на offset 175. |
+| 0x41 | **CFG-0x41** | 0 (poll) | **DJI проприетарная**: возвращает 256 байт с приватным ключом SEC-SIGN (offset 175 для Air 3/Mavic 4 Pro, offset 115 для Air 3S). |
 | 0x86 | **CFG-PMS** | var | Управление питанием. Просто ACK. |
 | 0x8A | **CFG-VALSET** | ≥4 | M10: установка значений. Header(4) + key-value пары. Размер value определяется по bits 28-30 key. |
 | 0x8B | **CFG-VALGET** | ≥8 | M10: запрос значений. Возвращает CFG-VALGET response с запрошенными ключами. |
@@ -155,8 +155,8 @@
 - Алгоритм: ECDSA SECP192R1 (P-192)
 - Hash: SHA256 складывается по XOR в 24 байта
 - k: Детерминистический по RFC6979 (HMAC-SHA256)
-- Период: 4 сек (Air 3), 2 сек (Mavic 4 Pro)
-- Первая задержка: 1000ms (Air 3), 650ms (Mavic 4 Pro)
+- Период: 4 сек (Air 3), 2 сек (Air 3S, Mavic 4 Pro)
+- Первая задержка: 1000ms (Air 3), 650ms (Air 3S, Mavic 4 Pro)
 
 ---
 
@@ -188,13 +188,15 @@ Poll-запрос (payload=0) возвращает 256-байтный ответ
 | ROM Patch #1 | 26 | 28 | file 0x82, ARM Thumb-2 |
 | ROM Patch #2 | 54 | 42 | file 0x83, ARM Thumb-2 |
 | CFG-SIGNAL | 96 | ~20 | group 0x31 |
-| CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory |
+| CFG-RINV | ~116 | ~50 | group 0xC7, Remote Inventory (Air 3 / Mavic 4 Pro only) |
 | **SEC/KEY** | **175** | **26** | group 0xA6, **Приватный ключ P-192** |
 | CFG-UART1 | ~192 | 10 | group 0x52, baudrate |
 | CFG-CLOCK | ~202 | 40 | group 0xA4, частоты |
 | Padding | ~242 | 14 | 0xFF fill |
 
-**Приватный ключ** (24 байта, big-endian) находится на offset 175.
+**Приватный ключ** (24 байта, big-endian):
+- Air 3 / Mavic 4 Pro: offset **175** (шаблон с CFG-RINV)
+- Air 3S: offset **115** (шаблон без CFG-RINV, больше FF-padding)
 
 ---
 
@@ -205,6 +207,7 @@ Poll-запрос (payload=0) возвращает 256-байтный ответ
 | Модель | Реальный тайминг | Задержка от первой команды |
 |--------|------------------|---------------------------|
 | DJI Air 3 | 666ms | 700ms |
+| DJI Air 3S | 780ms | 780ms |
 | DJI Mavic 4 Pro | 399ms | 400ms |
 
 ```
@@ -216,6 +219,7 @@ Poll-запрос (payload=0) возвращает 256-байтный ответ
 | Модель | Период | Первая задержка |
 |--------|--------|-----------------|
 | DJI Air 3 | 4 сек | 1000ms |
+| DJI Air 3S | 2 сек | 650ms |
 | DJI Mavic 4 Pro | 2 сек | 650ms |
 
 ---
@@ -249,6 +253,7 @@ tim_tp
 | Модель | Unique ID (5 байт) |
 |--------|-------------------|
 | DJI Air 3 | E0 95 65 0F 2A |
+| DJI Air 3S | E0 86 DB 8F 42 |
 | DJI Mavic 4 Pro | EB B9 91 0F 2B |
 
 ---

@@ -6,11 +6,17 @@
 pub const DEFAULT_BAUDRATE: u32 = 921600;
 
 /// Flash memory size in bytes
-/// Изменить для плат с другим размером flash (например, 2MB = 2 * 1024 * 1024)
-pub const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2MB (Spotpear RP2350-Core-A)
+#[cfg(not(feature = "rp2354"))]
+pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB external QSPI flash (RP2350)
 
-/// GPIO pin assignments for RP2350A (Spotpear RP2350-Core-A)
+#[cfg(feature = "rp2354")]
+pub const FLASH_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2MB internal flash (RP2354)
+
+/// GPIO pin assignments
+#[cfg(not(feature = "rp2354"))]
 pub mod pins {
+    // RP2350A (Spotpear RP2350-Core-A)
+
     // UART0: к дрону/хосту
     pub const UART0_TX: u8 = 0;
     pub const UART0_RX: u8 = 1;
@@ -19,12 +25,43 @@ pub mod pins {
     pub const UART1_TX: u8 = 4;   // не используется, но резервируем
     pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
 
-    // Mode button (перенесено с GPIO5/6)
-    pub const MODE_BTN_PWR: u8 = 6;
-    pub const MODE_BTN_INPUT: u8 = 7;
+    // Mode button (RP2350: GPIO13=PWR, GPIO14=INPUT)
+    pub const MODE_BTN_PWR: u8 = 13;
+    pub const MODE_BTN_INPUT: u8 = 14;
 
-    // WS2812B LED (RP2350-Core-A: GPIO16)
-    pub const WS2812_LED: u8 = 16;
+    // WS2812B LED
+    pub const WS2812_LED: u8 = 25;
+    pub const HAS_WS2812_LED: bool = true;
+
+    // Legacy alias
+    pub const UART_TX: u8 = UART0_TX;
+    pub const UART_RX: u8 = UART0_RX;
+}
+
+#[cfg(feature = "rp2354")]
+pub mod pins {
+    // RP2354A - отдельная конфигурация пинов
+
+    // UART0: к дрону/хосту
+    pub const UART0_TX: u8 = 0;
+    pub const UART0_RX: u8 = 1;
+
+    // UART1: от внешнего GNSS модуля (passthrough source)
+    pub const UART1_TX: u8 = 4;   // не используется, но резервируем
+    pub const UART1_RX: u8 = 5;   // вход от внешнего GNSS
+
+    // Mode button (RP2354: GPIO13/14)
+    pub const MODE_BTN_PWR: u8 = 13;
+    pub const MODE_BTN_INPUT: u8 = 14;
+
+    // WS2812B LED - отключен для RP2354
+    pub const WS2812_LED: u8 = 16;  // не используется
+    pub const HAS_WS2812_LED: bool = false;
+
+    // Simple GPIO LED для RP2354
+    // Схема: GPIO11 (анод +) --- LED --- GPIO12 (катод -, земля)
+    pub const SIMPLE_LED_ANODE: u8 = 11;   // управляющий пин (HIGH = включен)
+    pub const SIMPLE_LED_CATHODE: u8 = 12; // земля (постоянно LOW)
 
     // Legacy alias
     pub const UART_TX: u8 = UART0_TX;
@@ -46,25 +83,67 @@ pub mod timers {
     /// First SEC-SIGN delay after NAV start for Mavic 4 Pro (real: ~614ms)
     pub const SEC_SIGN_FIRST_MAVIC4_MS: u64 = 650;
     /// SEC-SIGN interval for DJI Air 3
-    pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 4000;
+    pub const SEC_SIGN_PERIOD_AIR3_MS: u64 = 2000;
     /// SEC-SIGN interval for DJI Mavic 4 Pro
     pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000;
     /// Delay from first config to NAV start for Air 3 (real: 666ms)
     pub const CONFIG_TO_NAV_AIR3_MS: u64 = 700;
     /// Delay from first config to NAV start for Mavic 4 Pro (real: 399ms)
     pub const CONFIG_TO_NAV_MAVIC4_MS: u64 = 400;
+    /// First SEC-SIGN delay after NAV start for Air 3S (same as Mavic 4 Pro)
+    pub const SEC_SIGN_FIRST_AIR3S_MS: u64 = 650;
+    /// SEC-SIGN interval for DJI Air 3S
+    pub const SEC_SIGN_PERIOD_AIR3S_MS: u64 = 2000;
+    /// Delay from first config to NAV start for Air 3S (real: 780ms)
+    pub const CONFIG_TO_NAV_AIR3S_MS: u64 = 780;
+    /// First SEC-SIGN delay after NAV start for Mavic 3 Pro (estimated, same as Air 3S)
+    pub const SEC_SIGN_FIRST_MAVIC3PRO_MS: u64 = 650;
+    /// SEC-SIGN interval for DJI Mavic 3 Pro (confirmed from logs)
+    pub const SEC_SIGN_PERIOD_MAVIC3PRO_MS: u64 = 2000;
+    /// Delay from first config to NAV start for Mavic 3 Pro (estimated, same as Air 3S)
+    pub const CONFIG_TO_NAV_MAVIC3PRO_MS: u64 = 780;
     /// Delay after CFG-RST before message output starts (0 = immediate)
     pub const UART_TX_INIT_DELAY_MS: u64 = 0;
     /// Time after start when satellites become invalid (ms)
     pub const SATELLITES_INVALID_AFTER_MS: u64 = 20_000;
 }
 
-/// Default coordinates (configurable)
-/// Rachel, Nevada: 37°38'49"N 115°44'40"W
+/// Константы для логики кнопки переключения режимов
+pub mod button {
+    /// Максимальное время между нажатиями для серии (мс)
+    /// 800мс даёт достаточно времени для 3 кликов (было 500мс - слишком мало)
+    pub const MULTI_CLICK_TIMEOUT_MS: u64 = 800;
+    /// Время debounce (мс)
+    pub const DEBOUNCE_MS: u64 = 50;
+    /// Период опроса кнопки (мс)
+    pub const POLL_PERIOD_MS: u64 = 20;
+    /// Длительность удержания для запуска key extraction (мс)
+    pub const LONG_PRESS_MS: u64 = 3000;
+    /// Таймаут режима выбора модели дрона без кликов (мс)
+    pub const MODEL_SELECT_TIMEOUT_MS: u64 = 5000;
+}
+
+/// Default coordinates (configurable) — Golden Beach, FL
+/// Used by Emulation mode for fake GNSS data
 pub mod default_position {
-    pub const LATITUDE: f64 = 37.6469;
-    pub const LONGITUDE: f64 = -115.7444;
+    pub const LATITUDE: f64 = 25.966443;
+    pub const LONGITUDE: f64 = -80.122371;
     pub const ALTITUDE_M: i32 = 100;
+    // Pre-computed for coordinate calculations
+    pub const LAT_1E7: i32 = 259_664_430;    // (LATITUDE * 1e7) as i32
+    pub const LON_1E7: i32 = -801_223_710;   // (LONGITUDE * 1e7) as i32
+    pub const ALT_MM: i32 = 100_000;          // ALTITUDE_M * 1000
+}
+
+/// Target coordinates for PassthroughOffset mode (mode 4) — Seney, Michigan
+/// Dynamic offset = offset_target - actual_gps_position (computed at first 3D fix)
+pub mod offset_target {
+    pub const LATITUDE: f64 = 46.3407;
+    pub const LONGITUDE: f64 = -85.9407;
+    pub const ALTITUDE_M: i32 = 100;
+    pub const LAT_1E7: i32 = 463_407_000;    // (LATITUDE * 1e7) as i32
+    pub const LON_1E7: i32 = -859_407_000;   // (LONGITUDE * 1e7) as i32
+    pub const ALT_MM: i32 = 100_000;          // ALTITUDE_M * 1000
 }
 
 /// UBX protocol version emulation
@@ -82,12 +161,16 @@ pub enum DroneModel {
     #[default]
     Air3 = 0,
     Mavic4Pro = 1,
+    Air3S = 2,
+    Mavic3Pro = 3,
 }
 
 impl DroneModel {
     pub fn from_u8(val: u8) -> Self {
         match val {
             1 => Self::Mavic4Pro,
+            2 => Self::Air3S,
+            3 => Self::Mavic3Pro,
             _ => Self::Air3,
         }
     }

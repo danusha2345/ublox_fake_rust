@@ -1,6 +1,6 @@
 # Makefile for ublox_fake firmware
 
-.PHONY: all clean rp2040 rp2350 rp2354 flash
+.PHONY: all clean rp2040 rp2350 rp2354 flash flash-rp2354 test
 
 # Default target
 all: rp2350
@@ -34,18 +34,28 @@ rp2350:
 	$(call PATCH_UF2_FAMILY,/tmp/temp.uf2,ublox_fake_rp2350.uf2)
 	@echo "Built: ublox_fake_rp2350.uf2"
 
-# Build for RP2354 (2MB internal flash, Cortex-M33)
-# Same binary as RP2350, different output name for clarity
+# Build for RP2354 (2MB internal flash, Cortex-M33, different pin config)
 rp2354:
-	cargo build --release --features rp2350 --target thumbv8m.main-none-eabihf
+	cargo build --release --no-default-features --features rp2354 --target thumbv8m.main-none-eabihf
 	$(CARGO_BIN)/elf2uf2-rs target/thumbv8m.main-none-eabihf/release/ublox_fake /tmp/temp.uf2
 	$(call PATCH_UF2_FAMILY,/tmp/temp.uf2,ublox_fake_rp2354.uf2)
-	@echo "Built: ublox_fake_rp2354.uf2 (RP2354A with 2MB internal flash)"
+	@echo "Built: ublox_fake_rp2354.uf2 (RP2354A: no LED, button on GPIO13/14)"
 
-# Flash via probe-rs
+# Flash via probe-rs (default RP2350)
 flash:
 	cargo run --release
 
+# Flash RP2354 via probe-rs (2MB internal flash, different pin config)
+# NOTE: cargo run не работает — CARGO_TARGET_*_RUNNER конкатенируется с .cargo/config.toml
+flash-rp2354:
+	cargo build --release --no-default-features --features rp2354 --target thumbv8m.main-none-eabihf
+	probe-rs run --chip RP2354 target/thumbv8m.main-none-eabihf/release/ublox_fake
+
+# Run host-side tests (spoof_detector)
+test:
+	cd tests_host && cargo test
+
 clean:
 	cargo clean
+	cd tests_host && cargo clean
 	rm -f *.uf2

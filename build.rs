@@ -1,68 +1,85 @@
 //! Build script for ublox_fake
 //!
 //! Automatically selects memory layout based on target
+//! Also extracts git version info for firmware identification
 
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
-    let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let out = &PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+
+    // === Generate firmware version from git ===
+    generate_version_info(out);
     let target = env::var("TARGET").unwrap_or_default();
+
+    // Detect RP2354 feature flag for flash size selection
+    let is_rp2354 = env::var("CARGO_FEATURE_RP2354").is_ok();
 
     // Select memory layout based on target architecture
     let memory_x = if target.contains("thumbv8m") {
-        // RP2350 (Cortex-M33) - 512KB RAM, 4MB Flash
+        // RP2350/RP2354 (Cortex-M33)
+        let flash_size = if is_rp2354 { "2048K" } else { "4096K" };
+        let chip_comment = if is_rp2354 {
+            "RP2354A (2MB internal flash)"
+        } else {
+            "RP2350A (Spotpear RP2350-Core-A)"
+        };
+
         // Pattern from working RP2350 examples - start_block AFTER vector_table
-        r#"/* Memory layout for RP2350A (Spotpear RP2350-Core-A) */
-MEMORY {
-    FLASH : ORIGIN = 0x10000000, LENGTH = 4096K
-    RAM   : ORIGIN = 0x20000000, LENGTH = 512K
-    SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
-    SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K
-}
-
-_stack_start = ORIGIN(RAM) + LENGTH(RAM);
-
-SECTIONS {
-    .start_block : ALIGN(4)
-    {
-        __start_block_addr = .;
-        KEEP(*(.start_block));
-        KEEP(*(.boot_info));
-    } > FLASH
-} INSERT AFTER .vector_table;
-
-_stext = ADDR(.start_block) + SIZEOF(.start_block);
-
-SECTIONS {
-    .bi_entries : ALIGN(4)
-    {
-        __bi_entries_start = .;
-        KEEP(*(.bi_entries));
-        . = ALIGN(4);
-        __bi_entries_end = .;
-    } > FLASH
-} INSERT AFTER .text;
-
-SECTIONS {
-    .end_block : ALIGN(4)
-    {
-        __end_block_addr = .;
-        KEEP(*(.end_block));
-    } > FLASH
-} INSERT AFTER .uninit;
-
-PROVIDE(start_to_end = __end_block_addr - __start_block_addr);
-PROVIDE(end_to_start = __start_block_addr - __end_block_addr);
-"#
+        format!(
+            "/* Memory layout for {} */\n\
+            MEMORY {{\n\
+            \x20   FLASH : ORIGIN = 0x10000000, LENGTH = {}\n\
+            \x20   RAM   : ORIGIN = 0x20000000, LENGTH = 512K\n\
+            \x20   SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K\n\
+            \x20   SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K\n\
+            }}\n\
+            \n\
+            _stack_start = ORIGIN(RAM) + LENGTH(RAM);\n\
+            \n\
+            SECTIONS {{\n\
+            \x20   .start_block : ALIGN(4)\n\
+            \x20   {{\n\
+            \x20       __start_block_addr = .;\n\
+            \x20       KEEP(*(.start_block));\n\
+            \x20       KEEP(*(.boot_info));\n\
+            \x20   }} > FLASH\n\
+            }} INSERT AFTER .vector_table;\n\
+            \n\
+            _stext = ADDR(.start_block) + SIZEOF(.start_block);\n\
+            \n\
+            SECTIONS {{\n\
+            \x20   .bi_entries : ALIGN(4)\n\
+            \x20   {{\n\
+            \x20       __bi_entries_start = .;\n\
+            \x20       KEEP(*(.bi_entries));\n\
+            \x20       . = ALIGN(4);\n\
+            \x20       __bi_entries_end = .;\n\
+            \x20   }} > FLASH\n\
+            }} INSERT AFTER .text;\n\
+            \n\
+            SECTIONS {{\n\
+            \x20   .end_block : ALIGN(4)\n\
+            \x20   {{\n\
+            \x20       __end_block_addr = .;\n\
+            \x20       KEEP(*(.end_block));\n\
+            \x20   }} > FLASH\n\
+            }} INSERT AFTER .uninit;\n\
+            \n\
+            PROVIDE(start_to_end = __end_block_addr - __start_block_addr);\n\
+            PROVIDE(end_to_start = __start_block_addr - __end_block_addr);\n",
+            chip_comment, flash_size
+        )
     } else {
-        // RP2040 (Cortex-M0+) - 264KB RAM, 4MB Flash
-        r#"/* Memory layout for RP2040 */
+        // RP2040 (Cortex-M0+) - 264KB RAM, 2MB Flash
+        String::from(r#"/* Memory layout for RP2040 */
 MEMORY {
     BOOT2 : ORIGIN = 0x10000000, LENGTH = 0x100
-    FLASH : ORIGIN = 0x10000100, LENGTH = 4096K - 0x100
+    FLASH : ORIGIN = 0x10000100, LENGTH = 2048K - 0x100
     RAM   : ORIGIN = 0x20000000, LENGTH = 264K
 }
 
@@ -74,12 +91,61 @@ SECTIONS {
         KEEP(*(.boot2));
     } > BOOT2
 } INSERT BEFORE .text;
-"#
+"#)
     };
 
-    let mut f = File::create(out.join("memory.x")).unwrap();
-    f.write_all(memory_x.as_bytes()).unwrap();
+    let mut f = File::create(out.join("memory.x")).expect("failed to create memory.x");
+    f.write_all(memory_x.as_bytes()).expect("failed to write memory.x");
 
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=build.rs");
+    // Rebuild when git HEAD changes (new commit, checkout, etc.)
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
+}
+
+/// Extract git commit hash and dirty flag, generate version.rs
+fn generate_version_info(out: &PathBuf) {
+    // Get short commit hash
+    let git_hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Check if working tree is dirty
+    let git_dirty = Command::new("git")
+        .args(["diff", "--quiet", "HEAD"])
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+
+    let cargo_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
+
+    // Build version string: "0.1.0-a72ddc5" or "0.1.0-a72ddc5-dirty"
+    let fw_version = if git_dirty {
+        format!("{}-{}-dirty", cargo_version, git_hash)
+    } else {
+        format!("{}-{}", cargo_version, git_hash)
+    };
+
+    let version_rs = format!(
+        r#"// Auto-generated by build.rs — do not edit
+pub const GIT_HASH: &str = "{}";
+pub const GIT_DIRTY: bool = {};
+pub const CARGO_VERSION: &str = "{}";
+pub const FW_VERSION: &str = "{}";
+"#,
+        git_hash, git_dirty, cargo_version, fw_version
+    );
+
+    let mut f = File::create(out.join("version.rs")).expect("failed to create version.rs");
+    f.write_all(version_rs.as_bytes()).expect("failed to write version.rs");
 }
