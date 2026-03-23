@@ -3,10 +3,15 @@
 
 #![allow(dead_code)]
 
+#[cfg(target_os = "none")]
 use embassy_rp::pio::{Common, Config, Instance, PioPin, StateMachine};
+#[cfg(target_os = "none")]
 use embassy_rp::Peri;
+#[cfg(target_os = "none")]
 use fixed::traits::ToFixed;
+#[cfg(target_os = "none")]
 use fixed::types::U24F8;
+#[cfg(target_os = "none")]
 use fixed_macro::fixed;
 
 // ============================================================================
@@ -674,10 +679,12 @@ pub fn extract_cno_from_nav_sat(payload: &[u8]) -> heapless::Vec<u8, 16> {
 }
 
 /// PIO passthrough driver - copies input pin state to output pin
+#[cfg(target_os = "none")]
 pub struct Passthrough<'d, P: Instance, const S: usize> {
     sm: StateMachine<'d, P, S>,
 }
 
+#[cfg(target_os = "none")]
 impl<'d, P: Instance, const S: usize> Passthrough<'d, P, S> {
     /// Create new passthrough driver
     /// - in_pin: GPIO3 (PIO input from external GNSS)
