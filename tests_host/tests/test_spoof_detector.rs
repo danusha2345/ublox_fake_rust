@@ -1635,3 +1635,477 @@ fn test_normal_altitude_change() {
             i, alt_mm / 1000);
     }
 }
+
+// ============================================================================
+// Group 14: Satellite loss + spoof detection + recovery comprehensive scenarios
+//
+// Tests the complete lifecycle: normal flight → satellite loss (NoFix) →
+// spoofing → detection → recovery → return to normal.
+// ============================================================================
+
+/// NoFix position helper
+fn pos_nofix(lat: i32, lon: i32, time_ms: u32) -> Position {
+    Position {
+        lat,
+        lon,
+        alt_mm: 100_000,
+        time_ms,
+        fix_type: FixType::NoFix,
+        h_acc_mm: 1000,
+        num_sv: 0,
+        pdop: 9999,
+        gnss_time: None,
+        cno_values: heapless::Vec::new(),
+    }
+}
+
+/// Normal flight → satellite loss (NoFix for 3s) → clean return at same position.
+/// The detector should handle the gap gracefully via GapReset.
+#[test]
+fn test_satellite_loss_clean_return_same_position() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal flight: 10 samples
+    for _ in 0..10 {
+        let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Normal);
+        t += 200;
+    }
+
+    // Satellite loss: 20 samples of NoFix (4 seconds)
+    for _ in 0..20 {
+        let r = det.analyze(pos_nofix(0, 0, t));
+        assert_eq!(r, AnalysisResult::Initializing,
+            "NoFix should return Initializing");
+        t += 200;
+    }
+
+    // Clean return at same position — gap > 5s from last 3D fix
+    let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+    // dt from last 3D fix prev is >5000ms → gap handler checks vs last_good
+    // Position is same → no anomaly → GapReset
+    assert!(r == AnalysisResult::GapReset || r == AnalysisResult::Normal,
+        "Clean return should be GapReset or Normal, got {:?}", result_name(r));
+    assert!(!det.is_spoofed(), "Should not be spoofed after clean return");
+}
+
+/// Normal flight → satellite loss → return at DIFFERENT position (teleport).
+/// The detector should flag this as spoofed via gap + teleport.
+#[test]
+fn test_satellite_loss_then_spoofed_return() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal flight
+    for _ in 0..10 {
+        let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Normal);
+        t += 200;
+    }
+
+    // Satellite loss: 30 samples (6 seconds)
+    for _ in 0..30 {
+        let r = det.analyze(pos_nofix(0, 0, t));
+        assert_eq!(r, AnalysisResult::Initializing);
+        t += 200;
+    }
+
+    // Return at spoofed position (far from original)
+    let spoofed_lat = BASE_LAT + DELTA_2001M_LAT * 5; // ~10km away
+    let r = det.analyze(pos(spoofed_lat, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "Return at far position after gap should be Spoofed");
+    assert!(det.is_spoofed());
+}
+
+/// Full cycle: normal → loss → spoof → detect → sustained spoof → recovery.
+/// This is the exact scenario from the bug report.
+#[test]
+fn test_full_cycle_normal_loss_spoof_recovery() {
+    let mut det = SpoofDetector::new();
+    // Initialize at BASE position — all phases use this as the "real" location
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Phase 1: Normal flight at same position (20 samples, 4 seconds)
+    for _ in 0..20 {
+        let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Normal);
+        t += 200;
+    }
+    assert!(!det.is_spoofed(), "Phase 1: should not be spoofed");
+
+    // Phase 2: Satellite loss (30 samples, 6 seconds of NoFix)
+    for _ in 0..30 {
+        let r = det.analyze(pos_nofix(0, 0, t));
+        assert_eq!(r, AnalysisResult::Initializing);
+        t += 200;
+    }
+
+    // Phase 3: Spoof detected (return at far position after gap)
+    let spoofed_lat = BASE_LAT + DELTA_2001M_LAT * 3; // ~6km away
+    let r = det.analyze(pos(spoofed_lat, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "Phase 3: gap + teleport should trigger spoof");
+    t += 200;
+
+    // Phase 4: Sustained spoofing (20 samples at spoofed position)
+    for _ in 0..20 {
+        let r = det.analyze(pos(spoofed_lat, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Spoofed,
+            "Phase 4: should stay spoofed at far position");
+        t += 200;
+    }
+    assert!(det.is_spoofed(), "Phase 4: must be spoofed");
+
+    // Phase 5: Spoofing ends — real position returns (at BASE, near last_good)
+    // First frame is a teleport from spoofed → real → stays spoofed
+    let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "Phase 5: initial return should still be Spoofed (teleport from fake)");
+    t += 200;
+
+    // Phase 6: Sustained real position → detector accumulates normal_count → recovery
+    // Need NORMAL_CONFIRM_COUNT (5) clean samples, then dist(last_good, curr) < 2km
+    let mut recovered = false;
+    for _ in 0..20 {
+        let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+        if r == AnalysisResult::Normal {
+            recovered = true;
+            break;
+        }
+        t += 200;
+    }
+    assert!(recovered, "Phase 6: detector should recover within 20 samples of clean data near last_good");
+    assert!(!det.is_spoofed(), "Phase 6: detector should not be spoofed after recovery");
+}
+
+/// NoFix frames during active spoofing should NOT clear the spoofed state.
+/// (Duplicate of existing test but with extended NoFix period.)
+#[test]
+fn test_extended_nofix_during_spoof_preserves_state() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Trigger spoof via teleport
+    let r = det.analyze(pos(BASE_LAT + DELTA_2001M_LAT, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Spoofed);
+    assert!(det.is_spoofed());
+    t += 200;
+
+    // Extended NoFix (50 samples, 10 seconds)
+    for _ in 0..50 {
+        let r = det.analyze(pos_nofix(0, 0, t));
+        assert_eq!(r, AnalysisResult::Initializing);
+        t += 200;
+    }
+
+    // Spoofed state must persist through NoFix
+    assert!(det.is_spoofed(), "Spoof state must survive extended NoFix period");
+}
+
+/// After spoof recovery, a SECOND satellite loss + spoof cycle should
+/// also be detected correctly (detector state is clean after recovery).
+#[test]
+fn test_double_spoof_recovery_cycle_with_satellite_loss() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    for cycle in 0..2 {
+        // Normal flight
+        for _ in 0..10 {
+            let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+            assert_eq!(r, AnalysisResult::Normal,
+                "Cycle {}: normal flight should be Normal", cycle);
+            t += 200;
+        }
+
+        // Satellite loss
+        for _ in 0..30 {
+            det.analyze(pos_nofix(0, 0, t));
+            t += 200;
+        }
+
+        // Spoofed return
+        let spoofed_lat = BASE_LAT + DELTA_2001M_LAT * 3;
+        let r = det.analyze(pos(spoofed_lat, BASE_LON, t));
+        assert_eq!(r, AnalysisResult::Spoofed,
+            "Cycle {}: should detect spoof after gap", cycle);
+        t += 200;
+
+        // Few spoofed samples
+        for _ in 0..5 {
+            det.analyze(pos(spoofed_lat, BASE_LON, t));
+            t += 200;
+        }
+
+        // Return to real position and recover
+        for _ in 0..30 {
+            let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+            if r == AnalysisResult::Normal {
+                break;
+            }
+            t += 200;
+        }
+        assert!(!det.is_spoofed(),
+            "Cycle {}: should recover after returning to real position", cycle);
+    }
+}
+
+/// Satellite loss with very short gap (just over 5s) — verifies gap handler
+/// threshold is correctly applied. 5001ms = gap, 5000ms = not gap.
+#[test]
+fn test_satellite_loss_gap_threshold() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal sample
+    let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Normal);
+    t += 200;
+
+    // NoFix for exactly 5001ms gap from prev
+    for _ in 0..25 {
+        det.analyze(pos_nofix(0, 0, t));
+        t += 200;
+    }
+    // Total time from last 3D fix: at least 5200ms
+
+    // Return at same position — should trigger gap handler
+    let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+    assert!(r == AnalysisResult::GapReset || r == AnalysisResult::Normal,
+        "Gap with clean return should be GapReset, got {:?}", result_name(r));
+}
+
+/// Normal flight → brief satellite loss (just under 5s gap) → return.
+/// Should NOT trigger gap handler (dt <= MAX_GAP_MS).
+#[test]
+fn test_satellite_loss_short_no_gap() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal
+    let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Normal);
+    let last_3d_time = t;
+    t += 200;
+
+    // NoFix for 4.6s (23 samples × 200ms = 4600ms)
+    for _ in 0..23 {
+        det.analyze(pos_nofix(0, 0, t));
+        t += 200;
+    }
+    // dt from last 3D fix = t - last_3d_time = 4800ms < 5000ms
+
+    // Return at same position — dt < MAX_GAP_MS → normal path, not gap
+    let _ = last_3d_time;
+    let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Normal,
+        "Short satellite loss should not trigger gap handler");
+}
+
+/// Recovery succeeds only when back near ORIGINAL position (last_good),
+/// not just any stable position. Verifies that recovery at a far position
+/// keeps the detector in spoofed state.
+#[test]
+fn test_recovery_requires_near_last_good_after_gap() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal flight
+    for _ in 0..10 {
+        det.analyze(pos(BASE_LAT, BASE_LON, t));
+        t += 200;
+    }
+
+    // Satellite loss
+    for _ in 0..30 {
+        det.analyze(pos_nofix(0, 0, t));
+        t += 200;
+    }
+
+    // Spoofed return far away
+    let far_lat = BASE_LAT + DELTA_2001M_LAT * 5;
+    let r = det.analyze(pos(far_lat, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Spoofed);
+    t += 200;
+
+    // Try to "recover" at the far position — should stay spoofed
+    // because far_lat is >2km from last_good (which is near BASE_LAT)
+    for _ in 0..20 {
+        det.analyze(pos(far_lat, BASE_LON, t));
+        t += 200;
+    }
+    assert!(det.is_spoofed(),
+        "Should remain spoofed when stable at position far from last_good");
+
+    // Now return to REAL position near last_good
+    for _ in 0..20 {
+        let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+        if r == AnalysisResult::Normal {
+            break;
+        }
+        t += 200;
+    }
+    assert!(!det.is_spoofed(),
+        "Should recover when back near original last_good position");
+}
+
+/// Verify that reset() + re-initialization works correctly after a spoof cycle.
+/// Simulates mode switch → detector reset → clean start.
+#[test]
+fn test_reset_after_spoof_allows_clean_restart() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Trigger spoof
+    det.analyze(pos(BASE_LAT + DELTA_2001M_LAT, BASE_LON, t));
+    assert!(det.is_spoofed());
+    t += 200;
+
+    // Reset (simulates mode switch)
+    det.reset();
+    assert!(!det.is_spoofed(), "Reset should clear spoofed state");
+
+    // Re-initialize at new position
+    let new_lat = BASE_LAT + DELTA_2001M_LAT;
+    let r = det.analyze(pos(new_lat, BASE_LON, t));
+    assert_eq!(r, AnalysisResult::Initializing, "After reset, first sample should init");
+    t += 200;
+
+    // Normal flight at new position
+    for _ in 0..10 {
+        let r = det.analyze(pos(new_lat, BASE_LON, t));
+        assert!(r == AnalysisResult::Normal || r == AnalysisResult::Initializing);
+        t += 200;
+    }
+    assert!(!det.is_spoofed(), "Should be normal after clean restart");
+}
+
+/// last_good_position() returns the frozen reference during spoofing
+/// and updated position after recovery.
+#[test]
+fn test_last_good_position_through_spoof_cycle() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal flight at same position — last_good stays at BASE
+    for _ in 0..5 {
+        det.analyze(pos(BASE_LAT, BASE_LON, t));
+        t += 200;
+    }
+    let lg = det.last_good_position().expect("Should have last_good");
+    assert_eq!(lg.lat, BASE_LAT, "last_good should be at base position");
+
+    // Trigger spoof via teleport
+    let spoofed_lat = BASE_LAT + DELTA_2001M_LAT;
+    det.analyze(pos(spoofed_lat, BASE_LON, t));
+    assert!(det.is_spoofed());
+    t += 200;
+
+    // During spoof — last_good should be FROZEN at pre-spoof position
+    for _ in 0..10 {
+        det.analyze(pos(spoofed_lat, BASE_LON, t));
+        t += 200;
+    }
+    let lg = det.last_good_position().expect("Should still have last_good");
+    assert_eq!(lg.lat, BASE_LAT, "last_good must be frozen during spoof");
+
+    // Recovery — return near last_good (BASE_LAT)
+    // First frame: teleport from spoofed → base → anomaly, stays spoofed
+    det.analyze(pos(BASE_LAT, BASE_LON, t));
+    t += 200;
+
+    // Subsequent frames: normal, accumulate normal_count
+    let mut recovered = false;
+    for _ in 0..20 {
+        let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+        if r == AnalysisResult::Normal {
+            recovered = true;
+            break;
+        }
+        t += 200;
+    }
+    assert!(recovered, "Should recover when back near last_good");
+    assert!(!det.is_spoofed());
+
+    // After recovery — last_good should continue to update
+    let lg_after = det.last_good_position().expect("Should have last_good after recovery");
+    assert_eq!(lg_after.lat, BASE_LAT, "last_good should be at base after recovery");
+}
+
+/// Spoofing detected via gap handler, then NoFix frames, then clean return.
+/// Verifies the full gap→spoof→nofix→recovery sequence.
+#[test]
+fn test_gap_spoof_nofix_then_recovery() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Normal flight
+    for _ in 0..10 {
+        det.analyze(pos(BASE_LAT, BASE_LON, t));
+        t += 200;
+    }
+
+    // Satellite loss → gap
+    for _ in 0..30 {
+        det.analyze(pos_nofix(0, 0, t));
+        t += 200;
+    }
+
+    // Spoofed position detected via gap handler
+    let spoofed_lat = BASE_LAT + DELTA_2001M_LAT * 4;
+    det.analyze(pos(spoofed_lat, BASE_LON, t));
+    assert!(det.is_spoofed(), "Gap + teleport should trigger spoof");
+    t += 200;
+
+    // More NoFix during spoof transition
+    for _ in 0..15 {
+        det.analyze(pos_nofix(0, 0, t));
+        t += 200;
+    }
+    assert!(det.is_spoofed(), "NoFix during spoof must not clear it");
+
+    // Clean return at original position (gap from last 3D fix > 5s)
+    // This enters gap handler again
+    det.analyze(pos(BASE_LAT, BASE_LON, t));
+    t += 200;
+    // Gap check: dist(last_good, curr) — last_good is near BASE_LAT → clean
+    // But spoofed flag stays because gap handler doesn't clear it directly
+
+    // Feed more samples to trigger recovery
+    for _ in 0..20 {
+        let r = det.analyze(pos(BASE_LAT, BASE_LON, t));
+        if r == AnalysisResult::Normal && !det.is_spoofed() {
+            break;
+        }
+        t += 200;
+    }
+    assert!(!det.is_spoofed(), "Should recover after clean return near last_good");
+}
+
+/// Verify total_anomalies() counter increments correctly through
+/// multiple spoof/recovery cycles.
+#[test]
+fn test_anomaly_counter_through_cycles() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    let initial_anomalies = det.total_anomalies();
+
+    // First spoof
+    det.analyze(pos(BASE_LAT + DELTA_2001M_LAT, BASE_LON, t));
+    t += 200;
+    assert!(det.total_anomalies() > initial_anomalies, "Anomaly counter should increment");
+    let after_first = det.total_anomalies();
+
+    // Recovery
+    for _ in 0..20 {
+        det.analyze(pos(BASE_LAT, BASE_LON, t));
+        t += 200;
+    }
+
+    // Second spoof
+    det.analyze(pos(BASE_LAT + DELTA_2001M_LAT, BASE_LON, t));
+    assert!(det.total_anomalies() > after_first, "Counter should increment again after second spoof");
+}

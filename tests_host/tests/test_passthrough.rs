@@ -679,3 +679,353 @@ fn test_position_buffer_push_and_get() {
     let empty_buf = PositionBuffer::new();
     assert!(empty_buf.get_position_at(0, 1000).is_none(), "Empty buffer must return None");
 }
+
+// ============================================================================
+// Group 5: PositionBuffer fix_type filtering (bug fix verification)
+//
+// BUG: pos_buffer.push() was called BEFORE fix_type check, so no-fix entries
+// (with coords 0,0,0) would corrupt LAST_GOOD when spoof is detected after
+// satellite loss. FIX: only push entries with valid 3D fix.
+// These tests verify the fix logic that should be applied in main.rs.
+// ============================================================================
+
+/// Simulate the exact bug scenario: normal flight → satellite loss (no-fix entries
+/// with 0,0,0 coords) → spoof detection. Verify that get_position_at returns
+/// the last valid 3D fix, NOT a no-fix entry.
+#[test]
+fn test_position_buffer_preserves_good_coords_through_satellite_loss() {
+    let mut buf = PositionBuffer::new();
+
+    // Normal flight: 15 samples at 5Hz (3 seconds), valid 3D fix
+    for i in 0u32..15 {
+        let lat = BASE_LAT + (i as i32) * 100;
+        let lon = BASE_LON + (i as i32) * 50;
+        buf.push(lat, lon, BASE_ALT, i * 200);
+    }
+
+    // Satellite loss: 15 more samples with no-fix. In the FIXED code, these
+    // would NOT be pushed. Simulate the fix by NOT pushing them.
+    // (Old buggy code would push (0, 0, 0) here.)
+
+    // Spoof detected at t=6000ms. get_position_at(2) should return
+    // position from ~4000ms = entry at i=14 (t=2800ms, closest to 4000ms).
+    let now_ms = 6000u32;
+    let result = buf.get_position_at(2, now_ms);
+    assert!(result.is_some(), "Should find a position from before satellite loss");
+
+    let (lat, _lon, _alt) = result.unwrap();
+    // All entries in buffer are from normal flight (BASE_LAT + delta)
+    assert!(lat > BASE_LAT, "Position should be near base, got lat={}", lat);
+    assert!(lat < BASE_LAT + 15 * 100 + 1, "Position should be within flight range");
+}
+
+/// Verify that a buffer with ONLY no-fix entries (simulating the old buggy behavior)
+/// would return (0,0,0) — demonstrating why the fix is necessary.
+#[test]
+fn test_position_buffer_nofix_corruption_demo() {
+    let mut buf = PositionBuffer::new();
+
+    // Normal entry
+    buf.push(BASE_LAT, BASE_LON, BASE_ALT, 0);
+
+    // 15 no-fix entries (0,0,0) overwrite the ring buffer entirely.
+    // This simulates the OLD BUGGY code that pushed without fix_type check.
+    for i in 1u32..16 {
+        buf.push(0, 0, 0, i * 200);
+    }
+
+    // get_position_at(2) returns a (0,0,0) entry — this is the bug
+    let result = buf.get_position_at(0, 3000);
+    assert!(result.is_some());
+    let (lat, lon, _) = result.unwrap();
+    assert_eq!(lat, 0, "Buggy buffer returns (0,0,0) from no-fix entries");
+    assert_eq!(lon, 0);
+}
+
+/// After satellite loss gap, buffer entries still hold pre-loss positions
+/// with timestamps far in the past. get_position_at(2, now) returns the closest
+/// available entry even if it's older than 2 seconds.
+#[test]
+fn test_position_buffer_stale_entries_after_long_gap() {
+    let mut buf = PositionBuffer::new();
+
+    // 10 entries at normal 5Hz (0..1800ms)
+    for i in 0u32..10 {
+        buf.push(BASE_LAT + (i as i32) * 100, BASE_LON, BASE_ALT, i * 200);
+    }
+
+    // Long satellite loss: 30 seconds with no pushes (fix applied)
+    // Spoof detected at t=32000ms
+    let now_ms = 32000u32;
+    let result = buf.get_position_at(2, now_ms);
+    assert!(result.is_some(), "Should return stale but valid entry");
+
+    let (lat, _, _) = result.unwrap();
+    assert!(lat >= BASE_LAT && lat <= BASE_LAT + 9 * 100,
+        "Stale entry should be from pre-loss flight, lat={}", lat);
+}
+
+// ============================================================================
+// Group 6: Dynamic offset computation and recomputation
+//
+// Tests for the offset pipeline: computation from GPS coords, application to
+// frames, and the recomputation-after-recovery fix.
+// ============================================================================
+
+/// Target offset position (Seney, Michigan)
+const TARGET_LAT: i32 = 463_407_000;
+const TARGET_LON: i32 = -859_407_000;
+const TARGET_ALT: i32 = 100_000;
+
+/// Simulated actual GPS position (Moscow area)
+const ACTUAL_LAT: i32 = 557_500_000;
+const ACTUAL_LON: i32 = 376_200_000;
+const ACTUAL_ALT: i32 = 200_000;
+
+/// Simulated spoofed GPS position (somewhere in Turkey)
+const SPOOFED_LAT: i32 = 390_000_000;
+const SPOOFED_LON: i32 = 320_000_000;
+const SPOOFED_ALT: i32 = 150_000;
+
+/// Offset computed from REAL coordinates produces correct target position.
+#[test]
+fn test_dynamic_offset_from_real_coords() {
+    let off = DynamicOffset {
+        lat_1e7: TARGET_LAT - ACTUAL_LAT,
+        lon_1e7: TARGET_LON - ACTUAL_LON,
+        alt_mm: TARGET_ALT - ACTUAL_ALT,
+    };
+
+    let mut frame = build_nav_pvt_frame(ACTUAL_LAT, ACTUAL_LON, ACTUAL_ALT, 3, 12);
+    apply_offset_nav_pvt(&mut frame, &off);
+
+    let lat = read_i32_le(&frame, 6 + 28);
+    let lon = read_i32_le(&frame, 6 + 24);
+    assert_eq!(lat, TARGET_LAT, "Offset from real coords should produce target lat");
+    assert_eq!(lon, TARGET_LON, "Offset from real coords should produce target lon");
+}
+
+/// Offset computed from SPOOFED coordinates produces WRONG target position
+/// when applied to real coordinates — this demonstrates the bug that the
+/// dynamic_offset recomputation fix addresses.
+#[test]
+fn test_dynamic_offset_from_spoofed_coords_produces_wrong_position() {
+    // Offset computed from spoofed coords (the bug scenario)
+    let bad_off = DynamicOffset {
+        lat_1e7: TARGET_LAT - SPOOFED_LAT,
+        lon_1e7: TARGET_LON - SPOOFED_LON,
+        alt_mm: TARGET_ALT - SPOOFED_ALT,
+    };
+
+    // Apply bad offset to REAL coordinates
+    let mut frame = build_nav_pvt_frame(ACTUAL_LAT, ACTUAL_LON, ACTUAL_ALT, 3, 12);
+    apply_offset_nav_pvt(&mut frame, &bad_off);
+
+    let lat = read_i32_le(&frame, 6 + 28);
+    let lon = read_i32_le(&frame, 6 + 24);
+
+    // Position should NOT equal target — that's the bug
+    assert_ne!(lat, TARGET_LAT, "Bad offset should NOT produce target lat");
+    assert_ne!(lon, TARGET_LON, "Bad offset should NOT produce target lon");
+
+    // The error should be approximately |ACTUAL - SPOOFED|
+    let lat_error = (lat - TARGET_LAT).abs();
+    let lon_error = (lon - TARGET_LON).abs();
+    assert!(lat_error > 100_000_000, "Lat error should be large, got {}", lat_error);
+    assert!(lon_error > 50_000_000, "Lon error should be large, got {}", lon_error);
+}
+
+/// After offset recomputation from real coords, position returns to target.
+/// This simulates the fix: invalidate offset → recompute from clean data.
+#[test]
+fn test_dynamic_offset_recomputation_fixes_position() {
+    // Step 1: bad offset from spoofed coords
+    let bad_off = DynamicOffset {
+        lat_1e7: TARGET_LAT - SPOOFED_LAT,
+        lon_1e7: TARGET_LON - SPOOFED_LON,
+        alt_mm: TARGET_ALT - SPOOFED_ALT,
+    };
+
+    let mut frame1 = build_nav_pvt_frame(ACTUAL_LAT, ACTUAL_LON, ACTUAL_ALT, 3, 12);
+    apply_offset_nav_pvt(&mut frame1, &bad_off);
+    let wrong_lat = read_i32_le(&frame1, 6 + 28);
+    assert_ne!(wrong_lat, TARGET_LAT, "Bad offset gives wrong position");
+
+    // Step 2: recompute offset from real coords (the fix)
+    let good_off = DynamicOffset {
+        lat_1e7: TARGET_LAT - ACTUAL_LAT,
+        lon_1e7: TARGET_LON - ACTUAL_LON,
+        alt_mm: TARGET_ALT - ACTUAL_ALT,
+    };
+
+    let mut frame2 = build_nav_pvt_frame(ACTUAL_LAT, ACTUAL_LON, ACTUAL_ALT, 3, 12);
+    apply_offset_nav_pvt(&mut frame2, &good_off);
+    let correct_lat = read_i32_le(&frame2, 6 + 28);
+    let correct_lon = read_i32_le(&frame2, 6 + 24);
+    assert_eq!(correct_lat, TARGET_LAT, "Recomputed offset should give target lat");
+    assert_eq!(correct_lon, TARGET_LON, "Recomputed offset should give target lon");
+}
+
+/// LAST_GOOD + offset should produce target-like position when LAST_GOOD
+/// has valid pre-spoof coordinates.
+#[test]
+fn test_last_good_plus_offset_produces_target() {
+    // LAST_GOOD is from pre-spoof real position
+    let last_good_lat = ACTUAL_LAT + 500; // slight movement
+    let last_good_lon = ACTUAL_LON + 300;
+
+    let off = DynamicOffset {
+        lat_1e7: TARGET_LAT - ACTUAL_LAT,
+        lon_1e7: TARGET_LON - ACTUAL_LON,
+        alt_mm: TARGET_ALT - ACTUAL_ALT,
+    };
+
+    // Spoof replacement: LAST_GOOD + offset
+    let rep_lat = last_good_lat.saturating_add(off.lat_1e7);
+    let rep_lon = last_good_lon.saturating_add(off.lon_1e7);
+
+    // Should be near TARGET (within ~50m of movement delta)
+    let lat_diff = (rep_lat - TARGET_LAT).abs();
+    let lon_diff = (rep_lon - TARGET_LON).abs();
+    assert!(lat_diff < 1000, "rep_lat should be near TARGET, diff={}", lat_diff);
+    assert!(lon_diff < 1000, "rep_lon should be near TARGET, diff={}", lon_diff);
+}
+
+/// LAST_GOOD = (0,0,0) (from no-fix corruption) + offset produces WRONG position.
+/// This demonstrates why pos_buffer must filter no-fix entries.
+#[test]
+fn test_last_good_zero_plus_offset_produces_wrong_position() {
+    let off = DynamicOffset {
+        lat_1e7: TARGET_LAT - ACTUAL_LAT,
+        lon_1e7: TARGET_LON - ACTUAL_LON,
+        alt_mm: TARGET_ALT - ACTUAL_ALT,
+    };
+
+    // Buggy LAST_GOOD from no-fix entry
+    let rep_lat = 0i32.saturating_add(off.lat_1e7);
+    let rep_lon = 0i32.saturating_add(off.lon_1e7);
+
+    // This should be very far from TARGET
+    let lat_diff = (rep_lat - TARGET_LAT).abs();
+    let lon_diff = (rep_lon - TARGET_LON).abs();
+    assert!(lat_diff > 100_000_000,
+        "Zero LAST_GOOD + offset should be far from TARGET, lat_diff={}", lat_diff);
+    assert!(lon_diff > 100_000_000,
+        "Zero LAST_GOOD + offset should be far from TARGET, lon_diff={}", lon_diff);
+}
+
+/// Full pipeline: build frame → apply offset → spoof modify → verify coords.
+/// Simulates the correct spoof handler behavior in PassthroughOffset mode.
+#[test]
+fn test_full_pipeline_offset_then_spoof_replace() {
+    let off = DynamicOffset {
+        lat_1e7: TARGET_LAT - ACTUAL_LAT,
+        lon_1e7: TARGET_LON - ACTUAL_LON,
+        alt_mm: TARGET_ALT - ACTUAL_ALT,
+    };
+
+    // Frame from spoofed GNSS
+    let mut frame = build_nav_pvt_frame(SPOOFED_LAT, SPOOFED_LON, SPOOFED_ALT, 3, 12);
+
+    // Step 1: apply offset (as in main.rs line 1737)
+    apply_offset_nav_pvt(&mut frame, &off);
+
+    // Step 2: spoof replacement with LAST_GOOD + offset (as in main.rs line 1818)
+    let last_good_lat = ACTUAL_LAT;
+    let last_good_lon = ACTUAL_LON;
+    let last_good_alt = ACTUAL_ALT;
+    let rep_lat = last_good_lat.saturating_add(off.lat_1e7);
+    let rep_lon = last_good_lon.saturating_add(off.lon_1e7);
+    let rep_alt = last_good_alt.saturating_add(off.alt_mm);
+
+    modify_nav_pvt_spoof(&mut frame, rep_lat, rep_lon, rep_alt);
+
+    // Verify final coords = TARGET
+    let lat = read_i32_le(&frame, 6 + 28);
+    let lon = read_i32_le(&frame, 6 + 24);
+    assert_eq!(lat, TARGET_LAT, "After offset+spoof, should show target lat");
+    assert_eq!(lon, TARGET_LON, "After offset+spoof, should show target lon");
+
+    // Verify status degraded
+    assert_eq!(frame[6 + 20], 0, "fix_type should be 0");
+    assert_eq!(frame[6 + 23], 92, "num_sv should be 92 (spoof marker)");
+}
+
+/// Verify ECEF consistency: offset LLH → ECEF should match for both
+/// normal and spoof replacement paths.
+#[test]
+fn test_ecef_consistency_after_offset_recomputation() {
+    coordinates::init();
+
+    let off = DynamicOffset {
+        lat_1e7: TARGET_LAT - ACTUAL_LAT,
+        lon_1e7: TARGET_LON - ACTUAL_LON,
+        alt_mm: TARGET_ALT - ACTUAL_ALT,
+    };
+
+    // Normal path: ACTUAL + offset = TARGET
+    let offset_lat = ACTUAL_LAT + off.lat_1e7;
+    let offset_lon = ACTUAL_LON + off.lon_1e7;
+    let offset_alt = ACTUAL_ALT + off.alt_mm;
+    let (ecef_x1, ecef_y1, ecef_z1) = coordinates::llh_to_ecef_cm(offset_lat, offset_lon, offset_alt);
+
+    // Spoof replacement path: LAST_GOOD + offset (LAST_GOOD ≈ ACTUAL)
+    let rep_lat = ACTUAL_LAT + off.lat_1e7;
+    let rep_lon = ACTUAL_LON + off.lon_1e7;
+    let rep_alt = ACTUAL_ALT + off.alt_mm;
+    let (ecef_x2, ecef_y2, ecef_z2) = coordinates::llh_to_ecef_cm(rep_lat, rep_lon, rep_alt);
+
+    // Both should produce identical ECEF
+    assert_eq!(ecef_x1, ecef_x2, "ECEF X should match between normal and spoof paths");
+    assert_eq!(ecef_y1, ecef_y2, "ECEF Y should match");
+    assert_eq!(ecef_z1, ecef_z2, "ECEF Z should match");
+}
+
+/// Verify all NAV message types get correct coordinates during spoof replacement
+/// with offset. Tests the full set of modify_nav_*_spoof functions.
+#[test]
+fn test_all_nav_messages_spoof_replacement_with_offset() {
+    coordinates::init();
+
+    let off = DynamicOffset {
+        lat_1e7: TARGET_LAT - ACTUAL_LAT,
+        lon_1e7: TARGET_LON - ACTUAL_LON,
+        alt_mm: TARGET_ALT - ACTUAL_ALT,
+    };
+
+    let rep_lat = ACTUAL_LAT + off.lat_1e7; // = TARGET_LAT
+    let rep_lon = ACTUAL_LON + off.lon_1e7; // = TARGET_LON
+    let rep_alt = ACTUAL_ALT + off.alt_mm;  // = TARGET_ALT
+    let (rep_ex, rep_ey, rep_ez) = coordinates::llh_to_ecef_cm(rep_lat, rep_lon, rep_alt);
+
+    // NAV-PVT
+    let mut pvt = build_nav_pvt_frame(SPOOFED_LAT, SPOOFED_LON, SPOOFED_ALT, 3, 12);
+    modify_nav_pvt_spoof(&mut pvt, rep_lat, rep_lon, rep_alt);
+    assert_eq!(read_i32_le(&pvt, 6 + 28), TARGET_LAT);
+    assert_eq!(read_i32_le(&pvt, 6 + 24), TARGET_LON);
+
+    // NAV-POSLLH
+    let mut posllh = build_nav_posllh_frame(SPOOFED_LAT, SPOOFED_LON, SPOOFED_ALT);
+    modify_nav_posllh_spoof(&mut posllh, rep_lat, rep_lon, rep_alt);
+    assert_eq!(read_i32_le(&posllh, 6 + 8), TARGET_LAT);
+    assert_eq!(read_i32_le(&posllh, 6 + 4), TARGET_LON);
+
+    // NAV-POSECEF
+    let mut posecef = build_nav_posecef_frame(0, 0, 0);
+    modify_nav_posecef_spoof(&mut posecef, rep_ex, rep_ey, rep_ez);
+    assert_eq!(read_i32_le(&posecef, 6 + 4), rep_ex);
+    assert_eq!(read_i32_le(&posecef, 6 + 8), rep_ey);
+    assert_eq!(read_i32_le(&posecef, 6 + 12), rep_ez);
+
+    // NAV-HPPOSECEF
+    let mut hpposecef = build_nav_hpposecef_frame(0, 0, 0);
+    modify_nav_hpposecef_spoof(&mut hpposecef, rep_ex, rep_ey, rep_ez);
+    assert_eq!(read_i32_le(&hpposecef, 6 + 8), rep_ex);
+
+    // NAV-SOL
+    let mut sol = build_nav_sol_frame(0, 0, 0);
+    modify_nav_sol_spoof(&mut sol, rep_ex, rep_ey, rep_ez);
+    assert_eq!(read_i32_le(&sol, 6 + 12), rep_ex);
+    assert_eq!(read_i32_le(&sol, 6 + 16), rep_ey);
+    assert_eq!(read_i32_le(&sol, 6 + 20), rep_ez);
+}

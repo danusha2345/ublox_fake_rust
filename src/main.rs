@@ -1635,8 +1635,12 @@ async fn gnss_processing_task() {
                         if let Some((lat, lon, alt, h_acc, _speed, num_sv)) =
                             extract_position_from_pvt(&frame[6..])
                         {
-                            pos_buffer.push(lat, lon, alt, now_ms);
                             let fix_type = FixType::from_u8(frame[6 + 20]);
+                            // Only store valid 3D fix data — prevents LAST_GOOD corruption
+                            // from no-fix entries (0,0,0) during satellite loss
+                            if fix_type.has_3d_fix() {
+                                pos_buffer.push(lat, lon, alt, now_ms);
+                            }
                             let gnss_time = extract_gnss_time_from_pvt(&frame[6..], now_ms);
 
                             let pos = Position {
@@ -1684,6 +1688,13 @@ async fn gnss_processing_task() {
                                     if elapsed >= 5000 {
                                         SPOOF_DETECTED.store(false, Ordering::Release);
                                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                                        // Recompute dynamic offset from verified-real coordinates
+                                        // (old offset may have been computed from spoofed data)
+                                        if apply_offset {
+                                            dynamic_offset = None;
+                                            cached_offset_llh = None;
+                                            info!("Dynamic offset invalidated for recomputation from clean coords");
+                                        }
                                         info!("Spoof recovery complete after 5s of clean data");
 
                                         // NOTE: Do NOT reset SEC_SIGN_ACC here.

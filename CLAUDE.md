@@ -31,7 +31,7 @@ make rp2350                           # Build UF2 for RP2350
 make rp2354                           # Build UF2 for RP2354
 make flash                            # Flash via probe-rs (RP2350)
 make flash-rp2354                     # Flash via probe-rs (RP2354)
-make test                             # Run all 75 host-side tests
+make test                             # Run all 128 host-side tests
 
 cargo rb                              # run release binary (alias)
 cargo rp2350                          # build ELF only (alias)
@@ -43,13 +43,15 @@ cargo rp2354                          # build ELF only (alias)
 `spoof_detector.rs` is pure logic (no embassy/cortex-m deps) and can be tested on host via `tests_host/`.
 
 ```bash
-cd tests_host && cargo test            # All 75 tests
+cd tests_host && cargo test            # All 128 tests
 cd tests_host && cargo test vuln       # Only regression tests
 ```
 
 **Structure**: `tests_host/` is a standalone crate (NOT in workspace) with `defmt_mock/` (no-op macros) and `#[path]` to `../../src/spoof_detector.rs`.
 
-**Test groups** (75 tests):
+**Test groups** (128 tests — 87 spoof_detector + 33 passthrough + 8 coordinates):
+
+Spoof detector (87 tests):
 | Group | Tests | Coverage |
 |-------|-------|----------|
 | 0: Utilities | 8 | GnssTime, calc_distance, FixType |
@@ -66,6 +68,17 @@ cd tests_host && cargo test vuln       # Only regression tests
 | 11: Reset | 2 | Clean state after reset |
 | 12: Bug fixes | 6 | Time recovery+distance, last_good check, origin drift |
 | 13: Leash+altitude | 5 | Gradual drift, leash freeze, altitude jump |
+| 14: Satellite loss | 12 | Loss+spoof+recovery cycles, gap thresholds, NoFix persistence |
+
+Passthrough (33 tests):
+| Group | Tests | Coverage |
+|-------|-------|----------|
+| 1: UBX parser | 6 | Frame parsing, checksum, split frames |
+| 2: Offset+ECEF | 8 | LLH offset, ECEF replacement, round-trip |
+| 3: Spoof modify | 5 | Coord replace, velocity zero, status degrade |
+| 4: Extract+Buffer | 3 | Position extraction, PositionBuffer ring |
+| 5: Buffer fix_type | 3 | No-fix filtering, stale entries, corruption demo |
+| 6: Dynamic offset | 8 | Offset recompute, spoofed-base bug, full pipeline |
 
 **Note**: Coord recovery requires 6 samples (not 5) — returning from spoofed position is itself a teleport that resets normal_count.
 
@@ -120,7 +133,7 @@ Mode persisted to flash. Button: 1-4 clicks → mode 0-3. Timeout: 800ms. Hot-sw
 
 ### PassthroughOffset Mode
 
-Dynamic offset computed **once** at first 3D GPS fix. Target: `offset_target` in `config.rs` (Seney, Michigan).
+Dynamic offset computed at first 3D GPS fix, and **recomputed after spoof recovery** (invalidated when 5s recovery timer completes). Target: `offset_target` in `config.rs` (Seney, Michigan).
 
 **LLH offset** (NAV-PVT, NAV-POSLLH): linear `offset = target - actual`, applied via addition. Always exact.
 
@@ -135,6 +148,8 @@ Dynamic offset computed **once** at first 3D GPS fix. Target: `offset_target` in
 - SEC-SIGN: always generate our own in Passthrough modes (real GNSS SEC-SIGN filtered).
 - `DynamicOffset` struct contains only LLH fields (lat_1e7, lon_1e7, alt_mm). No ECEF fields.
 - `cached_offset_llh` caches the latest offset LLH for ECEF recomputation within same epoch.
+- `pos_buffer` only stores entries with valid 3D fix (`fix_type >= 3`). No-fix entries (0,0,0 during satellite loss) are excluded to prevent LAST_GOOD corruption.
+- After spoof recovery (5s timer), `dynamic_offset` and `cached_offset_llh` are invalidated and recomputed from verified-real coordinates on the same NAV-PVT frame.
 
 ### Spoof Detection in Passthrough Mode
 
