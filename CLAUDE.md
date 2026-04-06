@@ -133,7 +133,7 @@ Mode persisted to flash. Button: 1-4 clicks → mode 0-3. Timeout: 800ms. Hot-sw
 
 ### PassthroughOffset Mode
 
-Dynamic offset computed at first 3D GPS fix, and **recomputed after spoof recovery** (invalidated when 5s recovery timer completes). Target: `offset_target` in `config.rs` (Seney, Michigan).
+Dynamic offset computed **once** at first 3D GPS fix and never recomputed (stays fixed for the entire flight). Target: `offset_target` in `config.rs` (Seney, Michigan).
 
 **LLH offset** (NAV-PVT, NAV-POSLLH): linear `offset = target - actual`, applied via addition. Always exact.
 
@@ -149,7 +149,7 @@ Dynamic offset computed at first 3D GPS fix, and **recomputed after spoof recove
 - `DynamicOffset` struct contains only LLH fields (lat_1e7, lon_1e7, alt_mm). No ECEF fields.
 - `cached_offset_llh` caches the latest offset LLH for ECEF recomputation within same epoch.
 - `pos_buffer` only stores entries with valid 3D fix (`fix_type >= 3`). No-fix entries (0,0,0 during satellite loss) are excluded to prevent LAST_GOOD corruption.
-- After spoof recovery (5s timer), `dynamic_offset` and `cached_offset_llh` are invalidated and recomputed from verified-real coordinates on the same NAV-PVT frame.
+- `dynamic_offset` is **never invalidated** after spoof recovery — recomputing from a different position would break coordinate mapping consistency (same physical location would produce different output coordinates before and after spoof event).
 
 ### Spoof Detection in Passthrough Mode
 

@@ -1688,13 +1688,9 @@ async fn gnss_processing_task() {
                                     if elapsed >= 5000 {
                                         SPOOF_DETECTED.store(false, Ordering::Release);
                                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
-                                        // Recompute dynamic offset from verified-real coordinates
-                                        // (old offset may have been computed from spoofed data)
-                                        if apply_offset {
-                                            dynamic_offset = None;
-                                            cached_offset_llh = None;
-                                            info!("Dynamic offset invalidated for recomputation from clean coords");
-                                        }
+                                        // Dynamic offset is NOT invalidated here — it was computed
+                                        // at the first genuine 3D fix (takeoff) and must stay fixed
+                                        // for the entire flight to keep coordinate mapping consistent.
                                         info!("Spoof recovery complete after 5s of clean data");
 
                                         // NOTE: Do NOT reset SEC_SIGN_ACC here.
