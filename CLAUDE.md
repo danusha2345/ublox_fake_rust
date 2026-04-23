@@ -1,5 +1,9 @@
 # u-blox GNSS M10 Emulator (RP2350/RP2354, Embassy)
 
+Two chip targets:
+- **u-blox M10** (default) — `make rp2350` / `make rp2354`. UBX + SEC-SIGN ECDSA.
+- **Unicore UC6580I** — `make rp2350-unicore` / `make rp2354-unicore` (feature `unicore`, bin `ublox_fake_uc`). NMEA + RTCM + proprietary msg 4074. No SEC-SIGN. Entry point `src/main_unicore.rs`, protocol stack in `src/unicore/`. See `docs/UC6580I.md` for live-verified protocol reference.
+
 ## CRITICAL: Version Dependencies
 
 | Crate | Version | Why |
