@@ -3,6 +3,12 @@
 
 #![allow(dead_code)]
 
+// Position history types and dynamic offset live in the shared `pos_history`
+// module so both UBX and NMEA emulators use the same implementation. Re-exported
+// here to preserve the existing `passthrough::PositionBuffer` / `DynamicOffset`
+// path for host tests and external callers.
+pub use crate::pos_history::{DynamicOffset, PositionBuffer};
+
 #[cfg(target_os = "none")]
 use embassy_rp::pio::{Common, Config, Instance, PioPin, StateMachine};
 #[cfg(target_os = "none")]
@@ -218,72 +224,6 @@ impl UbxFrameParser {
 }
 
 // ============================================================================
-// Position Buffer - ring buffer for 3 seconds of position history (5Hz = 15 samples)
-// ============================================================================
-
-/// Position entry with timestamp
-#[derive(Clone, Copy, Default)]
-pub struct PositionEntry {
-    pub lat: i32,      // degrees * 1e-7
-    pub lon: i32,      // degrees * 1e-7
-    pub alt: i32,      // mm
-    pub timestamp_ms: u32,
-}
-
-/// Ring buffer for position history
-pub struct PositionBuffer {
-    entries: [PositionEntry; 15],  // 3 seconds at 5Hz
-    write_idx: usize,
-    count: usize,
-}
-
-impl PositionBuffer {
-    pub const fn new() -> Self {
-        Self {
-            entries: [PositionEntry { lat: 0, lon: 0, alt: 0, timestamp_ms: 0 }; 15],
-            write_idx: 0,
-            count: 0,
-        }
-    }
-
-    /// Add new position to buffer
-    pub fn push(&mut self, lat: i32, lon: i32, alt: i32, timestamp_ms: u32) {
-        self.entries[self.write_idx] = PositionEntry { lat, lon, alt, timestamp_ms };
-        self.write_idx = (self.write_idx + 1) % 15;
-        if self.count < 15 {
-            self.count += 1;
-        }
-    }
-
-    /// Get position from N seconds ago (approximate)
-    /// Returns None if not enough history
-    pub fn get_position_at(&self, seconds_ago: u32, current_time_ms: u32) -> Option<(i32, i32, i32)> {
-        if self.count == 0 {
-            return None;
-        }
-
-        let target_time = current_time_ms.wrapping_sub(seconds_ago * 1000);
-        let mut best_idx = 0;
-        let mut best_diff = u32::MAX;
-
-        // Find entry closest to target time
-        for i in 0..self.count {
-            let idx = (self.write_idx + 15 - 1 - i) % 15;
-            let entry = &self.entries[idx];
-            let diff = entry.timestamp_ms.abs_diff(target_time);
-
-            if diff < best_diff {
-                best_diff = diff;
-                best_idx = idx;
-            }
-        }
-
-        let entry = &self.entries[best_idx];
-        Some((entry.lat, entry.lon, entry.alt))
-    }
-}
-
-// ============================================================================
 // NAV Message Modification Functions
 // ============================================================================
 
@@ -307,53 +247,47 @@ pub fn recalc_checksum(frame: &mut [u8]) {
     frame[len - 1] = ck_b;
 }
 
-/// Modify NAV-PVT (0x01 0x07): set fix_type=0, flags=0, num_sv=92
+/// Modify NAV-PVT (0x01 0x07): set fix_type=0, flags=0, num_sv=SPOOF_NSATS_MARKER
 /// Payload: 92 bytes, offsets: fix_type=20, flags=21, num_sv=23
-/// num_sv=92 is an impossible value (max real ~40) used as spoof marker
 pub fn modify_nav_pvt(frame: &mut [u8]) {
-    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(92) + ck(2) = 100 bytes
     if frame.len() >= 100 {
-        frame[6 + 20] = 0;  // fix_type = 0 (no fix)
-        frame[6 + 21] = 0;  // flags = 0
-        frame[6 + 23] = 92; // num_sv = 92 (spoof marker)
+        frame[6 + 20] = 0;
+        frame[6 + 21] = 0;
+        frame[6 + 23] = crate::spoof_detector::SPOOF_NSATS_MARKER;
     }
 }
 
-/// Modify NAV-SOL (0x01 0x06): set gps_fix=0, num_sv=92
+/// Modify NAV-SOL (0x01 0x06): set gps_fix=0, num_sv=SPOOF_NSATS_MARKER
 /// Payload: 52 bytes, offsets: gps_fix=10, num_sv=47
 pub fn modify_nav_sol(frame: &mut [u8]) {
-    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(52) + ck(2) = 60 bytes
     if frame.len() >= 60 {
-        frame[6 + 10] = 0;  // gps_fix = 0
-        frame[6 + 47] = 92; // num_sv = 92 (spoof marker)
+        frame[6 + 10] = 0;
+        frame[6 + 47] = crate::spoof_detector::SPOOF_NSATS_MARKER;
     }
 }
 
 /// Modify NAV-STATUS (0x01 0x03): set gps_fix=0, flags=0
 /// Payload: 16 bytes, offsets: gps_fix=4, flags=5
 pub fn modify_nav_status(frame: &mut [u8]) {
-    // Frame = sync(2) + class(1) + id(1) + len(2) + payload(16) + ck(2) = 24 bytes
     if frame.len() >= 24 {
-        frame[6 + 4] = 0;   // gps_fix = 0
-        frame[6 + 5] = 0;   // flags = 0
+        frame[6 + 4] = 0;
+        frame[6 + 5] = 0;
     }
 }
 
-/// Modify NAV-SAT (0x01 0x35): set num_svs=92
+/// Modify NAV-SAT (0x01 0x35): set num_svs=SPOOF_NSATS_MARKER
 /// Payload: 8 + 12*n bytes, offset: num_svs=5
 pub fn modify_nav_sat(frame: &mut [u8]) {
-    // Frame header = 8 bytes minimum
-    if frame.len() >= 14 {  // 6 + 8 minimum
-        frame[6 + 5] = 92;  // num_svs = 92 (spoof marker)
+    if frame.len() >= 14 {
+        frame[6 + 5] = crate::spoof_detector::SPOOF_NSATS_MARKER;
     }
 }
 
-/// Modify NAV-SVINFO (0x01 0x30): set num_ch=92
+/// Modify NAV-SVINFO (0x01 0x30): set num_ch=SPOOF_NSATS_MARKER
 /// Payload: 8 + 12*n bytes, offset: num_ch=4
 pub fn modify_nav_svinfo(frame: &mut [u8]) {
-    // Frame header = 8 bytes minimum
-    if frame.len() >= 14 {  // 6 + 8 minimum
-        frame[6 + 4] = 92;  // num_ch = 92 (spoof marker)
+    if frame.len() >= 14 {
+        frame[6 + 4] = crate::spoof_detector::SPOOF_NSATS_MARKER;
     }
 }
 
@@ -361,14 +295,6 @@ pub fn modify_nav_svinfo(frame: &mut [u8]) {
 // Coordinate Offset Functions for PassthroughOffset mode
 // Dynamic offset: computed once at first GPS 3D fix (target = default_position)
 // ============================================================================
-
-/// Dynamic coordinate offset computed at first GPS fix
-/// offset = default_position - actual_gps_position
-pub struct DynamicOffset {
-    pub lat_1e7: i32,
-    pub lon_1e7: i32,
-    pub alt_mm: i32,
-}
 
 /// Apply coordinate offset to NAV-PVT (0x01 0x07)
 /// Payload: 92 bytes

@@ -7,6 +7,9 @@ pub mod config;
 #[path = "../../src/coordinates.rs"]
 pub mod coordinates;
 
+#[path = "../../src/pos_history.rs"]
+pub mod pos_history;
+
 #[path = "../../src/passthrough.rs"]
 pub mod passthrough;
 

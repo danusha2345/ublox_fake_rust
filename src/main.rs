@@ -15,6 +15,7 @@ mod flash_storage;
 mod key_extract;
 mod led;
 mod passthrough;
+mod pos_history;
 mod sec_sign;
 mod spoof_detector;
 mod ubx;
