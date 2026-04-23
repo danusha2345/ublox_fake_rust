@@ -34,6 +34,12 @@ pub enum Command<'a> {
     CfgKey,
     CfgSave,
     CfgClr,
+    /// `$CFGMSM` GET (value = MSM type).
+    CfgMsm,
+    /// `$CFGPRT` GET. `None` = no portID, `Some(p)` = port-specific.
+    CfgPrt(Option<u8>),
+    /// `$CFGNMEA` GET.
+    CfgNmea,
     Unknown(&'a [u8]),
 }
 
@@ -131,6 +137,16 @@ pub fn parse_command(line: &[u8]) -> Result<Command<'_>, ParseError> {
         b"CFGKEY" => Ok(Command::CfgKey),
         b"CFGSAVE" => Ok(Command::CfgSave),
         b"CFGCLR" => Ok(Command::CfgClr),
+        b"CFGMSM" => Ok(Command::CfgMsm),
+        b"CFGNMEA" => Ok(Command::CfgNmea),
+        b"CFGPRT" => match args.len() {
+            0 => Ok(Command::CfgPrt(None)),
+            1 => {
+                let p = parse_dec_u8(args[0]).ok_or(ParseError::Malformed)?;
+                Ok(Command::CfgPrt(Some(p)))
+            }
+            _ => Err(ParseError::Malformed),
+        },
         _ => Ok(Command::Unknown(name)),
     }
 }
@@ -203,6 +219,21 @@ pub const CFGSYS_PREACK: &[u8] = b"$GNTXT,01,01,00,CFGSYS*4A\r\n";
 /// `$GNTXT,01,01,00,CFGNAV*4A\r\n` — pre-ACK for `$CFGNAV` GET.
 pub const CFGNAV_PREACK: &[u8] = b"$GNTXT,01,01,00,CFGNAV*4A\r\n";
 
+/// `$CFGMSM,7,0*16\r\n` — MSM type reply (MsmType=7 = MSM7; trailing 0 undoc).
+pub const CFGMSM_REPLY: &[u8] = b"$CFGMSM,7,0*16\r\n";
+
+/// `$GNTXT,01,01,00,CFGMSM*40\r\n` — pre-ACK for `$CFGMSM`.
+pub const CFGMSM_PREACK: &[u8] = b"$GNTXT,01,01,00,CFGMSM*40\r\n";
+
+/// `$CFGPRT,1,0,921600,H81,H12F*79\r\n` — UART1 port config (default target).
+pub const CFGPRT_UART1_REPLY: &[u8] = b"$CFGPRT,1,0,921600,H81,H12F*79\r\n";
+
+/// `$CFGPRT,2,0,921600,H1,H0*37\r\n` — UART2 port config (UNICORE-only, silent).
+pub const CFGPRT_UART2_REPLY: &[u8] = b"$CFGPRT,2,0,921600,H1,H0*37\r\n";
+
+/// `$CFGNMEA,H52*26\r\n` — NMEA version / flags.
+pub const CFGNMEA_REPLY: &[u8] = b"$CFGNMEA,H52*26\r\n";
+
 /// Generic `$OK*04\r\n` success reply.
 pub const OK_REPLY: &[u8] = b"$OK*04\r\n";
 
@@ -246,6 +277,18 @@ pub fn reply_cfgnav_default(buf: &mut [u8]) -> usize {
     copy_to(buf, CFGNAV_DEFAULT_REPLY)
 }
 
+/// Emit canned CFGMSM reply.
+pub fn reply_cfgmsm(buf: &mut [u8]) -> usize { copy_to(buf, CFGMSM_REPLY) }
+
+/// Emit canned CFGNMEA reply.
+pub fn reply_cfgnmea(buf: &mut [u8]) -> usize { copy_to(buf, CFGNMEA_REPLY) }
+
+/// Emit canned CFGPRT reply for UART1.
+pub fn reply_cfgprt_uart1(buf: &mut [u8]) -> usize { copy_to(buf, CFGPRT_UART1_REPLY) }
+
+/// Emit canned CFGPRT reply for UART2.
+pub fn reply_cfgprt_uart2(buf: &mut [u8]) -> usize { copy_to(buf, CFGPRT_UART2_REPLY) }
+
 /// Emit `$GNTXT,01,01,00,<name>*cs` pre-ACK for a GET command.
 /// `name` is the command name without `$`, e.g. `b"CFGSYS"`.
 pub fn reply_preack(buf: &mut [u8], name: &[u8]) -> usize {
@@ -286,19 +329,28 @@ pub fn build_cfgmsg_reply(buf: &mut [u8], class: u8, id: u8, rate: u8) -> usize 
     p
 }
 
-/// Known `$CFGMSG,class,id` pairs observed on live UC6580I (2026-04-23).
-/// Unknown pairs are rejected with `$FAIL,0` by the real chip.
-pub fn is_known_cfgmsg(class: u8, id: u8) -> bool {
-    matches!((class, id),
+/// Known `$CFGMSG,class,id` pairs on live UC6580I. Returns the default rate
+/// the chip reports on GET (2026-04-23 capture). `None` means the pair is
+/// rejected with `$FAIL,0`.
+pub fn default_cfgmsg_rate(class: u8, id: u8) -> Option<u8> {
+    Some(match (class, id) {
         // Standard NMEA
-        (0, 0..=8) |
+        (0, 0) => 1, (0, 1) => 0, (0, 2) => 5, (0, 3) => 5,
+        (0, 4) => 1, (0, 5) => 0, (0, 6) => 0, (0, 7) => 0, (0, 8) => 0,
         // RTCM 3 standard
-        (2, 3) | (2, 4) | (2, 5) | (2, 14) |
-        // ExtRTCM 4074 (empirically-verified mapping)
+        (2, 3) => 1, (2, 4) => 5, (2, 5) => 0, (2, 14) => 0,
+        // ExtRTCM 4074 (verified subset)
         (9, 1) | (9, 2) | (9, 3) | (9, 4) |
         (9, 7) | (9, 8) | (9, 9) |
         (9, 11) | (9, 12) |
-        (9, 15) | (9, 16))
+        (9, 15) | (9, 16) => 1,
+        _ => return None,
+    })
+}
+
+/// Convenience: `$CFGMSG` pair is known.
+pub fn is_known_cfgmsg(class: u8, id: u8) -> bool {
+    default_cfgmsg_rate(class, id).is_some()
 }
 
 /// Emit `$OK*04\r\n`.
@@ -518,15 +570,64 @@ mod tests {
 
     #[test]
     fn known_cfgmsg_table() {
-        // Sanity on the live-verified subset.
-        assert!(is_known_cfgmsg(0, 0));   // GGA
-        assert!(is_known_cfgmsg(0, 8));   // GBS
-        assert!(is_known_cfgmsg(2, 3));   // MSM
-        assert!(is_known_cfgmsg(9, 12));  // Sub 0x0FC
-        assert!(is_known_cfgmsg(9, 15));  // Sub 0x0E6
+        assert!(is_known_cfgmsg(0, 0));
+        assert!(is_known_cfgmsg(0, 8));
+        assert!(is_known_cfgmsg(2, 3));
+        assert!(is_known_cfgmsg(9, 12));
+        assert!(is_known_cfgmsg(9, 15));
         assert!(!is_known_cfgmsg(0, 99));
         assert!(!is_known_cfgmsg(2, 0));
         assert!(!is_known_cfgmsg(9, 0));
         assert!(!is_known_cfgmsg(99, 0));
+    }
+
+    #[test]
+    fn default_rates_match_live_chip() {
+        // Live capture 2026-04-23:
+        assert_eq!(default_cfgmsg_rate(0, 0), Some(1));   // GGA
+        assert_eq!(default_cfgmsg_rate(0, 1), Some(0));   // GLL
+        assert_eq!(default_cfgmsg_rate(0, 2), Some(5));   // GSA
+        assert_eq!(default_cfgmsg_rate(0, 3), Some(5));   // GSV
+        assert_eq!(default_cfgmsg_rate(0, 4), Some(1));   // RMC
+        assert_eq!(default_cfgmsg_rate(0, 5), Some(0));   // VTG
+        assert_eq!(default_cfgmsg_rate(0, 8), Some(0));   // GBS
+        assert_eq!(default_cfgmsg_rate(0, 9), None);      // $FAIL,0
+        assert_eq!(default_cfgmsg_rate(2, 3), Some(1));   // MSM
+        assert_eq!(default_cfgmsg_rate(2, 4), Some(5));   // Eph
+        assert_eq!(default_cfgmsg_rate(2, 14), Some(0));  // 1013
+        assert_eq!(default_cfgmsg_rate(2, 2), None);
+    }
+
+    #[test]
+    fn cfgprt_reply_bitexact_live() {
+        assert_eq!(CFGPRT_UART1_REPLY, b"$CFGPRT,1,0,921600,H81,H12F*79\r\n");
+        assert_eq!(CFGPRT_UART2_REPLY, b"$CFGPRT,2,0,921600,H1,H0*37\r\n");
+        assert!(nmea::verify_sentence(CFGPRT_UART1_REPLY));
+        assert!(nmea::verify_sentence(CFGPRT_UART2_REPLY));
+    }
+
+    #[test]
+    fn cfgmsm_reply_bitexact_live() {
+        assert_eq!(CFGMSM_REPLY, b"$CFGMSM,7,0*16\r\n");
+        assert_eq!(CFGMSM_PREACK, b"$GNTXT,01,01,00,CFGMSM*40\r\n");
+        assert!(nmea::verify_sentence(CFGMSM_REPLY));
+    }
+
+    #[test]
+    fn cfgnmea_reply_bitexact_live() {
+        assert_eq!(CFGNMEA_REPLY, b"$CFGNMEA,H52*26\r\n");
+        assert!(nmea::verify_sentence(CFGNMEA_REPLY));
+    }
+
+    #[test]
+    fn parse_cfgprt_forms() {
+        assert_eq!(parse_command(b"$CFGPRT\r\n").unwrap(), Command::CfgPrt(None));
+        assert_eq!(parse_command(b"$CFGPRT,2").unwrap(), Command::CfgPrt(Some(2)));
+    }
+
+    #[test]
+    fn parse_cfgmsm_and_cfgnmea() {
+        assert_eq!(parse_command(b"$CFGMSM").unwrap(), Command::CfgMsm);
+        assert_eq!(parse_command(b"$CFGNMEA").unwrap(), Command::CfgNmea);
     }
 }

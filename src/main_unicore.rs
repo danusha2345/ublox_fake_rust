@@ -16,6 +16,7 @@
 mod config;
 mod coordinates;
 mod flash_storage;
+mod spoof_detector;
 #[path = "unicore/mod.rs"]
 mod unicore;
 
@@ -24,7 +25,7 @@ mod version {
     include!(concat!(env!("OUT_DIR"), "/version.rs"));
 }
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -93,6 +94,14 @@ static RAW_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 
 type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { config::FLASH_SIZE_BYTES }>>;
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
 
+/// Set to true when the spoof-detector flagged the current position as spoofed.
+static SPOOF_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Detector instance — lives for the whole session, reset via `.reset()` on
+/// mode changes that would otherwise pollute its internal `LAST_GOOD`.
+static SPOOF_CELL: Mutex<CriticalSectionRawMutex, Option<spoof_detector::SpoofDetector>> =
+    Mutex::new(None);
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -106,6 +115,12 @@ async fn main(spawner: Spawner) {
     info!("========================================");
 
     coordinates::init();
+
+    // Initialise the spoof detector once.
+    {
+        let mut cell = SPOOF_CELL.lock().await;
+        *cell = Some(spoof_detector::SpoofDetector::default());
+    }
 
     // Flash: load persisted mode + save current firmware version.
     let flash = Flash::<_, Async, { config::FLASH_SIZE_BYTES }>::new(p.FLASH, p.DMA_CH0);
@@ -229,9 +244,10 @@ async fn uart0_rx_task(mut rx: BufferedUartRx) {
 
 async fn handle_command(line: &[u8]) {
     use unicore::cmd::{
-        build_cfgmsg_reply, is_known_cfgmsg, parse_command, reply_cfgkey, reply_cfgnav_default,
+        build_cfgmsg_reply, default_cfgmsg_rate, is_known_cfgmsg, parse_command, reply_cfgkey,
+        reply_cfgmsm, reply_cfgnav_default, reply_cfgnmea, reply_cfgprt_uart1, reply_cfgprt_uart2,
         reply_cfgsys_default, reply_fail, reply_gntxt_ack, reply_ok, reply_pdtinfo,
-        reply_productinfo, CFGNAV_PREACK, CFGSYS_PREACK, Command, ParseError,
+        reply_productinfo, CFGMSM_PREACK, CFGNAV_PREACK, CFGSYS_PREACK, Command, ParseError,
     };
 
     // Full echo body (between `$` and trailing \r\n, INCLUDING *HH if present).
@@ -313,12 +329,19 @@ async fn handle_command(line: &[u8]) {
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
         Command::CfgMsg { class, id, rate: None } => {
-            // GET: $GNTXT echo + $CFGMSG,c,i,1*cs + $OK
+            // GET: $GNTXT echo + (either $CFGMSG,c,i,rate*cs + $OK, or $FAIL,0 for unknown).
             let n = reply_gntxt_ack(&mut scratch, echo_clean);
             if n > 0 { enqueue(&scratch[..n]); }
-            let n = build_cfgmsg_reply(&mut scratch, class, id, 1);
-            if n > 0 { enqueue(&scratch[..n]); }
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+            match default_cfgmsg_rate(class, id) {
+                Some(r) => {
+                    let n = build_cfgmsg_reply(&mut scratch, class, id, r);
+                    if n > 0 { enqueue(&scratch[..n]); }
+                    let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+                }
+                None => {
+                    let n = reply_fail(&mut scratch, 0); enqueue(&scratch[..n]);
+                }
+            }
         }
         Command::CfgMsg { class, id, rate: Some(_) } => {
             // SET: echo + ($OK if known pair, $FAIL,0 if not)
@@ -328,6 +351,34 @@ async fn handle_command(line: &[u8]) {
                 let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
             } else {
                 let n = reply_fail(&mut scratch, 0); enqueue(&scratch[..n]);
+            }
+        }
+        Command::CfgMsm => {
+            enqueue(CFGMSM_PREACK);
+            let n = reply_cfgmsm(&mut scratch); enqueue(&scratch[..n]);
+            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+        }
+        Command::CfgNmea => {
+            // No $GNTXT pre-ACK for $CFGNMEA (verified live).
+            let n = reply_cfgnmea(&mut scratch); enqueue(&scratch[..n]);
+            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+        }
+        Command::CfgPrt(port) => {
+            let n = reply_gntxt_ack(&mut scratch, echo_clean);
+            if n > 0 { enqueue(&scratch[..n]); }
+            // Port 1 (UART1) default; port 2 (UART2) also valid; others $FAIL,0.
+            match port {
+                None | Some(1) => {
+                    let n = reply_cfgprt_uart1(&mut scratch); enqueue(&scratch[..n]);
+                    let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+                }
+                Some(2) => {
+                    let n = reply_cfgprt_uart2(&mut scratch); enqueue(&scratch[..n]);
+                    let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+                }
+                _ => {
+                    let n = reply_fail(&mut scratch, 0); enqueue(&scratch[..n]);
+                }
             }
         }
         // Remaining SET-ish commands (CFGSAVE, CFGCLR, CFGSYS with mask, etc.)
@@ -393,54 +444,73 @@ async fn uart1_rx_task(mut rx: BufferedUartRx) {
 // Offset = reassemble NMEA lines, rewrite coordinates, forward; non-NMEA bytes pass through.
 // ---------------------------------------------------------------------------
 
+/// Canned no-fix replacements emitted when spoofing is detected.
+const NOFIX_RMC: &[u8] = b"$GNRMC,,V,,,,,,,,,,N,V*37\r\n";
+const NOFIX_GGA: &[u8] = b"$GNGGA,,,,,,0,00,99.99,,,,,,*56\r\n";
+
 #[embassy_executor::task]
 async fn passthrough_forward_task() {
-    let mut asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
+    use unicore::nmea;
+
+    let mut asm: nmea::LineAssembler<256> = nmea::LineAssembler::new();
+    let mut pass_buf = heapless::Vec::<u8, 256>::new();
+    let mut in_sentence = false;
+    let mut last_mode = OperatingMode::load();
+
     loop {
         let chunk = RAW_RX_CHANNEL.receive().await;
         let mode = OperatingMode::load();
+
+        // Reset assembler + detector when the operator flips modes, so
+        // stale LAST_GOOD data cannot trigger false positives.
+        if mode != last_mode {
+            asm = nmea::LineAssembler::new();
+            pass_buf.clear();
+            in_sentence = false;
+            SPOOF_DETECTED.store(false, Ordering::Release);
+            let mut d = SPOOF_CELL.lock().await;
+            if let Some(ref mut det) = *d {
+                *det = spoof_detector::SpoofDetector::default();
+            }
+            last_mode = mode;
+        }
+
         match mode {
-            OperatingMode::Emulation => { /* ignore */ }
-            OperatingMode::PassthroughRaw | OperatingMode::Passthrough => {
-                // Forward untouched in 1280-byte chunks (single chunk is always ≤256 here).
+            OperatingMode::Emulation => {
+                // Drop incoming chip bytes while we are emitting our own.
+            }
+            OperatingMode::PassthroughRaw => {
+                // Byte-for-byte forward, no inspection.
                 let mut v = heapless::Vec::<u8, 1280>::new();
                 let _ = v.extend_from_slice(&chunk);
                 let _ = TX_CHANNEL.try_send(v);
             }
-            OperatingMode::PassthroughOffset => {
+            OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
                 for &b in chunk.iter() {
-                    // Bytes that are not part of an NMEA sentence flow through directly.
-                    if !asm_in_progress(&asm) && b != b'$' {
-                        let mut v = heapless::Vec::<u8, 1280>::new();
-                        let _ = v.push(b);
-                        let _ = TX_CHANNEL.try_send(v);
+                    // Non-NMEA bytes (RTCM payload, noise) pass through directly.
+                    if !in_sentence && b != b'$' {
+                        // batch pass-through bytes into 256-byte TX frames
+                        if pass_buf.push(b).is_err() {
+                            let mut v = heapless::Vec::<u8, 1280>::new();
+                            let _ = v.extend_from_slice(&pass_buf);
+                            let _ = TX_CHANNEL.try_send(v);
+                            pass_buf.clear();
+                            let _ = pass_buf.push(b);
+                        }
                         continue;
                     }
+                    // Flush any queued pass-through bytes before we start on NMEA.
+                    if b == b'$' && !pass_buf.is_empty() {
+                        let mut v = heapless::Vec::<u8, 1280>::new();
+                        let _ = v.extend_from_slice(&pass_buf);
+                        let _ = TX_CHANNEL.try_send(v);
+                        pass_buf.clear();
+                    }
+                    if b == b'$' { in_sentence = true; }
+
                     if let Some(line) = asm.feed(b) {
-                        // Try to rewrite GGA/RMC; forward as-is on failure.
-                        let mut work = [0u8; 320];
-                        if line.len() <= work.len() {
-                            work[..line.len()].copy_from_slice(line);
-                            let lat = config::offset_target::LAT_1E7;
-                            let lon = config::offset_target::LON_1E7;
-                            let alt = config::offset_target::ALT_MM;
-                            match unicore::nmea::rewrite_position_inplace(&mut work, line.len(), lat, lon, Some(alt)) {
-                                Some(new_len) => {
-                                    let mut v = heapless::Vec::<u8, 1280>::new();
-                                    let _ = v.extend_from_slice(&work[..new_len]);
-                                    let _ = TX_CHANNEL.try_send(v);
-                                }
-                                None => {
-                                    let mut v = heapless::Vec::<u8, 1280>::new();
-                                    let _ = v.extend_from_slice(line);
-                                    let _ = TX_CHANNEL.try_send(v);
-                                }
-                            }
-                        } else {
-                            let mut v = heapless::Vec::<u8, 1280>::new();
-                            let _ = v.extend_from_slice(line);
-                            let _ = TX_CHANNEL.try_send(v);
-                        }
+                        in_sentence = false;
+                        process_nmea_line(line, mode).await;
                     }
                 }
             }
@@ -448,12 +518,86 @@ async fn passthrough_forward_task() {
     }
 }
 
-fn asm_in_progress<const N: usize>(_asm: &unicore::nmea::LineAssembler<N>) -> bool {
-    // LineAssembler does not expose its state; conservative answer is false,
-    // which gives us the desired behaviour: any byte that isn't `$` while no
-    // sentence has started falls through to passthrough, and once `feed` sees
-    // `$` it starts a new sentence (the previous partial is discarded anyway).
-    false
+async fn process_nmea_line(line: &[u8], mode: OperatingMode) {
+    use unicore::nmea;
+
+    // Try to extract a position from GGA / RMC and feed the detector.
+    let fix = nmea::parse_gga(line).or_else(|| nmea::parse_rmc(line));
+    if let Some(fix) = fix {
+        if fix.checksum_ok && fix.fix_quality > 0 {
+            let pos = spoof_detector::Position {
+                lat: fix.lat_1e7,
+                lon: fix.lon_1e7,
+                alt_mm: fix.alt_mm,
+                time_ms: embassy_time::Instant::now().as_millis() as u32,
+                fix_type: spoof_detector::FixType::Fix3D,
+                h_acc_mm: 0,
+                num_sv: fix.nsats,
+                pdop: 0,
+                gnss_time: None,
+                cno_values: heapless::Vec::new(),
+            };
+            let mut d = SPOOF_CELL.lock().await;
+            if let Some(ref mut det) = *d {
+                let result = det.analyze(pos);
+                match result {
+                    spoof_detector::AnalysisResult::Spoofed => {
+                        SPOOF_DETECTED.store(true, Ordering::Release);
+                    }
+                    spoof_detector::AnalysisResult::Normal => {
+                        SPOOF_DETECTED.store(false, Ordering::Release);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
+    let is_gga = line.len() >= 6 && &line[3..6] == b"GGA";
+    let is_rmc = line.len() >= 6 && &line[3..6] == b"RMC";
+
+    // Spoof state: replace GGA/RMC with no-fix so the drone fails over.
+    if spoofed {
+        if is_gga {
+            let mut v = heapless::Vec::<u8, 1280>::new();
+            let _ = v.extend_from_slice(NOFIX_GGA);
+            let _ = TX_CHANNEL.try_send(v);
+            return;
+        }
+        if is_rmc {
+            let mut v = heapless::Vec::<u8, 1280>::new();
+            let _ = v.extend_from_slice(NOFIX_RMC);
+            let _ = TX_CHANNEL.try_send(v);
+            return;
+        }
+        // Other NMEA (GSA/GSV/VTG/...) pass through — they do not carry a position.
+    }
+
+    // Offset: rewrite coords in GGA/RMC only.
+    if mode == OperatingMode::PassthroughOffset && (is_gga || is_rmc) {
+        let mut work = [0u8; 320];
+        if line.len() <= work.len() {
+            work[..line.len()].copy_from_slice(line);
+            if let Some(new_len) = nmea::rewrite_position_inplace(
+                &mut work,
+                line.len(),
+                config::offset_target::LAT_1E7,
+                config::offset_target::LON_1E7,
+                if is_gga { Some(config::offset_target::ALT_MM) } else { None },
+            ) {
+                let mut v = heapless::Vec::<u8, 1280>::new();
+                let _ = v.extend_from_slice(&work[..new_len]);
+                let _ = TX_CHANNEL.try_send(v);
+                return;
+            }
+        }
+    }
+
+    // Default: forward verbatim.
+    let mut v = heapless::Vec::<u8, 1280>::new();
+    let _ = v.extend_from_slice(line);
+    let _ = TX_CHANNEL.try_send(v);
 }
 
 // ---------------------------------------------------------------------------
