@@ -97,17 +97,90 @@ static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
 /// Set to true when the spoof-detector flagged the current position as spoofed.
 static SPOOF_DETECTED: AtomicBool = AtomicBool::new(false);
 
-/// Last-known-good coordinates — mirrored on every Normal fix. Used to
-/// freeze the output position while SPOOF_DETECTED is asserted (same pattern
-/// as the u-blox build: the drone sees coords stay put, not disappear).
+/// Last-known-good coordinates — saved on the spoof-onset edge (2 s prior
+/// fix). Drone receives these while SPOOF_DETECTED is set, same semantics
+/// as the u-blox build.
 static LAST_GOOD_LAT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 static LAST_GOOD_LON: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 static LAST_GOOD_ALT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+
+/// Timestamp (ms since boot) when spoof recovery started. 0 = not recovering.
+/// Recovery confirmed only after 5 s of clean fixes (u-blox parity).
+static SPOOF_RECOVERY_START_MS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
+/// Set when the mode flips — passthrough loop resets detector + pos_buffer
+/// + dynamic_offset so stale LAST_GOOD cannot bleed into the new mode.
+static SPOOF_DETECTOR_RESET: AtomicBool = AtomicBool::new(false);
 
 /// Detector instance — lives for the whole session, reset via `.reset()` on
 /// mode changes that would otherwise pollute its internal `LAST_GOOD`.
 static SPOOF_CELL: Mutex<CriticalSectionRawMutex, Option<spoof_detector::SpoofDetector>> =
     Mutex::new(None);
+
+// ---------------------------------------------------------------------------
+// Position history ring-buffer + dynamic-offset state (inlined from the
+// u-blox build's `passthrough::PositionBuffer` / `DynamicOffset`, which live
+// in a UBX-only module we don't pull into this crate).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Default)]
+struct PositionEntry {
+    lat: i32,
+    lon: i32,
+    alt: i32,
+    ts_ms: u32,
+}
+
+struct PositionBuffer {
+    entries: [PositionEntry; 15], // 3 s @ 5 Hz, matches u-blox
+    write_idx: usize,
+    count: usize,
+}
+
+impl PositionBuffer {
+    const fn new() -> Self {
+        Self {
+            entries: [PositionEntry { lat: 0, lon: 0, alt: 0, ts_ms: 0 }; 15],
+            write_idx: 0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, lat: i32, lon: i32, alt: i32, ts_ms: u32) {
+        self.entries[self.write_idx] = PositionEntry { lat, lon, alt, ts_ms };
+        self.write_idx = (self.write_idx + 1) % 15;
+        if self.count < 15 {
+            self.count += 1;
+        }
+    }
+
+    fn get_position_at(&self, seconds_ago: u32, now_ms: u32) -> Option<(i32, i32, i32)> {
+        if self.count == 0 {
+            return None;
+        }
+        let target = now_ms.wrapping_sub(seconds_ago * 1000);
+        let mut best = 0usize;
+        let mut best_diff = u32::MAX;
+        for i in 0..self.count {
+            let idx = (self.write_idx + 15 - 1 - i) % 15;
+            let e = &self.entries[idx];
+            let diff = e.ts_ms.abs_diff(target);
+            if diff < best_diff {
+                best_diff = diff;
+                best = idx;
+            }
+        }
+        let e = &self.entries[best];
+        Some((e.lat, e.lon, e.alt))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DynamicOffset {
+    lat_1e7: i32,
+    lon_1e7: i32,
+    alt_mm: i32,
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -466,22 +539,35 @@ async fn passthrough_forward_task() {
     let mut in_sentence = false;
     let mut last_mode = OperatingMode::load();
 
+    // Lazy — created on first entry into Passthrough/PassthroughOffset.
+    let mut pos_buffer: Option<PositionBuffer> = None;
+    let mut dynamic_offset: Option<DynamicOffset> = None;
+
     loop {
         let chunk = RAW_RX_CHANNEL.receive().await;
         let mode = OperatingMode::load();
 
-        // Reset assembler + detector when the operator flips modes, so
-        // stale LAST_GOOD data cannot trigger false positives.
+        // Mode change → cause a full reset on the next detector tick.
         if mode != last_mode {
+            SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
+            last_mode = mode;
+        }
+
+        // Process the reset flag (also set explicitly by the button task).
+        if SPOOF_DETECTOR_RESET.swap(false, Ordering::AcqRel) {
             asm = nmea::LineAssembler::new();
             pass_buf.clear();
             in_sentence = false;
             SPOOF_DETECTED.store(false, Ordering::Release);
+            SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+            dynamic_offset = None;
+            if let Some(ref mut pb) = pos_buffer {
+                *pb = PositionBuffer::new();
+            }
             let mut d = SPOOF_CELL.lock().await;
             if let Some(ref mut det) = *d {
                 *det = spoof_detector::SpoofDetector::default();
             }
-            last_mode = mode;
         }
 
         match mode {
@@ -489,16 +575,19 @@ async fn passthrough_forward_task() {
                 // Drop incoming chip bytes while we are emitting our own.
             }
             OperatingMode::PassthroughRaw => {
-                // Byte-for-byte forward, no inspection.
                 let mut v = heapless::Vec::<u8, 1280>::new();
                 let _ = v.extend_from_slice(&chunk);
                 let _ = TX_CHANNEL.try_send(v);
             }
             OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
+                // Lazy init on first entry.
+                if pos_buffer.is_none() {
+                    pos_buffer = Some(PositionBuffer::new());
+                }
+                let apply_offset = mode == OperatingMode::PassthroughOffset;
+
                 for &b in chunk.iter() {
-                    // Non-NMEA bytes (RTCM payload, noise) pass through directly.
                     if !in_sentence && b != b'$' {
-                        // batch pass-through bytes into 256-byte TX frames
                         if pass_buf.push(b).is_err() {
                             let mut v = heapless::Vec::<u8, 1280>::new();
                             let _ = v.extend_from_slice(&pass_buf);
@@ -508,7 +597,6 @@ async fn passthrough_forward_task() {
                         }
                         continue;
                     }
-                    // Flush any queued pass-through bytes before we start on NMEA.
                     if b == b'$' && !pass_buf.is_empty() {
                         let mut v = heapless::Vec::<u8, 1280>::new();
                         let _ = v.extend_from_slice(&pass_buf);
@@ -519,7 +607,12 @@ async fn passthrough_forward_task() {
 
                     if let Some(line) = asm.feed(b) {
                         in_sentence = false;
-                        process_nmea_line(line, mode).await;
+                        process_nmea_line(
+                            line,
+                            apply_offset,
+                            pos_buffer.as_mut().unwrap(),
+                            &mut dynamic_offset,
+                        ).await;
                     }
                 }
             }
@@ -527,48 +620,89 @@ async fn passthrough_forward_task() {
     }
 }
 
-async fn process_nmea_line(line: &[u8], mode: OperatingMode) {
+/// Port of the u-blox `gnss_processing_task` NAV-PVT branch to NMEA.
+/// Mirror for mirror:
+///   - Only GGA feeds the detector (it carries lat/lon/alt/nsats like NAV-PVT).
+///   - RMC is a coordinate-only duplicate; we rewrite it but never analyse it.
+///   - PositionBuffer stores 3 s of 3D-fix history, used to look up the
+///     "good" position 2 s before the spoof edge.
+///   - 5 s recovery timer before clearing SPOOF_DETECTED.
+///   - Dynamic offset computed once at the first valid fix; never recomputed.
+///   - While in PassthroughOffset with the offset still unknown, coordinate-
+///     carrying messages are **suppressed** (not forwarded) to avoid leaking
+///     the real position. Non-coordinate messages (GSA/GSV/VTG/…) pass.
+async fn process_nmea_line(
+    line: &[u8],
+    apply_offset: bool,
+    pos_buffer: &mut PositionBuffer,
+    dynamic_offset: &mut Option<DynamicOffset>,
+) {
     use unicore::nmea;
 
+    let now_ms = embassy_time::Instant::now().as_millis() as u32;
     let is_gga = line.len() >= 6 && &line[3..6] == b"GGA";
     let is_rmc = line.len() >= 6 && &line[3..6] == b"RMC";
 
-    // Try to extract a position from GGA / RMC and feed the detector.
-    let fix = if is_gga { nmea::parse_gga(line) }
-        else if is_rmc { nmea::parse_rmc(line) }
-        else { None };
+    // --- Detector + pos_buffer: GGA only -------------------------------------
+    if is_gga {
+        if let Some(fix) = nmea::parse_gga(line) {
+            if fix.checksum_ok && fix.fix_quality > 0 {
+                // Store only valid 3D-fix samples (u-blox parity: skip no-fix).
+                pos_buffer.push(fix.lat_1e7, fix.lon_1e7, fix.alt_mm, now_ms);
 
-    if let Some(fix) = fix {
-        if fix.checksum_ok && fix.fix_quality > 0 {
-            let pos = spoof_detector::Position {
-                lat: fix.lat_1e7,
-                lon: fix.lon_1e7,
-                alt_mm: fix.alt_mm,
-                time_ms: embassy_time::Instant::now().as_millis() as u32,
-                fix_type: spoof_detector::FixType::Fix3D,
-                h_acc_mm: 0,
-                num_sv: fix.nsats,
-                pdop: 0,
-                gnss_time: None,
-                cno_values: heapless::Vec::new(),
-            };
-            let mut d = SPOOF_CELL.lock().await;
-            if let Some(ref mut det) = *d {
-                match det.analyze(pos) {
-                    spoof_detector::AnalysisResult::Normal => {
-                        // Fresh trustworthy position — save as last-good.
-                        LAST_GOOD_LAT.store(fix.lat_1e7, Ordering::Release);
-                        LAST_GOOD_LON.store(fix.lon_1e7, Ordering::Release);
-                        if is_gga && fix.alt_mm != 0 {
-                            LAST_GOOD_ALT.store(fix.alt_mm, Ordering::Release);
+                let pos = spoof_detector::Position {
+                    lat: fix.lat_1e7,
+                    lon: fix.lon_1e7,
+                    alt_mm: fix.alt_mm,
+                    time_ms: now_ms,
+                    fix_type: spoof_detector::FixType::Fix3D,
+                    h_acc_mm: 0,
+                    num_sv: fix.nsats,
+                    pdop: 100,
+                    gnss_time: None,
+                    cno_values: heapless::Vec::new(),
+                };
+
+                let mut d = SPOOF_CELL.lock().await;
+                if let Some(ref mut det) = *d {
+                    let result = det.analyze(pos);
+                    let was_spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
+                    let is_spoofed = result == spoof_detector::AnalysisResult::Spoofed;
+
+                    if is_spoofed && !was_spoofed {
+                        // Edge: capture the position from 2 s ago as LAST_GOOD.
+                        if let Some((gl, go, ga)) = pos_buffer.get_position_at(2, now_ms) {
+                            LAST_GOOD_LAT.store(gl, Ordering::Release);
+                            LAST_GOOD_LON.store(go, Ordering::Release);
+                            LAST_GOOD_ALT.store(ga, Ordering::Release);
                         }
-                        SPOOF_DETECTED.store(false, Ordering::Release);
-                    }
-                    spoof_detector::AnalysisResult::Spoofed => {
                         SPOOF_DETECTED.store(true, Ordering::Release);
+                        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                    } else if !is_spoofed && was_spoofed {
+                        let start = SPOOF_RECOVERY_START_MS.load(Ordering::Acquire);
+                        if start == 0 {
+                            SPOOF_RECOVERY_START_MS.store(now_ms, Ordering::Release);
+                        } else {
+                            let elapsed = now_ms.wrapping_sub(start);
+                            if elapsed >= 5000 {
+                                SPOOF_DETECTED.store(false, Ordering::Release);
+                                SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                                // dynamic_offset stays — computed once at takeoff,
+                                // must remain constant for the whole flight.
+                            }
+                        }
+                    } else if is_spoofed {
+                        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                     }
-                    // Initializing / GapReset — don't touch the flag.
-                    _ => {}
+                }
+
+                // Compute dynamic offset at first real 3D fix (Offset mode only).
+                if apply_offset && dynamic_offset.is_none() && fix.nsats >= 4 {
+                    *dynamic_offset = Some(DynamicOffset {
+                        lat_1e7: config::offset_target::LAT_1E7.saturating_sub(fix.lat_1e7),
+                        lon_1e7: config::offset_target::LON_1E7.saturating_sub(fix.lon_1e7),
+                        alt_mm:  config::offset_target::ALT_MM.saturating_sub(fix.alt_mm),
+                    });
                 }
             }
         }
@@ -576,44 +710,66 @@ async fn process_nmea_line(line: &[u8], mode: OperatingMode) {
 
     let spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
 
-    // Decide the target position to inject into GGA/RMC:
-    //   - spoofed            → LAST_GOOD (frozen, drone keeps "flying" in place)
-    //   - PassthroughOffset  → offset_target (static redirect)
-    //   - otherwise          → no rewrite, forward verbatim.
-    let rewrite_position = match (spoofed, mode) {
-        (true, _) => Some((
-            LAST_GOOD_LAT.load(Ordering::Acquire),
-            LAST_GOOD_LON.load(Ordering::Acquire),
-            LAST_GOOD_ALT.load(Ordering::Acquire),
-        )),
-        (false, OperatingMode::PassthroughOffset) => Some((
-            config::offset_target::LAT_1E7,
-            config::offset_target::LON_1E7,
-            config::offset_target::ALT_MM,
-        )),
-        _ => None,
-    };
+    // --- Decide what coords to emit in GGA/RMC -------------------------------
+    //
+    //   spoofed           → LAST_GOOD (+ offset in PassthroughOffset)
+    //   !spoofed, Offset  → actual + offset   (suppress if offset not computed)
+    //   !spoofed, plain   → verbatim
+    //
+    if is_gga || is_rmc {
+        let coords: Option<(i32, i32, i32)> = if spoofed {
+            let base = (
+                LAST_GOOD_LAT.load(Ordering::Acquire),
+                LAST_GOOD_LON.load(Ordering::Acquire),
+                LAST_GOOD_ALT.load(Ordering::Acquire),
+            );
+            if let Some(ref off) = *dynamic_offset {
+                Some((
+                    base.0.saturating_add(off.lat_1e7),
+                    base.1.saturating_add(off.lon_1e7),
+                    base.2.saturating_add(off.alt_mm),
+                ))
+            } else {
+                Some(base)
+            }
+        } else if apply_offset {
+            match (*dynamic_offset, nmea::parse_gga(line).or_else(|| nmea::parse_rmc(line))) {
+                (Some(off), Some(fix)) if fix.checksum_ok => Some((
+                    fix.lat_1e7.saturating_add(off.lat_1e7),
+                    fix.lon_1e7.saturating_add(off.lon_1e7),
+                    fix.alt_mm.saturating_add(off.alt_mm),
+                )),
+                (None, _) => {
+                    // Offset not yet computed — suppress, don't leak real position.
+                    return;
+                }
+                _ => None, // parse failure or CS fail → forward verbatim
+            }
+        } else {
+            None // plain Passthrough: forward as-is
+        };
 
-    if let (Some((lat, lon, alt)), true) = (rewrite_position, is_gga || is_rmc) {
-        let mut work = [0u8; 320];
-        if line.len() <= work.len() {
-            work[..line.len()].copy_from_slice(line);
-            if let Some(new_len) = nmea::rewrite_position_inplace(
-                &mut work,
-                line.len(),
-                lat,
-                lon,
-                if is_gga { Some(alt) } else { None },
-            ) {
-                let mut v = heapless::Vec::<u8, 1280>::new();
-                let _ = v.extend_from_slice(&work[..new_len]);
-                let _ = TX_CHANNEL.try_send(v);
-                return;
+        if let Some((lat, lon, alt)) = coords {
+            let mut work = [0u8; 320];
+            if line.len() <= work.len() {
+                work[..line.len()].copy_from_slice(line);
+                if let Some(new_len) = nmea::rewrite_position_inplace(
+                    &mut work,
+                    line.len(),
+                    lat,
+                    lon,
+                    if is_gga { Some(alt) } else { None },
+                ) {
+                    let mut v = heapless::Vec::<u8, 1280>::new();
+                    let _ = v.extend_from_slice(&work[..new_len]);
+                    let _ = TX_CHANNEL.try_send(v);
+                    return;
+                }
             }
         }
     }
 
-    // Default: forward verbatim.
+    // Non-GGA/RMC, or rewrite skipped — forward verbatim.
     let mut v = heapless::Vec::<u8, 1280>::new();
     let _ = v.extend_from_slice(line);
     let _ = TX_CHANNEL.try_send(v);
@@ -900,6 +1056,7 @@ async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
                 let current = OperatingMode::load();
                 if new_mode != current {
                     new_mode.store();
+                    SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
                     let mut flash = flash.lock().await;
                     flash_storage::save_mode(&mut flash, new_mode as u8).await;
                     info!("Mode: {:?} → {:?}", current, new_mode);
