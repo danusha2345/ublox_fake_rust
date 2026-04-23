@@ -118,15 +118,16 @@ pub fn parse_command(line: &[u8]) -> Result<Command<'_>, ParseError> {
             };
             Ok(Command::CfgMsg { class, id, rate })
         }
-        b"CFGNAV" => {
-            if args.len() != 3 {
-                return Err(ParseError::Malformed);
+        b"CFGNAV" => match args.len() {
+            0 => Ok(Command::CfgNav { meas_rate: 0, nav_rate: 0, dr_nav_rate: 0 }),
+            3 => {
+                let a = parse_dec_u32(args[0]).ok_or(ParseError::Malformed)?;
+                let b = parse_dec_u32(args[1]).ok_or(ParseError::Malformed)?;
+                let c = parse_dec_u32(args[2]).ok_or(ParseError::Malformed)?;
+                Ok(Command::CfgNav { meas_rate: a, nav_rate: b, dr_nav_rate: c })
             }
-            let a = parse_dec_u32(args[0]).ok_or(ParseError::Malformed)?;
-            let b = parse_dec_u32(args[1]).ok_or(ParseError::Malformed)?;
-            let c = parse_dec_u32(args[2]).ok_or(ParseError::Malformed)?;
-            Ok(Command::CfgNav { meas_rate: a, nav_rate: b, dr_nav_rate: c })
-        }
+            _ => Err(ParseError::Malformed),
+        },
         b"CFGKEY" => Ok(Command::CfgKey),
         b"CFGSAVE" => Ok(Command::CfgSave),
         b"CFGCLR" => Ok(Command::CfgClr),
@@ -183,9 +184,24 @@ pub const PDTINFO_REPLY: &[u8] =
 /// (L1+L5 dual-band across GPS/BDS/GLO/GAL/QZSS).
 pub const CFGSYS_DEFAULT_REPLY: &[u8] = b"$CFGSYS,H55155*4E\r\n";
 
-/// `$CFGKEY,...` — factory key as observed in production.
+/// `$CFGKEY,...` — factory key, byte-exact from live chip probe 2026-04-23.
 pub const CFGKEY_REPLY: &[u8] =
-    b"$CFGKEY,,6adae970f433a1c9c55f3bd7092b1400f40dddc4c715c39a5aed529158f00101010101010101010101010101010101010101,D0645C*3B\r\n";
+    b"$CFGKEY,,6adae970f433a1c9c55f3bd7092b1400f40dddc4c715c39a5aed529158f0010101010101010101010101010101010101,D0645C*3B\r\n";
+
+/// `$PRODUCTINFO,...*cs\r\n` — extended identity reply. Adds protocol
+/// version (PTV=1.1) + 4 reserved fields after the $PDTINFO payload.
+pub const PRODUCTINFO_REPLY: &[u8] =
+    b"$PRODUCTINFO,UC6580I-00,G1B1L1E1,V00,R6.1.1.1Build9074,2400615000514,20250427080308004,1.1,,,,*44\r\n";
+
+/// `$CFGNAV,200,200,0*07\r\n` — navigation rate reply (5 Hz, no DR).
+pub const CFGNAV_DEFAULT_REPLY: &[u8] = b"$CFGNAV,200,200,0*07\r\n";
+
+/// `$GNTXT,01,01,00,CFGSYS*4A\r\n` — pre-ACK emitted by the real chip
+/// *before* the `$CFGSYS` value on a GET request.
+pub const CFGSYS_PREACK: &[u8] = b"$GNTXT,01,01,00,CFGSYS*4A\r\n";
+
+/// `$GNTXT,01,01,00,CFGNAV*4A\r\n` — pre-ACK for `$CFGNAV` GET.
+pub const CFGNAV_PREACK: &[u8] = b"$GNTXT,01,01,00,CFGNAV*4A\r\n";
 
 /// Generic `$OK*04\r\n` success reply.
 pub const OK_REPLY: &[u8] = b"$OK*04\r\n";
@@ -218,6 +234,23 @@ pub fn reply_cfgsys_default(buf: &mut [u8]) -> usize {
 /// Emit the canned CFGKEY reply.
 pub fn reply_cfgkey(buf: &mut [u8]) -> usize {
     copy_to(buf, CFGKEY_REPLY)
+}
+
+/// Emit the canned PRODUCTINFO reply.
+pub fn reply_productinfo(buf: &mut [u8]) -> usize {
+    copy_to(buf, PRODUCTINFO_REPLY)
+}
+
+/// Emit the canned CFGNAV GET reply.
+pub fn reply_cfgnav_default(buf: &mut [u8]) -> usize {
+    copy_to(buf, CFGNAV_DEFAULT_REPLY)
+}
+
+/// Emit `$GNTXT,01,01,00,<name>*cs` pre-ACK for a GET command.
+/// `name` is the command name without `$`, e.g. `b"CFGSYS"`.
+pub fn reply_preack(buf: &mut [u8], name: &[u8]) -> usize {
+    // Reuse build_gntxt to keep the CS in sync with the echoed command.
+    nmea::build_gntxt(buf, 1, 1, 0, name)
 }
 
 /// Emit `$OK*04\r\n`.
@@ -369,5 +402,54 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = reply_gntxt_ack(&mut buf, b"PDTINFO");
         assert_eq!(&buf[..n], b"$GNTXT,01,01,00,PDTINFO*1F\r\n");
+    }
+
+    // ---- bit-exact checks against live chip replies captured 2026-04-23 ----
+
+    #[test]
+    fn cfgsys_reply_bitexact_live() {
+        assert_eq!(CFGSYS_DEFAULT_REPLY, b"$CFGSYS,H55155*4E\r\n");
+        assert!(nmea::verify_sentence(CFGSYS_DEFAULT_REPLY));
+    }
+
+    #[test]
+    fn cfgsys_preack_bitexact_live() {
+        assert_eq!(CFGSYS_PREACK, b"$GNTXT,01,01,00,CFGSYS*4A\r\n");
+        assert!(nmea::verify_sentence(CFGSYS_PREACK));
+    }
+
+    #[test]
+    fn cfgnav_reply_bitexact_live() {
+        assert_eq!(CFGNAV_DEFAULT_REPLY, b"$CFGNAV,200,200,0*07\r\n");
+        assert!(nmea::verify_sentence(CFGNAV_DEFAULT_REPLY));
+    }
+
+    #[test]
+    fn cfgnav_preack_bitexact_live() {
+        assert_eq!(CFGNAV_PREACK, b"$GNTXT,01,01,00,CFGNAV*4A\r\n");
+        assert!(nmea::verify_sentence(CFGNAV_PREACK));
+    }
+
+    #[test]
+    fn productinfo_reply_bitexact_live() {
+        let expected = b"$PRODUCTINFO,UC6580I-00,G1B1L1E1,V00,R6.1.1.1Build9074,2400615000514,20250427080308004,1.1,,,,*44\r\n";
+        assert_eq!(PRODUCTINFO_REPLY, expected);
+        assert!(nmea::verify_sentence(PRODUCTINFO_REPLY));
+    }
+
+    #[test]
+    fn cfgkey_reply_bitexact_live() {
+        // Exact bytes captured from live UC6580I chip on 2026-04-23.
+        let expected = b"$CFGKEY,,6adae970f433a1c9c55f3bd7092b1400f40dddc4c715c39a5aed529158f0010101010101010101010101010101010101,D0645C*3B\r\n";
+        assert_eq!(CFGKEY_REPLY, expected);
+        assert!(nmea::verify_sentence(CFGKEY_REPLY));
+    }
+
+    #[test]
+    fn parse_cfgnav_get_form() {
+        assert_eq!(
+            parse_command(b"$CFGNAV\r\n").unwrap(),
+            Command::CfgNav { meas_rate: 0, nav_rate: 0, dr_nav_rate: 0 }
+        );
     }
 }

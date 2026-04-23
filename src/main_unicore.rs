@@ -229,8 +229,9 @@ async fn uart0_rx_task(mut rx: BufferedUartRx) {
 
 async fn handle_command(line: &[u8]) {
     use unicore::cmd::{
-        parse_command, reply_cfgkey, reply_cfgsys_default, reply_fail, reply_gntxt_ack, reply_ok,
-        reply_pdtinfo, Command, ParseError,
+        parse_command, reply_cfgkey, reply_cfgnav_default, reply_cfgsys_default, reply_fail,
+        reply_gntxt_ack, reply_ok, reply_pdtinfo, reply_productinfo, CFGNAV_PREACK, CFGSYS_PREACK,
+        Command, ParseError,
     };
 
     let mut scratch = [0u8; 256];
@@ -266,15 +267,29 @@ async fn handle_command(line: &[u8]) {
 
     match cmd {
         Command::PdtInfo => {
+            // Real chip emits no $GNTXT pre-ACK for $PDTINFO.
             let n = reply_pdtinfo(&mut scratch); enqueue(&scratch[..n]);
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
+        Command::ProductInfo => {
+            // Real chip emits no $GNTXT pre-ACK for $PRODUCTINFO either.
+            let n = reply_productinfo(&mut scratch); enqueue(&scratch[..n]);
+            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+        }
         Command::CfgSys(None) => {
+            enqueue(CFGSYS_PREACK);
             let n = reply_cfgsys_default(&mut scratch); enqueue(&scratch[..n]);
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
+        Command::CfgNav { meas_rate: 0, nav_rate: 0, dr_nav_rate: 0 } => {
+            enqueue(CFGNAV_PREACK);
+            let n = reply_cfgnav_default(&mut scratch); enqueue(&scratch[..n]);
+            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+        }
         Command::CfgKey => {
+            // No pre-ACK for $CFGKEY (verified on live chip).
             let n = reply_cfgkey(&mut scratch); enqueue(&scratch[..n]);
+            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
         _ => {
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
