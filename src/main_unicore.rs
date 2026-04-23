@@ -717,6 +717,7 @@ async fn process_nmea_line(
     //   !spoofed, plain   → verbatim
     //
     if is_gga || is_rmc {
+        // Determine target coordinates for this message.
         let coords: Option<(i32, i32, i32)> = if spoofed {
             let base = (
                 LAST_GOOD_LAT.load(Ordering::Acquire),
@@ -743,13 +744,61 @@ async fn process_nmea_line(
                     // Offset not yet computed — suppress, don't leak real position.
                     return;
                 }
-                _ => None, // parse failure or CS fail → forward verbatim
+                _ => None,
             }
         } else {
-            None // plain Passthrough: forward as-is
+            None // plain Passthrough: forward verbatim
         };
 
         if let Some((lat, lon, alt)) = coords {
+            // u-blox parity: under spoof, rebuild GGA/RMC with degraded status
+            //   GGA: fix_quality=0, nsats=92 (spoof marker), hdop high
+            //   RMC: status='V' invalid, sog/cog=0, mode='N'
+            // Coordinates still come out as LAST_GOOD(+offset) so the drone sees
+            // a "last-known position, fix lost" state and enters failsafe.
+            if spoofed {
+                let mut buf = [0u8; 256];
+                if is_gga {
+                    let existing = nmea::parse_gga(line).unwrap_or_default();
+                    let g = nmea::GgaFields {
+                        time: existing.time,
+                        lat_1e7: lat, lon_1e7: lon,
+                        fix_quality: 0,
+                        nsats: 92,
+                        hdop_x100: 9999,
+                        alt_mm: alt,
+                        geoid_sep_mm: -30_000,
+                    };
+                    let n = nmea::build_gga(&mut buf, nmea::Talker::Gn, &g);
+                    if n > 0 {
+                        let mut v = heapless::Vec::<u8, 1280>::new();
+                        let _ = v.extend_from_slice(&buf[..n]);
+                        let _ = TX_CHANNEL.try_send(v);
+                    }
+                    return;
+                }
+                if is_rmc {
+                    let existing = nmea::parse_rmc(line).unwrap_or_default();
+                    let r = nmea::RmcFields {
+                        time: existing.time,
+                        valid: false,
+                        lat_1e7: lat, lon_1e7: lon,
+                        sog_knots_x1000: 0,
+                        cog_deg_x100: 0,
+                        date: existing.date,
+                        mode: b'N',
+                    };
+                    let n = nmea::build_rmc(&mut buf, nmea::Talker::Gn, &r);
+                    if n > 0 {
+                        let mut v = heapless::Vec::<u8, 1280>::new();
+                        let _ = v.extend_from_slice(&buf[..n]);
+                        let _ = TX_CHANNEL.try_send(v);
+                    }
+                    return;
+                }
+            }
+
+            // Non-spoof: plain coordinate rewrite (offset mode).
             let mut work = [0u8; 320];
             if line.len() <= work.len() {
                 work[..line.len()].copy_from_slice(line);

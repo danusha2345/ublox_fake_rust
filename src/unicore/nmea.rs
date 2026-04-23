@@ -727,6 +727,8 @@ pub struct NmeaFix {
     pub fix_quality: u8,
     pub nsats: u8,
     pub time: NmeaTime,
+    /// Populated by RMC parser only (GGA carries no date).
+    pub date: NmeaDate,
     /// `true` only if the sentence's own checksum validated.
     pub checksum_ok: bool,
 }
@@ -808,6 +810,9 @@ fn parse_position(line: &[u8], kind: SentenceKind) -> Option<NmeaFix> {
             out.fix_quality = if fields[2] == b"A" { 1 } else { 0 };
             out.lat_1e7 = parse_lat(fields[3], fields[4]).unwrap_or(0);
             out.lon_1e7 = parse_lon(fields[5], fields[6]).unwrap_or(0);
+            if count > 9 {
+                out.date = parse_date(fields[9]).unwrap_or_default();
+            }
         }
     }
     Some(out)
@@ -832,6 +837,15 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
         v = v.checked_mul(10)?.checked_add((c - b'0') as u32)?;
     }
     Some(v)
+}
+
+fn parse_date(s: &[u8]) -> Option<NmeaDate> {
+    if s.len() < 6 { return None; }
+    let day = parse_u8(&s[0..2])?;
+    let month = parse_u8(&s[2..4])?;
+    let yy = parse_u8(&s[4..6])? as u16;
+    // RMC date field is yy; expand to 4-digit year (20yy).
+    Some(NmeaDate { day, month, year: 2000 + yy })
 }
 
 fn parse_time(s: &[u8]) -> Option<NmeaTime> {
