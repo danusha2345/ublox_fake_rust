@@ -57,6 +57,14 @@ pub const FRAME_MSG_1046: &[u8] = &[
     0xFC, 0x04, 0x10, 0x10, 0x05, 0x00, 0x8E, 0xD8, 0x46,
 ];
 
+/// System Parameters — 44-byte frame.
+pub const FRAME_MSG_1013: &[u8] = &[
+    0xD3, 0x00, 0x26, 0x3F, 0x50, 0x00, 0xED, 0x9F, 0x15, 0x99, 0x18, 0x49,
+    0x0D, 0x40, 0x00, 0x47, 0xF6, 0x00, 0x02, 0x8B, 0x30, 0x00, 0x14, 0x35,
+    0x00, 0x00, 0x91, 0x9C, 0x00, 0x04, 0x82, 0x40, 0x00, 0x24, 0x49, 0x00,
+    0x01, 0x20, 0xB0, 0x00, 0x08, 0x64, 0x37, 0x13,
+];
+
 /// Galileo MSM7 — 115-byte frame.
 pub const FRAME_MSG_1097: &[u8] = &[
     0xD3, 0x00, 0x6D, 0x44, 0x90, 0x00, 0x54, 0xFC, 0x6E, 0xE0, 0x00, 0x00,
@@ -82,6 +90,11 @@ pub const PPS_INFO_SAMPLE: &[u8] =
 pub const SVEPH_SAMPLE: &[u8] =
     b"$SVEPH_164,18,414000D300000070,20755D19,00405F06\r\n";
 
+/// `$CWOUT` — proprietary continuous-wave / AGC info, emits at ~1 Hz when
+/// the chip has a fix. Captured from live chip on 2026-04-23.
+pub const CW_OUT_SAMPLE: &[u8] =
+    b"$CWOUT,1,0,0,0,0,0,0,1169998,-113*6E\r\n";
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -101,4 +114,11 @@ mod tests {
     #[test] fn msg_1019_crc_ok()  { assert_rtcm_valid(FRAME_MSG_1019, 1019); }
     #[test] fn msg_1046_crc_ok()  { assert_rtcm_valid(FRAME_MSG_1046, 1046); }
     #[test] fn msg_1097_crc_ok()  { assert_rtcm_valid(FRAME_MSG_1097, 1097); }
+    #[test] fn msg_1013_crc_ok()  { assert_rtcm_valid(FRAME_MSG_1013, 1013); }
+
+    #[test]
+    fn cwout_sample_nmea_cs_ok() {
+        use super::super::nmea;
+        assert!(nmea::verify_sentence(CW_OUT_SAMPLE));
+    }
 }

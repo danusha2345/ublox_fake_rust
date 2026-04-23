@@ -229,9 +229,9 @@ async fn uart0_rx_task(mut rx: BufferedUartRx) {
 
 async fn handle_command(line: &[u8]) {
     use unicore::cmd::{
-        parse_command, reply_cfgkey, reply_cfgnav_default, reply_cfgsys_default, reply_fail,
-        reply_gntxt_ack, reply_ok, reply_pdtinfo, reply_productinfo, CFGNAV_PREACK, CFGSYS_PREACK,
-        Command, ParseError,
+        build_cfgmsg_reply, is_known_cfgmsg, parse_command, reply_cfgkey, reply_cfgnav_default,
+        reply_cfgsys_default, reply_fail, reply_gntxt_ack, reply_ok, reply_pdtinfo,
+        reply_productinfo, CFGNAV_PREACK, CFGSYS_PREACK, Command, ParseError,
     };
 
     // Full echo body (between `$` and trailing \r\n, INCLUDING *HH if present).
@@ -312,7 +312,25 @@ async fn handle_command(line: &[u8]) {
             let n = reply_cfgkey(&mut scratch); enqueue(&scratch[..n]);
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
-        // Remaining SET-ish commands (CFGMSG with rate, CFGSAVE, CFGCLR, CFGSYS with mask, etc.)
+        Command::CfgMsg { class, id, rate: None } => {
+            // GET: $GNTXT echo + $CFGMSG,c,i,1*cs + $OK
+            let n = reply_gntxt_ack(&mut scratch, echo_clean);
+            if n > 0 { enqueue(&scratch[..n]); }
+            let n = build_cfgmsg_reply(&mut scratch, class, id, 1);
+            if n > 0 { enqueue(&scratch[..n]); }
+            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+        }
+        Command::CfgMsg { class, id, rate: Some(_) } => {
+            // SET: echo + ($OK if known pair, $FAIL,0 if not)
+            let n = reply_gntxt_ack(&mut scratch, echo_clean);
+            if n > 0 { enqueue(&scratch[..n]); }
+            if is_known_cfgmsg(class, id) {
+                let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
+            } else {
+                let n = reply_fail(&mut scratch, 0); enqueue(&scratch[..n]);
+            }
+        }
+        // Remaining SET-ish commands (CFGSAVE, CFGCLR, CFGSYS with mask, etc.)
         // — echo in $GNTXT then $OK.
         _ => {
             let n = reply_gntxt_ack(&mut scratch, echo_clean);
@@ -490,6 +508,8 @@ async fn emulation_task() {
         if counter % 3 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1097); } // ≈1.7 Hz
         if counter % 3 == 1 { enqueue(unicore::rtcm_samples::FRAME_MSG_1019); } // ≈1.7 Hz
         if counter % 8 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1046); } // ≈0.6 Hz
+        if counter % 5 == 2 { enqueue(unicore::rtcm_samples::FRAME_MSG_1013); } // ≈1 Hz
+        if counter % 5 == 3 { enqueue(unicore::rtcm_samples::CW_OUT_SAMPLE);  } // ≈1 Hz
 
         // Extended RTCM 4074 status bundle — ≈1 Hz.
         if counter % 5 == 0 {

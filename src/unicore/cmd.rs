@@ -253,6 +253,54 @@ pub fn reply_preack(buf: &mut [u8], name: &[u8]) -> usize {
     nmea::build_gntxt(buf, 1, 1, 0, name)
 }
 
+/// Build `$CFGMSG,<class>,<id>,<rate>*cs\r\n` — used as the GET reply for
+/// `$CFGMSG,class,id`. Returns bytes written, 0 on overflow.
+pub fn build_cfgmsg_reply(buf: &mut [u8], class: u8, id: u8, rate: u8) -> usize {
+    // Body: "CFGMSG,<class>,<id>,<rate>" with `class`/`id`/`rate` in decimal.
+    fn write_u32(buf: &mut [u8], mut pos: usize, mut v: u32) -> usize {
+        let mut tmp = [0u8; 10]; let mut n = 0;
+        if v == 0 { tmp[0] = b'0'; n = 1; }
+        while v > 0 { tmp[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+        if pos + n > buf.len() { return 0; }
+        for i in 0..n { buf[pos + i] = tmp[n - 1 - i]; }
+        pos += n;
+        pos
+    }
+    if buf.len() < 32 { return 0; }
+    let mut p = 0;
+    buf[p] = b'$'; p += 1;
+    for &b in b"CFGMSG," { buf[p] = b; p += 1; }
+    p = write_u32(buf, p, class as u32); if p == 0 { return 0; }
+    buf[p] = b','; p += 1;
+    p = write_u32(buf, p, id as u32); if p == 0 { return 0; }
+    buf[p] = b','; p += 1;
+    p = write_u32(buf, p, rate as u32); if p == 0 { return 0; }
+    // Checksum over body
+    let cs = nmea::nmea_checksum(&buf[1..p]);
+    buf[p] = b'*'; p += 1;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    buf[p] = HEX[(cs >> 4) as usize]; p += 1;
+    buf[p] = HEX[(cs & 0x0F) as usize]; p += 1;
+    buf[p] = b'\r'; p += 1;
+    buf[p] = b'\n'; p += 1;
+    p
+}
+
+/// Known `$CFGMSG,class,id` pairs observed on live UC6580I (2026-04-23).
+/// Unknown pairs are rejected with `$FAIL,0` by the real chip.
+pub fn is_known_cfgmsg(class: u8, id: u8) -> bool {
+    matches!((class, id),
+        // Standard NMEA
+        (0, 0..=8) |
+        // RTCM 3 standard
+        (2, 3) | (2, 4) | (2, 5) | (2, 14) |
+        // ExtRTCM 4074 (empirically-verified mapping)
+        (9, 1) | (9, 2) | (9, 3) | (9, 4) |
+        (9, 7) | (9, 8) | (9, 9) |
+        (9, 11) | (9, 12) |
+        (9, 15) | (9, 16))
+}
+
 /// Emit `$OK*04\r\n`.
 pub fn reply_ok(buf: &mut [u8]) -> usize {
     copy_to(buf, OK_REPLY)
@@ -451,5 +499,34 @@ mod tests {
             parse_command(b"$CFGNAV\r\n").unwrap(),
             Command::CfgNav { meas_rate: 0, nav_rate: 0, dr_nav_rate: 0 }
         );
+    }
+
+    #[test]
+    fn cfgmsg_reply_matches_live_chip() {
+        // Live captures from UC6580I on 2026-04-23:
+        //   $CFGMSG,0,0      -> $CFGMSG,0,0,1*06
+        //   $CFGMSG,2,3      -> $CFGMSG,2,3,1*07
+        //   $CFGMSG,9,15     -> $CFGMSG,9,15,1*3B
+        let mut buf = [0u8; 32];
+        let n = build_cfgmsg_reply(&mut buf, 0, 0, 1);
+        assert_eq!(&buf[..n], b"$CFGMSG,0,0,1*06\r\n");
+        let n = build_cfgmsg_reply(&mut buf, 2, 3, 1);
+        assert_eq!(&buf[..n], b"$CFGMSG,2,3,1*07\r\n");
+        let n = build_cfgmsg_reply(&mut buf, 9, 15, 1);
+        assert_eq!(&buf[..n], b"$CFGMSG,9,15,1*3B\r\n");
+    }
+
+    #[test]
+    fn known_cfgmsg_table() {
+        // Sanity on the live-verified subset.
+        assert!(is_known_cfgmsg(0, 0));   // GGA
+        assert!(is_known_cfgmsg(0, 8));   // GBS
+        assert!(is_known_cfgmsg(2, 3));   // MSM
+        assert!(is_known_cfgmsg(9, 12));  // Sub 0x0FC
+        assert!(is_known_cfgmsg(9, 15));  // Sub 0x0E6
+        assert!(!is_known_cfgmsg(0, 99));
+        assert!(!is_known_cfgmsg(2, 0));
+        assert!(!is_known_cfgmsg(9, 0));
+        assert!(!is_known_cfgmsg(99, 0));
     }
 }
