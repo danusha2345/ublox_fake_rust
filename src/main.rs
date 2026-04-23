@@ -606,8 +606,17 @@ async fn main(spawner: Spawner) {
     {
         let mut flash = flash_mutex.lock().await;
 
+        // Detect firmware version change — on new FW, reset mode to default (PassthroughOffset)
+        let version_changed = flash_storage::load_version(&mut flash)
+            .map(|s| s.as_str() != version::FW_VERSION)
+            .unwrap_or(true);
+
         // Load operating mode
-        if let Some(mode_byte) = flash_storage::load_mode(&mut flash) {
+        if version_changed {
+            info!("New firmware version, resetting mode to PassthroughOffset");
+            OperatingMode::PassthroughOffset.store();
+            flash_storage::save_mode(&mut flash, OperatingMode::PassthroughOffset as u8).await;
+        } else if let Some(mode_byte) = flash_storage::load_mode(&mut flash) {
             let mode = match mode_byte {
                 0 => OperatingMode::Emulation,
                 1 => OperatingMode::Passthrough,
@@ -617,9 +626,8 @@ async fn main(spawner: Spawner) {
             mode.store();
             info!("Loaded mode {} from flash: {:?}", mode_byte, mode);
         } else {
-            // No saved mode, default to Passthrough
-            info!("No saved mode, defaulting to Passthrough");
-            OperatingMode::Passthrough.store();
+            info!("No saved mode, defaulting to PassthroughOffset");
+            OperatingMode::PassthroughOffset.store();
         }
 
         // Load drone model from flash (if set via button)

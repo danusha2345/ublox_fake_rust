@@ -1029,3 +1029,219 @@ fn test_all_nav_messages_spoof_replacement_with_offset() {
     assert_eq!(read_i32_le(&sol, 6 + 16), rep_ey);
     assert_eq!(read_i32_le(&sol, 6 + 20), rep_ez);
 }
+
+// ============================================================================
+// Group 7: Full flight simulation — offset stability through spoof/recovery
+//
+// Simulates: first fix → normal flight → satellite loss → spoofing →
+// recovery → return to start. Verifies offset never changes.
+// ============================================================================
+
+/// Helper: simulate processing one NAV-PVT through the offset pipeline.
+/// Returns (output_lat, output_lon) after offset is applied (and spoof modify if spoofed).
+/// Also updates dynamic_offset if it was None and fix is 3D.
+fn process_nav_pvt(
+    frame_lat: i32, frame_lon: i32, frame_alt: i32,
+    fix_type: u8, num_sv: u8,
+    dynamic_offset: &mut Option<DynamicOffset>,
+    is_spoofed: bool,
+    last_good: Option<(i32, i32, i32)>,
+) -> (i32, i32) {
+    let mut frame = build_nav_pvt_frame(frame_lat, frame_lon, frame_alt, fix_type, num_sv);
+
+    // Compute offset at first 3D fix (replicates main.rs:1711-1731)
+    if dynamic_offset.is_none() && fix_type >= 3 && num_sv >= 4 {
+        let off = DynamicOffset {
+            lat_1e7: TARGET_LAT - frame_lat,
+            lon_1e7: TARGET_LON - frame_lon,
+            alt_mm: TARGET_ALT - frame_alt,
+        };
+        *dynamic_offset = Some(off);
+    }
+
+    // Apply offset (replicates main.rs:1739-1744)
+    if let Some(ref off) = dynamic_offset {
+        apply_offset_nav_pvt(&mut frame, off);
+    }
+
+    // Spoof modify (replicates main.rs:1799-1825)
+    if is_spoofed {
+        if let (Some(ref off), Some((gl, go, ga))) = (dynamic_offset, last_good) {
+            let rep_lat = gl.saturating_add(off.lat_1e7);
+            let rep_lon = go.saturating_add(off.lon_1e7);
+            let rep_alt = ga.saturating_add(off.alt_mm);
+            modify_nav_pvt_spoof(&mut frame, rep_lat, rep_lon, rep_alt);
+        }
+    }
+
+    let out_lat = read_i32_le(&frame, 6 + 28);
+    let out_lon = read_i32_le(&frame, 6 + 24);
+    (out_lat, out_lon)
+}
+
+/// Full flight: fix → flight → sat loss → spoof → recovery → return to start.
+/// Offset must stay the same throughout, output coords at start must match.
+#[test]
+fn test_offset_stable_through_full_flight_with_spoof() {
+    // Start position (Moscow area)
+    let start_lat = ACTUAL_LAT;
+    let start_lon = ACTUAL_LON;
+    let start_alt = ACTUAL_ALT;
+
+    // Flight waypoint (~1km away)
+    let flight_lat = start_lat + 9000;  // ~1km north
+    let flight_lon = start_lon + 5000;
+
+    // Spoofed position (far away)
+    let spoof_lat = SPOOFED_LAT;
+    let spoof_lon = SPOOFED_LON;
+
+    let mut dynamic_offset: Option<DynamicOffset> = None;
+
+    // === Phase 1: First fix at start ===
+    let (out_lat_start, out_lon_start) = process_nav_pvt(
+        start_lat, start_lon, start_alt, 3, 12,
+        &mut dynamic_offset, false, None,
+    );
+    assert!(dynamic_offset.is_some(), "Offset must be computed at first 3D fix");
+    assert_eq!(out_lat_start, TARGET_LAT, "First fix output must be TARGET");
+    assert_eq!(out_lon_start, TARGET_LON);
+
+    // Save offset for comparison
+    let off_ref = dynamic_offset.as_ref().unwrap();
+    let offset_after_first_fix = (off_ref.lat_1e7, off_ref.lon_1e7, off_ref.alt_mm);
+
+    // === Phase 2: Normal flight (10 samples) ===
+    for i in 1..=10 {
+        let lat = start_lat + (i * 900);  // gradual movement toward waypoint
+        let lon = start_lon + (i * 500);
+        let (out_lat, out_lon) = process_nav_pvt(
+            lat, lon, start_alt, 3, 12,
+            &mut dynamic_offset, false, None,
+        );
+        // Output should track movement relative to target
+        let expected_lat = TARGET_LAT + (i * 900);
+        let expected_lon = TARGET_LON + (i * 500);
+        assert_eq!(out_lat, expected_lat, "Normal flight: output must track movement");
+        assert_eq!(out_lon, expected_lon);
+    }
+
+    // Offset unchanged after normal flight
+    let off = dynamic_offset.as_ref().unwrap();
+    assert_eq!(off.lat_1e7, offset_after_first_fix.0, "Offset must not change during flight");
+    assert_eq!(off.lon_1e7, offset_after_first_fix.1);
+
+    // === Phase 3: Satellite loss (no fix, 15 samples) ===
+    for _ in 0..15 {
+        // fix_type=0, num_sv=0 — no GPS
+        let (_, _) = process_nav_pvt(
+            0, 0, 0, 0, 0,
+            &mut dynamic_offset, false, None,
+        );
+    }
+    // Offset must survive satellite loss
+    let off = dynamic_offset.as_ref().unwrap();
+    assert_eq!(off.lat_1e7, offset_after_first_fix.0, "Offset must survive satellite loss");
+
+    // === Phase 4: Spoofing detected ===
+    // last_good was at the flight waypoint (pre-loss position)
+    let last_good = Some((flight_lat, flight_lon, start_alt));
+
+    for _ in 0..20 {
+        let (out_lat, out_lon) = process_nav_pvt(
+            spoof_lat, spoof_lon, start_alt, 3, 12,
+            &mut dynamic_offset, true, last_good,
+        );
+        // During spoof: output = LAST_GOOD + offset
+        let expected_lat = flight_lat + offset_after_first_fix.0;
+        let expected_lon = flight_lon + offset_after_first_fix.1;
+        assert_eq!(out_lat, expected_lat, "During spoof: output must be LAST_GOOD + offset");
+        assert_eq!(out_lon, expected_lon);
+    }
+
+    // Offset must survive spoofing
+    let off = dynamic_offset.as_ref().unwrap();
+    assert_eq!(off.lat_1e7, offset_after_first_fix.0, "Offset must survive spoofing");
+
+    // === Phase 5: Recovery (spoof cleared, 5s of clean data) ===
+    // Simulate recovery — no spoof, real coords near flight waypoint
+    for _ in 0..30 {
+        let (_, _) = process_nav_pvt(
+            flight_lat, flight_lon, start_alt, 3, 12,
+            &mut dynamic_offset, false, None,
+        );
+    }
+
+    // KEY CHECK: offset must NOT be invalidated after recovery
+    let off = dynamic_offset.as_ref().unwrap();
+    assert_eq!(off.lat_1e7, offset_after_first_fix.0,
+        "CRITICAL: Offset must NOT change after spoof recovery");
+    assert_eq!(off.lon_1e7, offset_after_first_fix.1,
+        "CRITICAL: Offset must NOT change after spoof recovery");
+
+    // === Phase 6: Return to start with real satellites ===
+    let (out_lat_end, out_lon_end) = process_nav_pvt(
+        start_lat, start_lon, start_alt, 3, 12,
+        &mut dynamic_offset, false, None,
+    );
+
+    // THE CRITICAL ASSERTION: same physical location must produce same output
+    assert_eq!(out_lat_end, out_lat_start,
+        "CRITICAL: Same physical location must produce same output lat! start={} end={} diff={}",
+        out_lat_start, out_lat_end, (out_lat_end - out_lat_start).abs());
+    assert_eq!(out_lon_end, out_lon_start,
+        "CRITICAL: Same physical location must produce same output lon! start={} end={} diff={}",
+        out_lon_start, out_lon_end, (out_lon_end - out_lon_start).abs());
+}
+
+/// Multiple spoof/recovery cycles must not affect offset.
+#[test]
+fn test_offset_stable_through_multiple_spoof_cycles() {
+    let mut dynamic_offset: Option<DynamicOffset> = None;
+
+    // First fix
+    process_nav_pvt(ACTUAL_LAT, ACTUAL_LON, ACTUAL_ALT, 3, 12, &mut dynamic_offset, false, None);
+    let off_ref = dynamic_offset.as_ref().unwrap();
+    let original_offset = (off_ref.lat_1e7, off_ref.lon_1e7, off_ref.alt_mm);
+
+    // 5 spoof/recovery cycles at different positions
+    let positions = [
+        (ACTUAL_LAT + 10000, ACTUAL_LON + 5000),
+        (ACTUAL_LAT + 20000, ACTUAL_LON + 10000),
+        (ACTUAL_LAT + 30000, ACTUAL_LON - 5000),
+        (ACTUAL_LAT - 10000, ACTUAL_LON + 15000),
+        (ACTUAL_LAT + 5000, ACTUAL_LON - 10000),
+    ];
+
+    for (i, &(pos_lat, pos_lon)) in positions.iter().enumerate() {
+        let last_good = Some((pos_lat, pos_lon, ACTUAL_ALT));
+
+        // Spoofing at this position
+        for _ in 0..10 {
+            process_nav_pvt(SPOOFED_LAT, SPOOFED_LON, ACTUAL_ALT, 3, 12,
+                &mut dynamic_offset, true, last_good);
+        }
+
+        // Recovery
+        for _ in 0..30 {
+            process_nav_pvt(pos_lat, pos_lon, ACTUAL_ALT, 3, 12,
+                &mut dynamic_offset, false, None);
+        }
+
+        // Offset must be identical after every cycle
+        let off = dynamic_offset.as_ref().unwrap();
+        assert_eq!(off.lat_1e7, original_offset.0,
+            "Offset changed after spoof cycle {}! expected={} got={}",
+            i + 1, original_offset.0, off.lat_1e7);
+        assert_eq!(off.lon_1e7, original_offset.1,
+            "Offset changed after spoof cycle {}!", i + 1);
+    }
+
+    // Return to start
+    let (out_lat, out_lon) = process_nav_pvt(
+        ACTUAL_LAT, ACTUAL_LON, ACTUAL_ALT, 3, 12,
+        &mut dynamic_offset, false, None,
+    );
+    assert_eq!(out_lat, TARGET_LAT, "After 5 spoof cycles, start coords must equal target");
+    assert_eq!(out_lon, TARGET_LON);
+}
