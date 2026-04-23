@@ -60,6 +60,10 @@ default = ["rp2350"]
 rp2040 = ["embassy-rp/rp2040"]
 rp2350 = ["embassy-rp/rp235xa", "embassy-rp/imagedef-secure-exe"]
 rp2354 = ["rp2350"]  # RP2354 uses same HAL as RP2350, different pin config
+# Emulate a Unicore UC6580I chip instead of u-blox M10.
+# Disables SEC-SIGN/key-extract (LTO drops the ECDSA stack) and switches
+# the UART0 protocol to NMEA 0183 + RTCM v3 + proprietary ExtRTCM 4074.
+unicore = []
 
 [profile.dev]
 debug = 2
@@ -108,3 +112,8 @@ opt-level = 3
 [[bin]]
 name = "ublox_fake"
 path = "src/main.rs"
+
+[[bin]]
+name = "ublox_fake_uc"
+path = "src/main_unicore.rs"
+required-features = ["unicore"]

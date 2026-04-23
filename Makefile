@@ -1,6 +1,6 @@
 # Makefile for ublox_fake firmware
 
-.PHONY: all clean rp2040 rp2350 rp2354 flash flash-rp2354 test
+.PHONY: all clean rp2040 rp2350 rp2354 rp2350-unicore rp2354-unicore flash flash-rp2354 flash-unicore flash-unicore-rp2354 test
 
 # Default target
 all: rp2350
@@ -41,9 +41,33 @@ rp2354:
 	$(call PATCH_UF2_FAMILY,/tmp/temp.uf2,ublox_fake_rp2354.uf2)
 	@echo "Built: ublox_fake_rp2354.uf2 (RP2354A: no LED, button on GPIO13/14)"
 
+# Build for RP2350 emulating Unicore UC6580I instead of u-blox M10
+rp2350-unicore:
+	cargo build --release --features "rp2350 unicore" --bin ublox_fake_uc --target thumbv8m.main-none-eabihf
+	$(CARGO_BIN)/elf2uf2-rs target/thumbv8m.main-none-eabihf/release/ublox_fake_uc /tmp/temp.uf2
+	$(call PATCH_UF2_FAMILY,/tmp/temp.uf2,ublox_fake_rp2350_unicore.uf2)
+	@echo "Built: ublox_fake_rp2350_unicore.uf2 (UC6580I emulation)"
+
+# Build for RP2354 emulating Unicore UC6580I
+rp2354-unicore:
+	cargo build --release --no-default-features --features "rp2354 unicore" --bin ublox_fake_uc --target thumbv8m.main-none-eabihf
+	$(CARGO_BIN)/elf2uf2-rs target/thumbv8m.main-none-eabihf/release/ublox_fake_uc /tmp/temp.uf2
+	$(call PATCH_UF2_FAMILY,/tmp/temp.uf2,ublox_fake_rp2354_unicore.uf2)
+	@echo "Built: ublox_fake_rp2354_unicore.uf2 (UC6580I emulation, RP2354A)"
+
 # Flash via probe-rs (default RP2350)
 flash:
 	cargo run --release
+
+# Flash RP2350 + UC6580I emulation via probe-rs
+flash-unicore:
+	cargo build --release --features "rp2350 unicore" --bin ublox_fake_uc --target thumbv8m.main-none-eabihf
+	probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/ublox_fake_uc
+
+# Flash RP2354 + UC6580I emulation via probe-rs
+flash-unicore-rp2354:
+	cargo build --release --no-default-features --features "rp2354 unicore" --bin ublox_fake_uc --target thumbv8m.main-none-eabihf
+	probe-rs run --chip RP2354 target/thumbv8m.main-none-eabihf/release/ublox_fake_uc
 
 # Flash RP2354 via probe-rs (2MB internal flash, different pin config)
 # NOTE: cargo run не работает — CARGO_TARGET_*_RUNNER конкатенируется с .cargo/config.toml
