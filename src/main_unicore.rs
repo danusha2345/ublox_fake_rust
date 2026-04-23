@@ -97,6 +97,13 @@ static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
 /// Set to true when the spoof-detector flagged the current position as spoofed.
 static SPOOF_DETECTED: AtomicBool = AtomicBool::new(false);
 
+/// Last-known-good coordinates — mirrored on every Normal fix. Used to
+/// freeze the output position while SPOOF_DETECTED is asserted (same pattern
+/// as the u-blox build: the drone sees coords stay put, not disappear).
+static LAST_GOOD_LAT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+static LAST_GOOD_LON: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+static LAST_GOOD_ALT: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
+
 /// Detector instance — lives for the whole session, reset via `.reset()` on
 /// mode changes that would otherwise pollute its internal `LAST_GOOD`.
 static SPOOF_CELL: Mutex<CriticalSectionRawMutex, Option<spoof_detector::SpoofDetector>> =
@@ -115,6 +122,12 @@ async fn main(spawner: Spawner) {
     info!("========================================");
 
     coordinates::init();
+
+    // Seed LAST_GOOD with the emulation-mode default position so spoof
+    // replacement has something sane to point at before any real fix.
+    LAST_GOOD_LAT.store(config::default_position::LAT_1E7, Ordering::Release);
+    LAST_GOOD_LON.store(config::default_position::LON_1E7, Ordering::Release);
+    LAST_GOOD_ALT.store(config::default_position::ALT_MM, Ordering::Release);
 
     // Initialise the spoof detector once.
     {
@@ -444,10 +457,6 @@ async fn uart1_rx_task(mut rx: BufferedUartRx) {
 // Offset = reassemble NMEA lines, rewrite coordinates, forward; non-NMEA bytes pass through.
 // ---------------------------------------------------------------------------
 
-/// Canned no-fix replacements emitted when spoofing is detected.
-const NOFIX_RMC: &[u8] = b"$GNRMC,,V,,,,,,,,,,N,V*37\r\n";
-const NOFIX_GGA: &[u8] = b"$GNGGA,,,,,,0,00,99.99,,,,,,*56\r\n";
-
 #[embassy_executor::task]
 async fn passthrough_forward_task() {
     use unicore::nmea;
@@ -521,8 +530,14 @@ async fn passthrough_forward_task() {
 async fn process_nmea_line(line: &[u8], mode: OperatingMode) {
     use unicore::nmea;
 
+    let is_gga = line.len() >= 6 && &line[3..6] == b"GGA";
+    let is_rmc = line.len() >= 6 && &line[3..6] == b"RMC";
+
     // Try to extract a position from GGA / RMC and feed the detector.
-    let fix = nmea::parse_gga(line).or_else(|| nmea::parse_rmc(line));
+    let fix = if is_gga { nmea::parse_gga(line) }
+        else if is_rmc { nmea::parse_rmc(line) }
+        else { None };
+
     if let Some(fix) = fix {
         if fix.checksum_ok && fix.fix_quality > 0 {
             let pos = spoof_detector::Position {
@@ -539,14 +554,20 @@ async fn process_nmea_line(line: &[u8], mode: OperatingMode) {
             };
             let mut d = SPOOF_CELL.lock().await;
             if let Some(ref mut det) = *d {
-                let result = det.analyze(pos);
-                match result {
+                match det.analyze(pos) {
+                    spoof_detector::AnalysisResult::Normal => {
+                        // Fresh trustworthy position — save as last-good.
+                        LAST_GOOD_LAT.store(fix.lat_1e7, Ordering::Release);
+                        LAST_GOOD_LON.store(fix.lon_1e7, Ordering::Release);
+                        if is_gga && fix.alt_mm != 0 {
+                            LAST_GOOD_ALT.store(fix.alt_mm, Ordering::Release);
+                        }
+                        SPOOF_DETECTED.store(false, Ordering::Release);
+                    }
                     spoof_detector::AnalysisResult::Spoofed => {
                         SPOOF_DETECTED.store(true, Ordering::Release);
                     }
-                    spoof_detector::AnalysisResult::Normal => {
-                        SPOOF_DETECTED.store(false, Ordering::Release);
-                    }
+                    // Initializing / GapReset — don't touch the flag.
                     _ => {}
                 }
             }
@@ -554,37 +575,35 @@ async fn process_nmea_line(line: &[u8], mode: OperatingMode) {
     }
 
     let spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
-    let is_gga = line.len() >= 6 && &line[3..6] == b"GGA";
-    let is_rmc = line.len() >= 6 && &line[3..6] == b"RMC";
 
-    // Spoof state: replace GGA/RMC with no-fix so the drone fails over.
-    if spoofed {
-        if is_gga {
-            let mut v = heapless::Vec::<u8, 1280>::new();
-            let _ = v.extend_from_slice(NOFIX_GGA);
-            let _ = TX_CHANNEL.try_send(v);
-            return;
-        }
-        if is_rmc {
-            let mut v = heapless::Vec::<u8, 1280>::new();
-            let _ = v.extend_from_slice(NOFIX_RMC);
-            let _ = TX_CHANNEL.try_send(v);
-            return;
-        }
-        // Other NMEA (GSA/GSV/VTG/...) pass through — they do not carry a position.
-    }
+    // Decide the target position to inject into GGA/RMC:
+    //   - spoofed            → LAST_GOOD (frozen, drone keeps "flying" in place)
+    //   - PassthroughOffset  → offset_target (static redirect)
+    //   - otherwise          → no rewrite, forward verbatim.
+    let rewrite_position = match (spoofed, mode) {
+        (true, _) => Some((
+            LAST_GOOD_LAT.load(Ordering::Acquire),
+            LAST_GOOD_LON.load(Ordering::Acquire),
+            LAST_GOOD_ALT.load(Ordering::Acquire),
+        )),
+        (false, OperatingMode::PassthroughOffset) => Some((
+            config::offset_target::LAT_1E7,
+            config::offset_target::LON_1E7,
+            config::offset_target::ALT_MM,
+        )),
+        _ => None,
+    };
 
-    // Offset: rewrite coords in GGA/RMC only.
-    if mode == OperatingMode::PassthroughOffset && (is_gga || is_rmc) {
+    if let (Some((lat, lon, alt)), true) = (rewrite_position, is_gga || is_rmc) {
         let mut work = [0u8; 320];
         if line.len() <= work.len() {
             work[..line.len()].copy_from_slice(line);
             if let Some(new_len) = nmea::rewrite_position_inplace(
                 &mut work,
                 line.len(),
-                config::offset_target::LAT_1E7,
-                config::offset_target::LON_1E7,
-                if is_gga { Some(config::offset_target::ALT_MM) } else { None },
+                lat,
+                lon,
+                if is_gga { Some(alt) } else { None },
             ) {
                 let mut v = heapless::Vec::<u8, 1280>::new();
                 let _ = v.extend_from_slice(&work[..new_len]);
@@ -624,13 +643,6 @@ async fn emulation_task() {
     let mut centis: u64 = start_centis;
     let date = NmeaDate { day: 5, month: 6, year: 2025 };
 
-    // Fake satellite roster — gives the drone something coherent to see
-    // across GGA/GSA/GSV without needing real ephemeris.
-    const FAKE_SATS: &[(u16, u8, u16, u8)] = &[
-        // (PRN, elev_deg, azim_deg, cno_dbhz)
-        (5, 45, 90, 45), (13, 60, 180, 47), (15, 30, 270, 42), (20, 80, 0, 50),
-    ];
-
     loop {
         tick.next().await;
         if OperatingMode::load() != OperatingMode::Emulation {
@@ -648,12 +660,10 @@ async fn emulation_task() {
         counter = counter.wrapping_add(1);
         centis += 20;
 
-        // First 25 ticks (≈5 s) — cold start, no fix. After — 3D fix with
-        // a growing sat count (4 → 12 over ~16 s) for realism.
-        let cold = counter < 25;
-        let valid = !cold;
-        let fix_quality: u8 = if valid { 1 } else { 0 };
-        let nsats: u8 = if valid { (4 + (counter - 25) / 10).min(12) as u8 } else { 0 };
+        // Fix is reported from the very first tick — no warm-up.
+        let valid = true;
+        let fix_quality: u8 = 1;
+        let nsats: u8 = 16;
 
         // Unpack simulated time
         let total_s = centis / 100;
@@ -696,30 +706,27 @@ async fn emulation_task() {
         if n > 0 { enqueue(&buf[..n]); }
 
         // GSA every 5th tick (rate=5): 5 sentences, one per constellation.
+        // PRN split below totals 16 satellites (matches GGA nsats=16).
         if counter % 5 == 0 {
-            for (sys_id, prn_lo, prn_hi) in &[
-                (1u8, 1u16, 32u16),    // GPS
-                (2, 65, 96),            // GLONASS
-                (3, 1, 30),             // Galileo
-                (4, 1, 40),             // BeiDou
-                (5, 193, 200),          // QZSS
-            ] {
+            let sys_prns: &[(u8, &[u16])] = &[
+                (1, &[5, 13, 15, 20]),      // GPS — 4
+                (2, &[65, 70, 75]),          // GLONASS — 3
+                (3, &[2, 11, 18]),           // Galileo — 3
+                (4, &[6, 14, 20, 27]),       // BeiDou — 4
+                (5, &[193, 194]),            // QZSS — 2
+            ];
+            for (sys_id, prn_list) in sys_prns {
                 let mut sats: [u16; 12] = [0; 12];
-                if valid {
-                    // Put a couple of our fake PRNs if they fall into the range,
-                    // else pick plausible numbers inside the constellation span.
-                    let a = prn_lo.saturating_add(4);
-                    let b = prn_lo.saturating_add(8);
-                    sats[0] = a.min(*prn_hi);
-                    sats[1] = b.min(*prn_hi);
+                for (i, &prn) in prn_list.iter().enumerate().take(12) {
+                    sats[i] = prn;
                 }
                 let gsa = GsaFields {
                     op_mode: GsaOpMode::Automatic,
-                    fix_type: if valid { 3 } else { 1 },
+                    fix_type: 3,
                     sats,
-                    pdop_x100: if valid { 99 } else { 9999 },
-                    hdop_x100: if valid { 99 } else { 9999 },
-                    vdop_x100: if valid { 99 } else { 9999 },
+                    pdop_x100: 99,
+                    hdop_x100: 99,
+                    vdop_x100: 99,
                     system_id: *sys_id,
                 };
                 let n = build_gsa(&mut buf, Talker::Gn, &gsa);
@@ -727,29 +734,28 @@ async fn emulation_task() {
             }
         }
 
-        // GSV every 5th tick (rate=5): one page per talker per signal.
+        // GSV every 5th tick (rate=5): per-talker pages advertising the same
+        // 16 SVs split across constellations. View count matches GGA nsats.
         if counter % 5 == 0 {
-            let view = if valid { FAKE_SATS.len() as u8 } else { 0 };
-            let pages: &[(Talker, u8)] = &[
-                (Talker::Gp, 1), (Talker::Gp, 8),
-                (Talker::Gb, 1), (Talker::Gb, 5),
-                (Talker::Ga, 7), (Talker::Ga, 1),
-                (Talker::Gl, 1),
-                (Talker::Gq, 1), (Talker::Gq, 8),
+            // (talker, signal_id, satellites for this talker's view)
+            let pages: &[(Talker, u8, &[(u16, u8, u16, u8)])] = &[
+                (Talker::Gp, 1, &[(5, 45, 90, 45), (13, 60, 180, 47), (15, 30, 270, 42), (20, 80, 0, 50)]),
+                (Talker::Gb, 1, &[(6, 35, 60, 43), (14, 50, 150, 45), (20, 70, 210, 44), (27, 25, 300, 41)]),
+                (Talker::Ga, 7, &[(2, 40, 45, 46), (11, 55, 135, 48), (18, 28, 225, 41)]),
+                (Talker::Gl, 1, &[(65, 42, 110, 44), (70, 68, 200, 46), (75, 22, 330, 40)]),
+                (Talker::Gq, 1, &[(193, 55, 180, 47), (194, 40, 240, 43)]),
             ];
-            for (talker, sig) in pages {
-                let sats_vec: [GsvSat; 4] = [
-                    GsvSat { prn: FAKE_SATS[0].0, elevation_deg: FAKE_SATS[0].1,
-                             azimuth_deg: FAKE_SATS[0].2, cno_dbhz: if valid { FAKE_SATS[0].3 } else { 0 } },
-                    GsvSat { prn: FAKE_SATS[1].0, elevation_deg: FAKE_SATS[1].1,
-                             azimuth_deg: FAKE_SATS[1].2, cno_dbhz: if valid { FAKE_SATS[1].3 } else { 0 } },
-                    GsvSat { prn: FAKE_SATS[2].0, elevation_deg: FAKE_SATS[2].1,
-                             azimuth_deg: FAKE_SATS[2].2, cno_dbhz: if valid { FAKE_SATS[2].3 } else { 0 } },
-                    GsvSat { prn: FAKE_SATS[3].0, elevation_deg: FAKE_SATS[3].1,
-                             azimuth_deg: FAKE_SATS[3].2, cno_dbhz: if valid { FAKE_SATS[3].3 } else { 0 } },
-                ];
-                let slice = if valid { &sats_vec[..] } else { &sats_vec[..0] };
-                let n = build_gsv(&mut buf, *talker, 1, 1, view, slice, *sig);
+            for (talker, sig, sats) in pages {
+                let mut arr: [GsvSat; 4] = [GsvSat::default(); 4];
+                for (i, s) in sats.iter().enumerate().take(4) {
+                    arr[i] = GsvSat {
+                        prn: s.0,
+                        elevation_deg: s.1,
+                        azimuth_deg: s.2,
+                        cno_dbhz: s.3,
+                    };
+                }
+                let n = build_gsv(&mut buf, *talker, 1, 1, nsats, &arr[..sats.len().min(4)], *sig);
                 if n > 0 { enqueue(&buf[..n]); }
             }
         }
@@ -759,8 +765,8 @@ async fn emulation_task() {
             enqueue(b"$PNOISE,65,85,13663,11506,9643,34974,10000,10000,10000,10000,0,0*37\r\n");
         }
 
-        // RTCM + ExtRTCM only when we have a fix — matches real chip behaviour.
-        if valid {
+        // RTCM + ExtRTCM stream alongside NMEA (fix is immediate now).
+        {
             if counter % 5 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1077); }
             if counter % 3 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1097); }
             if counter % 3 == 1 { enqueue(unicore::rtcm_samples::FRAME_MSG_1019); }
