@@ -20,3 +20,6 @@ pub mod cmd;
 
 #[path = "boot.rs"]
 pub mod boot;
+
+#[path = "rtcm_samples.rs"]
+pub mod rtcm_samples;

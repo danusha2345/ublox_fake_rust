@@ -444,6 +444,14 @@ async fn emulation_task() {
         if counter % 10 == 0 {
             enqueue(b"$PNOISE,65,85,13663,11506,9643,34974,10000,10000,10000,10000,0,0*37\r\n");
         }
+
+        // RTCM MSM7 + ephemerides — rates matched to real chip log 2026-04-23.
+        if counter % 5 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1077); } // ≈1 Hz
+        if counter % 3 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1097); } // ≈1.7 Hz
+        if counter % 3 == 1 { enqueue(unicore::rtcm_samples::FRAME_MSG_1019); } // ≈1.7 Hz
+        if counter % 8 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1046); } // ≈0.6 Hz
+
+        // Extended RTCM 4074 status bundle — ≈1 Hz.
         if counter % 5 == 0 {
             for &(sub, data) in &[
                 (0x0FEu16, unicore::extrtcm::DATA_SUB_0FE),
@@ -456,6 +464,10 @@ async fn emulation_task() {
                 if n > 0 { enqueue(&buf[..n]); }
             }
         }
+
+        // $PPSInfo ≈ every 17 s; $SVEPH once per minute-ish.
+        if counter % 85 == 40  { enqueue(unicore::rtcm_samples::PPS_INFO_SAMPLE); }
+        if counter % 300 == 120 { enqueue(unicore::rtcm_samples::SVEPH_SAMPLE); }
     }
 }
 

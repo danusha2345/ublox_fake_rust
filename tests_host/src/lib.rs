@@ -19,6 +19,7 @@ pub use unicore::rtcm3 as unicore_rtcm3;
 pub use unicore::extrtcm as unicore_extrtcm;
 pub use unicore::cmd as unicore_cmd;
 pub use unicore::boot as unicore_boot;
+pub use unicore::rtcm_samples as unicore_rtcm_samples;
 
 // AnalysisResult doesn't derive Debug in firmware (no std), add it here for assert_eq!
 impl core::fmt::Debug for spoof_detector::AnalysisResult {
