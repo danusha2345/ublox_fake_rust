@@ -607,71 +607,183 @@ async fn process_nmea_line(line: &[u8], mode: OperatingMode) {
 
 #[embassy_executor::task]
 async fn emulation_task() {
+    use unicore::nmea::{
+        build_gga, build_gsa, build_gsv, build_rmc, GgaFields, GsaFields, GsaOpMode,
+        GsvSat, NmeaDate, NmeaTime, RmcFields, Talker,
+    };
+
     let mut tick = Ticker::every(Duration::from_millis(200));
     let mut counter: u32 = 0;
     let mut buf = [0u8; 256];
     let mut booted = false;
 
+    // Simulated UTC time, reset at each (re)start of Emulation mode.
+    // Increment by 200 ms per tick. Start at 03:01:55.00 UTC 2025-06-05
+    // (matches the `$GNZDA` values we observed from the live chip probe).
+    let start_centis: u64 = (3 * 3_600 + 1 * 60 + 55) * 100; // 10 865 500
+    let mut centis: u64 = start_centis;
+    let date = NmeaDate { day: 5, month: 6, year: 2025 };
+
+    // Fake satellite roster — gives the drone something coherent to see
+    // across GGA/GSA/GSV without needing real ephemeris.
+    const FAKE_SATS: &[(u16, u8, u16, u8)] = &[
+        // (PRN, elev_deg, azim_deg, cno_dbhz)
+        (5, 45, 90, 45), (13, 60, 180, 47), (15, 30, 270, 42), (20, 80, 0, 50),
+    ];
+
     loop {
         tick.next().await;
         if OperatingMode::load() != OperatingMode::Emulation {
             booted = false;
+            centis = start_centis;
+            counter = 0;
             continue;
         }
         if !booted {
             enqueue_chunked(unicore::boot::BOOT_DUMP).await;
             booted = true;
+            counter = 0;
+            centis = start_centis;
         }
         counter = counter.wrapping_add(1);
+        centis += 20;
 
-        enqueue(b"$GNRMC,,V,,,,,,,,,,N,V*37\r\n");
-        enqueue(b"$GNGGA,,,,,,0,00,99.99,,,,,,*56\r\n");
-        enqueue(b"$GNGSA,A,1,,,,,,,,,,,,,99.99,99.99,99.99,1*33\r\n");
-        enqueue(b"$GNGSA,A,1,,,,,,,,,,,,,99.99,99.99,99.99,2*30\r\n");
-        enqueue(b"$GNGSA,A,1,,,,,,,,,,,,,99.99,99.99,99.99,3*31\r\n");
-        enqueue(b"$GNGSA,A,1,,,,,,,,,,,,,99.99,99.99,99.99,4*36\r\n");
-        enqueue(b"$GNGSA,A,1,,,,,,,,,,,,,99.99,99.99,99.99,5*37\r\n");
+        // First 25 ticks (≈5 s) — cold start, no fix. After — 3D fix with
+        // a growing sat count (4 → 12 over ~16 s) for realism.
+        let cold = counter < 25;
+        let valid = !cold;
+        let fix_quality: u8 = if valid { 1 } else { 0 };
+        let nsats: u8 = if valid { (4 + (counter - 25) / 10).min(12) as u8 } else { 0 };
 
-        if counter % 2 == 0 {
-            enqueue(b"$GPGSV,1,1,00,1*64\r\n");
-            enqueue(b"$GPGSV,1,1,00,8*6D\r\n");
-            enqueue(b"$GBGSV,1,1,00,1*76\r\n");
-            enqueue(b"$GBGSV,1,1,00,5*72\r\n");
-            enqueue(b"$GAGSV,1,1,00,7*73\r\n");
-            enqueue(b"$GAGSV,1,1,00,1*75\r\n");
-            enqueue(b"$GLGSV,1,1,00,1*78\r\n");
-            enqueue(b"$GQGSV,1,1,00,1*65\r\n");
-            enqueue(b"$GQGSV,1,1,00,8*6C\r\n");
-        }
-        if counter % 10 == 0 {
-            enqueue(b"$PNOISE,65,85,13663,11506,9643,34974,10000,10000,10000,10000,0,0*37\r\n");
-        }
+        // Unpack simulated time
+        let total_s = centis / 100;
+        let cs = (centis % 100) as u8;
+        let hour = ((total_s / 3600) % 24) as u8;
+        let minute = ((total_s / 60) % 60) as u8;
+        let second = (total_s % 60) as u8;
+        let time = NmeaTime { hour, minute, second, centis: cs };
 
-        // RTCM MSM7 + ephemerides — rates matched to real chip log 2026-04-23.
-        if counter % 5 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1077); } // ≈1 Hz
-        if counter % 3 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1097); } // ≈1.7 Hz
-        if counter % 3 == 1 { enqueue(unicore::rtcm_samples::FRAME_MSG_1019); } // ≈1.7 Hz
-        if counter % 8 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1046); } // ≈0.6 Hz
-        if counter % 5 == 2 { enqueue(unicore::rtcm_samples::FRAME_MSG_1013); } // ≈1 Hz
-        if counter % 5 == 3 { enqueue(unicore::rtcm_samples::CW_OUT_SAMPLE);  } // ≈1 Hz
+        let lat = if valid { config::default_position::LAT_1E7 } else { 0 };
+        let lon = if valid { config::default_position::LON_1E7 } else { 0 };
+        let alt = if valid { config::default_position::ALT_MM } else { 0 };
 
-        // Extended RTCM 4074 status bundle — ≈1 Hz.
+        // GGA every tick (rate=1).
+        let gga = GgaFields {
+            time,
+            lat_1e7: lat,
+            lon_1e7: lon,
+            fix_quality,
+            nsats,
+            hdop_x100: if valid { 99 } else { 9999 },
+            alt_mm: alt,
+            geoid_sep_mm: -30_000,
+        };
+        let n = build_gga(&mut buf, Talker::Gn, &gga);
+        if n > 0 { enqueue(&buf[..n]); }
+
+        // RMC every tick (rate=1).
+        let rmc = RmcFields {
+            time,
+            valid,
+            lat_1e7: lat,
+            lon_1e7: lon,
+            sog_knots_x1000: 0,
+            cog_deg_x100: 0,
+            date,
+            mode: if valid { b'A' } else { b'N' },
+        };
+        let n = build_rmc(&mut buf, Talker::Gn, &rmc);
+        if n > 0 { enqueue(&buf[..n]); }
+
+        // GSA every 5th tick (rate=5): 5 sentences, one per constellation.
         if counter % 5 == 0 {
-            for &(sub, data) in &[
-                (0x0FEu16, unicore::extrtcm::DATA_SUB_0FE),
-                (0x0E6,    unicore::extrtcm::DATA_SUB_0E6),
-                (0x0F9,    unicore::extrtcm::DATA_SUB_0F9),
-                (0x0E9,    unicore::extrtcm::DATA_SUB_0E9),
-                (0x0FF,    unicore::extrtcm::DATA_SUB_0FF),
+            for (sys_id, prn_lo, prn_hi) in &[
+                (1u8, 1u16, 32u16),    // GPS
+                (2, 65, 96),            // GLONASS
+                (3, 1, 30),             // Galileo
+                (4, 1, 40),             // BeiDou
+                (5, 193, 200),          // QZSS
             ] {
-                let n = unicore::extrtcm::build_sub(&mut buf, sub, data);
+                let mut sats: [u16; 12] = [0; 12];
+                if valid {
+                    // Put a couple of our fake PRNs if they fall into the range,
+                    // else pick plausible numbers inside the constellation span.
+                    let a = prn_lo.saturating_add(4);
+                    let b = prn_lo.saturating_add(8);
+                    sats[0] = a.min(*prn_hi);
+                    sats[1] = b.min(*prn_hi);
+                }
+                let gsa = GsaFields {
+                    op_mode: GsaOpMode::Automatic,
+                    fix_type: if valid { 3 } else { 1 },
+                    sats,
+                    pdop_x100: if valid { 99 } else { 9999 },
+                    hdop_x100: if valid { 99 } else { 9999 },
+                    vdop_x100: if valid { 99 } else { 9999 },
+                    system_id: *sys_id,
+                };
+                let n = build_gsa(&mut buf, Talker::Gn, &gsa);
                 if n > 0 { enqueue(&buf[..n]); }
             }
         }
 
-        // $PPSInfo ≈ every 17 s; $SVEPH once per minute-ish.
-        if counter % 85 == 40  { enqueue(unicore::rtcm_samples::PPS_INFO_SAMPLE); }
-        if counter % 300 == 120 { enqueue(unicore::rtcm_samples::SVEPH_SAMPLE); }
+        // GSV every 5th tick (rate=5): one page per talker per signal.
+        if counter % 5 == 0 {
+            let view = if valid { FAKE_SATS.len() as u8 } else { 0 };
+            let pages: &[(Talker, u8)] = &[
+                (Talker::Gp, 1), (Talker::Gp, 8),
+                (Talker::Gb, 1), (Talker::Gb, 5),
+                (Talker::Ga, 7), (Talker::Ga, 1),
+                (Talker::Gl, 1),
+                (Talker::Gq, 1), (Talker::Gq, 8),
+            ];
+            for (talker, sig) in pages {
+                let sats_vec: [GsvSat; 4] = [
+                    GsvSat { prn: FAKE_SATS[0].0, elevation_deg: FAKE_SATS[0].1,
+                             azimuth_deg: FAKE_SATS[0].2, cno_dbhz: if valid { FAKE_SATS[0].3 } else { 0 } },
+                    GsvSat { prn: FAKE_SATS[1].0, elevation_deg: FAKE_SATS[1].1,
+                             azimuth_deg: FAKE_SATS[1].2, cno_dbhz: if valid { FAKE_SATS[1].3 } else { 0 } },
+                    GsvSat { prn: FAKE_SATS[2].0, elevation_deg: FAKE_SATS[2].1,
+                             azimuth_deg: FAKE_SATS[2].2, cno_dbhz: if valid { FAKE_SATS[2].3 } else { 0 } },
+                    GsvSat { prn: FAKE_SATS[3].0, elevation_deg: FAKE_SATS[3].1,
+                             azimuth_deg: FAKE_SATS[3].2, cno_dbhz: if valid { FAKE_SATS[3].3 } else { 0 } },
+                ];
+                let slice = if valid { &sats_vec[..] } else { &sats_vec[..0] };
+                let n = build_gsv(&mut buf, *talker, 1, 1, view, slice, *sig);
+                if n > 0 { enqueue(&buf[..n]); }
+            }
+        }
+
+        // PNOISE every 10 ticks (~0.5 Hz).
+        if counter % 10 == 0 {
+            enqueue(b"$PNOISE,65,85,13663,11506,9643,34974,10000,10000,10000,10000,0,0*37\r\n");
+        }
+
+        // RTCM + ExtRTCM only when we have a fix — matches real chip behaviour.
+        if valid {
+            if counter % 5 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1077); }
+            if counter % 3 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1097); }
+            if counter % 3 == 1 { enqueue(unicore::rtcm_samples::FRAME_MSG_1019); }
+            if counter % 8 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1046); }
+            if counter % 5 == 2 { enqueue(unicore::rtcm_samples::FRAME_MSG_1013); }
+            if counter % 5 == 3 { enqueue(unicore::rtcm_samples::CW_OUT_SAMPLE); }
+
+            if counter % 5 == 0 {
+                for &(sub, data) in &[
+                    (0x0FEu16, unicore::extrtcm::DATA_SUB_0FE),
+                    (0x0E6,    unicore::extrtcm::DATA_SUB_0E6),
+                    (0x0F9,    unicore::extrtcm::DATA_SUB_0F9),
+                    (0x0E9,    unicore::extrtcm::DATA_SUB_0E9),
+                    (0x0FF,    unicore::extrtcm::DATA_SUB_0FF),
+                ] {
+                    let n = unicore::extrtcm::build_sub(&mut buf, sub, data);
+                    if n > 0 { enqueue(&buf[..n]); }
+                }
+            }
+
+            if counter % 85 == 40  { enqueue(unicore::rtcm_samples::PPS_INFO_SAMPLE); }
+            if counter % 300 == 120 { enqueue(unicore::rtcm_samples::SVEPH_SAMPLE); }
+        }
     }
 }
 
@@ -693,19 +805,28 @@ async fn led_task(
     let mut ws: PioWs2812<_, 0, 1, Grb> =
         PioWs2812::with_color_order(&mut pio.common, pio.sm0, dma, pin, &program);
 
-    let mut ticker = Ticker::every(Duration::from_millis(250));
+    let mut ticker = Ticker::every(Duration::from_millis(125));
     let mut phase: u8 = 0;
     loop {
         phase = phase.wrapping_add(1);
-        // Distinct colour palette from the u-blox build so at a glance you
-        // can tell which firmware variant is running.
-        let colour = match OperatingMode::load() {
-            OperatingMode::Emulation       => RGB8::new(40, 20, 0),  // orange
-            OperatingMode::Passthrough     => RGB8::new(0, 30, 30),  // cyan
-            OperatingMode::PassthroughRaw  => RGB8::new(30, 0, 30),  // magenta
-            OperatingMode::PassthroughOffset => RGB8::new(40, 30, 0), // yellow
+        let mode = OperatingMode::load();
+        let spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
+
+        // Spoof detection in Passthrough/PassthroughOffset: fast-blink red.
+        let value = if spoofed
+            && matches!(mode, OperatingMode::Passthrough | OperatingMode::PassthroughOffset)
+        {
+            if phase.is_multiple_of(2) { RGB8::new(60, 0, 0) } else { RGB8::new(0, 0, 0) }
+        } else {
+            let colour = match mode {
+                OperatingMode::Emulation       => RGB8::new(40, 20, 0),  // orange
+                OperatingMode::Passthrough     => RGB8::new(0, 30, 30),  // cyan
+                OperatingMode::PassthroughRaw  => RGB8::new(30, 0, 30),  // magenta
+                OperatingMode::PassthroughOffset => RGB8::new(40, 30, 0), // yellow
+            };
+            // Slower base blink (~1 Hz: on 4 ticks, off 4 ticks).
+            if phase % 8 < 4 { colour } else { RGB8::new(0, 0, 0) }
         };
-        let value = if phase.is_multiple_of(2) { colour } else { RGB8::new(0, 0, 0) };
         let _ = ws.write(&[value]).await;
         ticker.next().await;
     }
