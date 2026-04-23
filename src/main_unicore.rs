@@ -234,45 +234,66 @@ async fn handle_command(line: &[u8]) {
         Command, ParseError,
     };
 
+    // Full echo body (between `$` and trailing \r\n, INCLUDING *HH if present).
+    let mut end = line.len();
+    while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
+        end -= 1;
+    }
+    let start = if !line.is_empty() && line[0] == b'$' { 1 } else { 0 };
+    let echo_full = &line[start..end];
+    // Echo stripped of *HH, used as the $GNTXT body for valid replies.
+    let star = echo_full.iter().rposition(|&b| b == b'*').unwrap_or(echo_full.len());
+    let echo_clean = &echo_full[..star];
+
     let mut scratch = [0u8; 256];
+
     let cmd = match parse_command(line) {
         Ok(c) => c,
         Err(ParseError::BadChecksum) => {
+            // Live chip echoes the full (invalid) body in $GNTXT, then replies $FAIL,1.
+            let n = reply_gntxt_ack(&mut scratch, echo_full);
+            if n > 0 { enqueue(&scratch[..n]); }
             let n = reply_fail(&mut scratch, 1);
             enqueue(&scratch[..n]);
             return;
         }
-        Err(_) => {
+        Err(ParseError::Malformed) => {
+            // Known CMD, bad args → same echo + $FAIL,0.
+            let n = reply_gntxt_ack(&mut scratch, echo_clean);
+            if n > 0 { enqueue(&scratch[..n]); }
             let n = reply_fail(&mut scratch, 0);
             enqueue(&scratch[..n]);
             return;
         }
+        Err(ParseError::NoDollarPrefix) => {
+            return; // silently ignore stray bytes
+        }
     };
 
-    let should_ack = matches!(
-        cmd,
-        Command::CfgSave | Command::CfgClr | Command::CfgMsg { rate: Some(_), .. } | Command::CfgNav { .. }
-    );
-    if should_ack {
-        let mut end = line.len();
-        while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
-            end -= 1;
-        }
-        let start = if !line.is_empty() && line[0] == b'$' { 1 } else { 0 };
-        let star = line[..end].iter().rposition(|&b| b == b'*').unwrap_or(end);
-        let echo = &line[start..star.min(end)];
-        let n = reply_gntxt_ack(&mut scratch, echo);
-        if n > 0 { enqueue(&scratch[..n]); }
-    }
-
     match cmd {
+        Command::Unknown(_) => {
+            // Live chip silently ignores commands it does not recognise.
+        }
         Command::PdtInfo => {
-            // Real chip emits no $GNTXT pre-ACK for $PDTINFO.
+            // Strict: extra args → $GNTXT + $FAIL,0 (confirmed on live chip).
+            if echo_clean.contains(&b',') {
+                let n = reply_gntxt_ack(&mut scratch, echo_clean);
+                if n > 0 { enqueue(&scratch[..n]); }
+                let n = reply_fail(&mut scratch, 0);
+                enqueue(&scratch[..n]);
+                return;
+            }
             let n = reply_pdtinfo(&mut scratch); enqueue(&scratch[..n]);
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
         Command::ProductInfo => {
-            // Real chip emits no $GNTXT pre-ACK for $PRODUCTINFO either.
+            if echo_clean.contains(&b',') {
+                let n = reply_gntxt_ack(&mut scratch, echo_clean);
+                if n > 0 { enqueue(&scratch[..n]); }
+                let n = reply_fail(&mut scratch, 0);
+                enqueue(&scratch[..n]);
+                return;
+            }
             let n = reply_productinfo(&mut scratch); enqueue(&scratch[..n]);
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
@@ -287,11 +308,15 @@ async fn handle_command(line: &[u8]) {
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
         Command::CfgKey => {
-            // No pre-ACK for $CFGKEY (verified on live chip).
+            // No $GNTXT pre-ACK for $CFGKEY on the live chip.
             let n = reply_cfgkey(&mut scratch); enqueue(&scratch[..n]);
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
+        // Remaining SET-ish commands (CFGMSG with rate, CFGSAVE, CFGCLR, CFGSYS with mask, etc.)
+        // — echo in $GNTXT then $OK.
         _ => {
+            let n = reply_gntxt_ack(&mut scratch, echo_clean);
+            if n > 0 { enqueue(&scratch[..n]); }
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
     }
