@@ -522,11 +522,10 @@ async fn passthrough_forward_task() {
     // Lazy — created on first entry into Passthrough/PassthroughOffset.
     let mut pos_buffer: Option<PositionBuffer> = None;
     let mut dynamic_offset: Option<DynamicOffset> = None;
-    // Latest date seen in $GxRMC. Combined with the HH:MM:SS from GGA to build
-    // `spoof_detector::GnssTime`, which enables time-jump and system-clock-drift
-    // checks in the shared detector. Without this the Unicore build only had
-    // coordinate-based detection (u-blox parity was partial).
-    let mut last_rmc_date: Option<nmea::NmeaDate> = None;
+    // Date from $GxRMC + midnight-rollover guard. Combined with the HH:MM:SS
+    // from GGA to build `spoof_detector::GnssTime`, which enables time-jump
+    // and system-clock-drift checks in the shared detector.
+    let mut time_cache = NmeaTimeCache::default();
 
     loop {
         let chunk = RAW_RX_CHANNEL.receive().await;
@@ -545,7 +544,7 @@ async fn passthrough_forward_task() {
             in_sentence = false;
             rtcm_hdr_have = 0;
             rtcm_remaining = 0;
-            last_rmc_date = None;
+            time_cache = NmeaTimeCache::default();
             SPOOF_DETECTED.store(false, Ordering::Release);
             SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
             dynamic_offset = None;
@@ -576,22 +575,39 @@ async fn passthrough_forward_task() {
                     if rtcm_remaining > 0 {
                         buffered_forward(&mut pass_buf, b);
                         rtcm_remaining -= 1;
+                        // Frame boundary = TX boundary: flush immediately so small
+                        // RTCM frames (e.g. 1013 system params) don't sit in
+                        // pass_buf waiting for the next `$` or a 256-byte fill.
+                        if rtcm_remaining == 0 && !pass_buf.is_empty() {
+                            enqueue(&pass_buf);
+                            pass_buf.clear();
+                        }
                         continue;
                     }
 
                     // --- Reading the 3-byte RTCM header (D3 + 2 length bytes) --
-                    if rtcm_hdr_have > 0 {
-                        buffered_forward(&mut pass_buf, b);
-                        if rtcm_hdr_have == 1 {
+                    if rtcm_hdr_have == 1 {
+                        // Byte index 1 of the header: top 6 bits MUST be zero
+                        // (RTCM3 reserved). If not, the `0xD3` was noise/desync,
+                        // not a real preamble. Abort RTCM state and re-route
+                        // this byte through the NMEA logic below so that a `$`
+                        // appearing here still starts a sentence correctly.
+                        if b & 0xFC != 0 {
+                            rtcm_hdr_have = 0;
+                            // fall through without consuming `b`
+                        } else {
+                            buffered_forward(&mut pass_buf, b);
                             rtcm_hdr1 = b;
                             rtcm_hdr_have = 2;
-                        } else {
-                            // Payload length = low 10 bits of bytes [1..2] big-endian.
-                            let payload_len = (((rtcm_hdr1 as u16) & 0x03) << 8) | (b as u16);
-                            // Remaining = payload + 3-byte CRC24 (header already forwarded).
-                            rtcm_remaining = payload_len + 3;
-                            rtcm_hdr_have = 0;
+                            continue;
                         }
+                    } else if rtcm_hdr_have == 2 {
+                        buffered_forward(&mut pass_buf, b);
+                        // Payload length = low 10 bits of bytes [1..2] big-endian.
+                        let payload_len = (((rtcm_hdr1 as u16) & 0x03) << 8) | (b as u16);
+                        // Remaining = payload + 3-byte CRC24 (header already forwarded).
+                        rtcm_remaining = payload_len + 3;
+                        rtcm_hdr_have = 0;
                         continue;
                     }
 
@@ -620,7 +636,7 @@ async fn passthrough_forward_task() {
                             apply_offset,
                             pos_buffer.as_mut().unwrap(),
                             &mut dynamic_offset,
-                            &mut last_rmc_date,
+                            &mut time_cache,
                         ).await;
                     }
                 }
@@ -686,12 +702,34 @@ fn rewrite_coords(line: &[u8], coords: (i32, i32, i32), is_gga: bool, out: &mut 
 ///   - While in PassthroughOffset with the offset still unknown, coordinate-
 ///     carrying messages are **suppressed** (not forwarded) to avoid leaking
 ///     the real position. Non-coordinate messages (GSA/GSV/VTG/…) pass.
+/// Tracks NMEA time/date state needed to synthesise `spoof_detector::GnssTime`
+/// from the combined GGA (HH:MM:SS) + RMC (DD/MM/YY) streams.
+///
+/// `date_ms`: monotonic ms when `date` was last refreshed. Used to reject
+/// stale cached dates (RMC stream paused, e.g. antenna lost fix).
+///
+/// `last_gga_sod`: previous GGA's second-of-day. Used to detect a midnight
+/// rollover: if the new GGA is > 12 h *earlier* than the previous one, we've
+/// crossed 00:00 UTC but haven't yet seen the post-midnight RMC — the cached
+/// date would be yesterday's, so we skip this tick rather than fire a bogus
+/// 24 h backward-jump at the detector.
+///
+/// Freshness window (1500 ms) covers the default 5 Hz RMC cadence with slack.
+#[derive(Default)]
+struct NmeaTimeCache {
+    date: Option<unicore::nmea::NmeaDate>,
+    date_ms: u32,
+    last_gga_sod: Option<u32>,
+}
+
+const NMEA_DATE_FRESHNESS_MS: u32 = 1500;
+
 async fn process_nmea_line(
     line: &[u8],
     apply_offset: bool,
     pos_buffer: &mut PositionBuffer,
     dynamic_offset: &mut Option<DynamicOffset>,
-    last_rmc_date: &mut Option<unicore::nmea::NmeaDate>,
+    time_cache: &mut NmeaTimeCache,
 ) {
     use unicore::nmea;
 
@@ -709,7 +747,8 @@ async fn process_nmea_line(
     if is_rmc {
         if let Some(fix) = parsed {
             if fix.checksum_ok && fix.fix_quality > 0 && fix.date.year > 0 {
-                *last_rmc_date = Some(fix.date);
+                time_cache.date = Some(fix.date);
+                time_cache.date_ms = now_ms;
             }
         }
     }
@@ -723,16 +762,37 @@ async fn process_nmea_line(
 
                 // Build GnssTime from GGA time + cached RMC date so that
                 // time-jump and system-clock-drift checks run on Unicore too.
-                let gnss_time = last_rmc_date.map(|d| spoof_detector::GnssTime {
-                    itow_ms: 0,
-                    year: d.year,
-                    month: d.month,
-                    day: d.day,
-                    hour: fix.time.hour,
-                    min: fix.time.minute,
-                    sec: fix.time.second,
-                    system_time_ms: now_ms,
-                });
+                // Two guards:
+                //   - stale cache: skip if no fresh RMC within 1500 ms (RMC
+                //     stream paused → cached date may be wrong day).
+                //   - midnight rollover: if GGA's second-of-day jumped back
+                //     by > 12 h, we crossed 00:00 UTC but the RMC date is
+                //     still yesterday; skip this tick rather than synthesise
+                //     a 24 h backward jump.
+                let sod = fix.time.hour as u32 * 3600
+                        + fix.time.minute as u32 * 60
+                        + fix.time.second as u32;
+                let stale_date =
+                    time_cache.date.is_none()
+                    || now_ms.wrapping_sub(time_cache.date_ms) > NMEA_DATE_FRESHNESS_MS;
+                let rolled_over = time_cache.last_gga_sod
+                    .map_or(false, |prev| prev > sod && prev - sod > 12 * 3600);
+                time_cache.last_gga_sod = Some(sod);
+
+                let gnss_time = if stale_date || rolled_over {
+                    None
+                } else {
+                    time_cache.date.map(|d| spoof_detector::GnssTime {
+                        itow_ms: 0,
+                        year: d.year,
+                        month: d.month,
+                        day: d.day,
+                        hour: fix.time.hour,
+                        min: fix.time.minute,
+                        sec: fix.time.second,
+                        system_time_ms: now_ms,
+                    })
+                };
 
                 let pos = spoof_detector::Position {
                     lat: fix.lat_1e7,
