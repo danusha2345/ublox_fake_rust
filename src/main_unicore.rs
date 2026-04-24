@@ -871,6 +871,39 @@ async fn process_nmea_line(
         }
     }
 
+    // Secondary trigger on RMC: UC6580I often emits RMC before the paired GGA
+    // in the same epoch. If the first post-gap message is an `A`-status RMC at a
+    // spoofed position, the GGA-only detector hasn't fired yet — so the RMC would
+    // leak verbatim (coords=SPB, status=A) before the next GGA rebuild. Compare
+    // RMC lat/lon against the most recent buffered 3D fix; a jump beyond
+    // `TELEPORT_M` is treated as spoof onset so the RMC gets rebuilt with
+    // LAST_GOOD instead of forwarded raw.
+    if is_rmc && !SPOOF_DETECTED.load(Ordering::Acquire) {
+        if let Some(fix) = parsed {
+            if fix.checksum_ok && fix.fix_quality > 0 {
+                if let Some((prev_lat, prev_lon, _)) = pos_buffer.get_position_at(0, now_ms) {
+                    let jump_m = spoof_detector::SpoofDetector::calc_distance(
+                        prev_lat,
+                        prev_lon,
+                        fix.lat_1e7,
+                        fix.lon_1e7,
+                    );
+                    if jump_m > spoof_detector::thresholds::TELEPORT_M {
+                        if let Some((gl, go, ga)) =
+                            pos_buffer.get_position_at(SPOOF_LOOKBACK_SECONDS, now_ms)
+                        {
+                            LAST_GOOD_LAT.store(gl, Ordering::Release);
+                            LAST_GOOD_LON.store(go, Ordering::Release);
+                            LAST_GOOD_ALT.store(ga, Ordering::Release);
+                        }
+                        SPOOF_DETECTED.store(true, Ordering::Release);
+                        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                    }
+                }
+            }
+        }
+    }
+
     let spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
 
     // Non-GGA/RMC messages (GSA/GSV/VTG/…) always pass verbatim — they don't

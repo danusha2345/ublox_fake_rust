@@ -769,8 +769,10 @@ impl SpoofDetector {
         }
     }
 
-    /// Calculate distance between two points in meters using proper lat/lon scaling
-    fn calc_distance(lat1: i32, lon1: i32, lat2: i32, lon2: i32) -> f32 {
+    /// Calculate distance between two points in meters using proper lat/lon scaling.
+    /// Public so secondary (non-UBX) detection paths (e.g. NMEA RMC in the Unicore
+    /// build) can flag large jumps against pos_buffer without duplicating the math.
+    pub fn calc_distance(lat1: i32, lon1: i32, lat2: i32, lon2: i32) -> f32 {
         // Convert from 1e-7 degrees to radians for cos calculation
         // Average latitude for longitude scaling
         let avg_lat_rad = ((lat1 + lat2) / 2) as f32 * 1e-7 * core::f32::consts::PI / 180.0;
