@@ -909,6 +909,15 @@ async fn process_nmea_line(
     // a backward jump > `TIME_JUMP_BACK_S` flips SPOOF_DETECTED. Forward jumps
     // are left unbounded — chip legitimately fast-forwards after a long
     // fix-loss gap when it re-acquires real time.
+    //
+    // Gate: require at least one 3D-fix entry in pos_buffer before firing.
+    // u-blox parity — the internal detector's state-modifying checks only
+    // activate once `self.prev` is set (first Fix3D sample). Until then,
+    // boot-time chip noise (date transitions like 010824→050625, temporary
+    // time rewinds during satellite acquisition) should not be interpreted
+    // as spoof. We still *track* `last_frame_gnss_unix` so that the first
+    // post-3D-fix frame has a reference to compare against.
+    let have_fix_reference = pos_buffer.get_position_at(0, now_ms).is_some();
     if (is_gga || is_rmc) && !SPOOF_DETECTED.load(Ordering::Acquire) {
         if let Some(fix) = parsed {
             if fix.checksum_ok {
@@ -944,17 +953,19 @@ async fn process_nmea_line(
                     }
                     .to_unix_timestamp();
 
-                    if let Some(prev_unix) = time_cache.last_frame_gnss_unix {
-                        if curr_unix < prev_unix - TIME_JUMP_BACK_S {
-                            if let Some((gl, go, ga)) =
-                                pos_buffer.get_position_at(SPOOF_LOOKBACK_SECONDS, now_ms)
-                            {
-                                LAST_GOOD_LAT.store(gl, Ordering::Release);
-                                LAST_GOOD_LON.store(go, Ordering::Release);
-                                LAST_GOOD_ALT.store(ga, Ordering::Release);
+                    if have_fix_reference {
+                        if let Some(prev_unix) = time_cache.last_frame_gnss_unix {
+                            if curr_unix < prev_unix - TIME_JUMP_BACK_S {
+                                if let Some((gl, go, ga)) =
+                                    pos_buffer.get_position_at(SPOOF_LOOKBACK_SECONDS, now_ms)
+                                {
+                                    LAST_GOOD_LAT.store(gl, Ordering::Release);
+                                    LAST_GOOD_LON.store(go, Ordering::Release);
+                                    LAST_GOOD_ALT.store(ga, Ordering::Release);
+                                }
+                                SPOOF_DETECTED.store(true, Ordering::Release);
+                                SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                             }
-                            SPOOF_DETECTED.store(true, Ordering::Release);
-                            SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                         }
                     }
 
