@@ -741,9 +741,20 @@ struct NmeaTimeCache {
     date: Option<unicore::nmea::NmeaDate>,
     date_ms: u32,
     last_gga_sod: Option<u32>,
+    /// Last frame's GNSS unix timestamp (non-spoofed). Used by the time-jump
+    /// secondary to catch backward time shifts on NoFix/V-status frames where
+    /// the detector's `check_gnss_time` is gated behind `has_3d_fix`.
+    last_frame_gnss_unix: Option<i64>,
 }
 
 const NMEA_DATE_FRESHNESS_MS: u32 = 1500;
+
+/// Largest tolerated backward jump between consecutive GNSS timestamps. The
+/// u-blox detector uses the same 1 s threshold (`thresholds::MAX_TIME_JUMP_BACK_S`
+/// inside `check_gnss_time`). Forward jumps are allowed to be unbounded — chips
+/// legitimately fast-forward by the gap duration when re-acquiring after a
+/// long fix loss, so flagging forward jumps would produce false positives.
+const TIME_JUMP_BACK_S: i64 = 1;
 
 async fn process_nmea_line(
     line: &[u8],
@@ -890,8 +901,73 @@ async fn process_nmea_line(
         }
     }
 
-    // Secondary trigger on any coord-carrying GGA/RMC. The GGA-driven detector
-    // only runs on fq>0 samples, so two leaks slip past it:
+    // Secondary trigger #2 — time-jump check on any frame with a derivable
+    // GNSS timestamp. The detector's own `check_gnss_time` is gated behind
+    // `has_3d_fix` (early-return at `spoof_detector.rs:388`), so a spoofer
+    // that shifts date/time on V-status RMCs with empty coords never reaches
+    // it. Compare the current frame's unix timestamp to the previous frame's;
+    // a backward jump > `TIME_JUMP_BACK_S` flips SPOOF_DETECTED. Forward jumps
+    // are left unbounded — chip legitimately fast-forwards after a long
+    // fix-loss gap when it re-acquires real time.
+    if (is_gga || is_rmc) && !SPOOF_DETECTED.load(Ordering::Acquire) {
+        if let Some(fix) = parsed {
+            if fix.checksum_ok {
+                // Derive the frame's gnss_time. RMC carries its own date; for
+                // GGA combine with the cached RMC date (skip if stale, skip on
+                // midnight rollover to avoid a bogus 24 h backward jump).
+                let frame_date = if is_rmc && fix.date.year > 0 {
+                    Some(fix.date)
+                } else if is_gga {
+                    let sod = fix.time.hour as u32 * 3600
+                            + fix.time.minute as u32 * 60
+                            + fix.time.second as u32;
+                    let stale = time_cache.date.is_none()
+                        || now_ms.wrapping_sub(time_cache.date_ms) > NMEA_DATE_FRESHNESS_MS;
+                    let rolled_over = time_cache
+                        .last_gga_sod
+                        .map_or(false, |prev| prev > sod && prev - sod > 12 * 3600);
+                    if stale || rolled_over { None } else { time_cache.date }
+                } else {
+                    None
+                };
+
+                if let Some(d) = frame_date {
+                    let curr_unix = spoof_detector::GnssTime {
+                        itow_ms: 0,
+                        year: d.year,
+                        month: d.month,
+                        day: d.day,
+                        hour: fix.time.hour,
+                        min: fix.time.minute,
+                        sec: fix.time.second,
+                        system_time_ms: now_ms,
+                    }
+                    .to_unix_timestamp();
+
+                    if let Some(prev_unix) = time_cache.last_frame_gnss_unix {
+                        if curr_unix < prev_unix - TIME_JUMP_BACK_S {
+                            if let Some((gl, go, ga)) =
+                                pos_buffer.get_position_at(SPOOF_LOOKBACK_SECONDS, now_ms)
+                            {
+                                LAST_GOOD_LAT.store(gl, Ordering::Release);
+                                LAST_GOOD_LON.store(go, Ordering::Release);
+                                LAST_GOOD_ALT.store(ga, Ordering::Release);
+                            }
+                            SPOOF_DETECTED.store(true, Ordering::Release);
+                            SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                        }
+                    }
+
+                    if !SPOOF_DETECTED.load(Ordering::Acquire) {
+                        time_cache.last_frame_gnss_unix = Some(curr_unix);
+                    }
+                }
+            }
+        }
+    }
+
+    // Secondary trigger #1 on any coord-carrying GGA/RMC. The GGA-driven
+    // detector only runs on fq>0 samples, so two leaks slip past it:
     //   (a) RMC arriving before the paired GGA with status=A at a spoofed position
     //       (UC6580I epoch order can be RMC-first).
     //   (b) An `fq=0 / V-status` message that still carries non-zero coords —
