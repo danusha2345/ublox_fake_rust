@@ -2,10 +2,14 @@
 //!
 //! Supports the same four operating modes as the u-blox build:
 //!   0 Emulation          — fake UC6580I stream: boot-dump + NMEA + ExtRTCM 4074.
-//!   1 Passthrough        — forward UART1 (real UC6580I) → UART0 (drone) verbatim.
-//!   2 PassthroughRaw     — identical to Passthrough in this chip (no spoof detection yet).
-//!   3 PassthroughOffset  — forward, but rewrite `$GxGGA`/`$GxRMC` latitude/longitude
-//!                          to `config::offset_target` on the fly.
+//!   1 Passthrough        — forward UART1 (real UC6580I) → UART0 (drone); reassembles
+//!                          `$GxGGA`/`$GxRMC` to run the shared spoof detector and,
+//!                          when spoofing is flagged, rebuilds GGA/RMC with the
+//!                          `SPOOF_NSATS_MARKER` fingerprint. RTCM3 frames (incl.
+//!                          proprietary msg 4074) pass byte-for-byte.
+//!   2 PassthroughRaw     — byte-for-byte forward, no parsing or spoof detection.
+//!   3 PassthroughOffset  — same as Passthrough, plus rewrites GGA/RMC latitude/
+//!                          longitude to `config::offset_target` on the fly.
 //!
 //! Mode is persisted in the same flash slot as the u-blox build and changed
 //! by clicking the mode button (GPIO13 power, GPIO14 sense) 1..4 times.
@@ -440,6 +444,17 @@ fn enqueue(bytes: &[u8]) {
     }
 }
 
+/// Append one byte to `buf`; flush to TX if full, then retry. Used by the
+/// RTCM/NMEA stream router to forward bytes without allocating.
+#[inline]
+fn buffered_forward(buf: &mut heapless::Vec<u8, 256>, byte: u8) {
+    if buf.push(byte).is_err() {
+        enqueue(buf);
+        buf.clear();
+        let _ = buf.push(byte);
+    }
+}
+
 async fn enqueue_chunked(bytes: &[u8]) {
     let mut off = 0;
     while off < bytes.len() {
@@ -495,9 +510,23 @@ async fn passthrough_forward_task() {
     let mut in_sentence = false;
     let mut last_mode = OperatingMode::load();
 
+    // RTCM3 framing state (preamble 0xD3 + 2-byte big-endian length-header + payload
+    // + 3-byte CRC24). Required so that a stray `$` (0x24) inside an RTCM payload
+    // is NOT misread as the start of an NMEA sentence — that would hand binary
+    // bytes to `asm.feed()` and lose them. RTCM wraps UC6580I proprietary
+    // msg 4074, so this state covers both.
+    let mut rtcm_hdr_have: u8 = 0;    // bytes of the 3-byte header already consumed
+    let mut rtcm_hdr1: u8 = 0;        // header byte 1 (high bits of length)
+    let mut rtcm_remaining: u16 = 0;  // payload + CRC bytes still to forward
+
     // Lazy — created on first entry into Passthrough/PassthroughOffset.
     let mut pos_buffer: Option<PositionBuffer> = None;
     let mut dynamic_offset: Option<DynamicOffset> = None;
+    // Latest date seen in $GxRMC. Combined with the HH:MM:SS from GGA to build
+    // `spoof_detector::GnssTime`, which enables time-jump and system-clock-drift
+    // checks in the shared detector. Without this the Unicore build only had
+    // coordinate-based detection (u-blox parity was partial).
+    let mut last_rmc_date: Option<nmea::NmeaDate> = None;
 
     loop {
         let chunk = RAW_RX_CHANNEL.receive().await;
@@ -514,6 +543,9 @@ async fn passthrough_forward_task() {
             asm = nmea::LineAssembler::new();
             pass_buf.clear();
             in_sentence = false;
+            rtcm_hdr_have = 0;
+            rtcm_remaining = 0;
+            last_rmc_date = None;
             SPOOF_DETECTED.store(false, Ordering::Release);
             SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
             dynamic_offset = None;
@@ -540,12 +572,39 @@ async fn passthrough_forward_task() {
                 let apply_offset = mode == OperatingMode::PassthroughOffset;
 
                 for &b in chunk.iter() {
-                    if !in_sentence && b != b'$' {
-                        if pass_buf.push(b).is_err() {
-                            enqueue(&pass_buf);
-                            pass_buf.clear();
-                            let _ = pass_buf.push(b);
+                    // --- Inside an RTCM frame: forward payload/CRC verbatim. --
+                    if rtcm_remaining > 0 {
+                        buffered_forward(&mut pass_buf, b);
+                        rtcm_remaining -= 1;
+                        continue;
+                    }
+
+                    // --- Reading the 3-byte RTCM header (D3 + 2 length bytes) --
+                    if rtcm_hdr_have > 0 {
+                        buffered_forward(&mut pass_buf, b);
+                        if rtcm_hdr_have == 1 {
+                            rtcm_hdr1 = b;
+                            rtcm_hdr_have = 2;
+                        } else {
+                            // Payload length = low 10 bits of bytes [1..2] big-endian.
+                            let payload_len = (((rtcm_hdr1 as u16) & 0x03) << 8) | (b as u16);
+                            // Remaining = payload + 3-byte CRC24 (header already forwarded).
+                            rtcm_remaining = payload_len + 3;
+                            rtcm_hdr_have = 0;
                         }
+                        continue;
+                    }
+
+                    // --- RTCM3 preamble only outside of an active NMEA sentence --
+                    if !in_sentence && b == 0xD3 {
+                        buffered_forward(&mut pass_buf, b);
+                        rtcm_hdr_have = 1;
+                        continue;
+                    }
+
+                    // --- NMEA routing ------------------------------------------
+                    if !in_sentence && b != b'$' {
+                        buffered_forward(&mut pass_buf, b);
                         continue;
                     }
                     if b == b'$' && !pass_buf.is_empty() {
@@ -561,6 +620,7 @@ async fn passthrough_forward_task() {
                             apply_offset,
                             pos_buffer.as_mut().unwrap(),
                             &mut dynamic_offset,
+                            &mut last_rmc_date,
                         ).await;
                     }
                 }
@@ -631,6 +691,7 @@ async fn process_nmea_line(
     apply_offset: bool,
     pos_buffer: &mut PositionBuffer,
     dynamic_offset: &mut Option<DynamicOffset>,
+    last_rmc_date: &mut Option<unicore::nmea::NmeaDate>,
 ) {
     use unicore::nmea;
 
@@ -643,12 +704,35 @@ async fn process_nmea_line(
         else if is_rmc { nmea::parse_rmc(line) }
         else { None };
 
+    // Cache the RMC date. GGA has no date of its own, so we combine it with
+    // the last-seen RMC date to feed `GnssTime` into the shared detector.
+    if is_rmc {
+        if let Some(fix) = parsed {
+            if fix.checksum_ok && fix.fix_quality > 0 && fix.date.year > 0 {
+                *last_rmc_date = Some(fix.date);
+            }
+        }
+    }
+
     // --- Detector + pos_buffer: GGA only -------------------------------------
     if is_gga {
         if let Some(fix) = parsed {
             if fix.checksum_ok && fix.fix_quality > 0 {
                 // Store only valid 3D-fix samples (u-blox parity: skip no-fix).
                 pos_buffer.push(fix.lat_1e7, fix.lon_1e7, fix.alt_mm, now_ms);
+
+                // Build GnssTime from GGA time + cached RMC date so that
+                // time-jump and system-clock-drift checks run on Unicore too.
+                let gnss_time = last_rmc_date.map(|d| spoof_detector::GnssTime {
+                    itow_ms: 0,
+                    year: d.year,
+                    month: d.month,
+                    day: d.day,
+                    hour: fix.time.hour,
+                    min: fix.time.minute,
+                    sec: fix.time.second,
+                    system_time_ms: now_ms,
+                });
 
                 let pos = spoof_detector::Position {
                     lat: fix.lat_1e7,
@@ -659,7 +743,7 @@ async fn process_nmea_line(
                     h_acc_mm: 0,
                     num_sv: fix.nsats,
                     pdop: 100,
-                    gnss_time: None,
+                    gnss_time,
                     cno_values: heapless::Vec::new(),
                 };
 

@@ -80,23 +80,26 @@ pub fn parse_command(line: &[u8]) -> Result<Command<'_>, ParseError> {
     };
     let _ = has_cs;
 
-    // Split by comma. Field 0 is the command name.
+    // Split by comma. Field 0 is the command name. Max 16 fields (name + 15 args);
+    // anything beyond that is malformed — reject rather than silently drop.
     let mut fields: [&[u8]; 16] = [&[][..]; 16];
     let mut count = 0;
     let mut last = 0;
     for i in 0..fields_slice.len() {
         if fields_slice[i] == b',' {
-            if count < fields.len() {
-                fields[count] = &fields_slice[last..i];
-                count += 1;
+            if count >= fields.len() {
+                return Err(ParseError::Malformed);
             }
+            fields[count] = &fields_slice[last..i];
+            count += 1;
             last = i + 1;
         }
     }
-    if count < fields.len() {
-        fields[count] = &fields_slice[last..];
-        count += 1;
+    if count >= fields.len() {
+        return Err(ParseError::Malformed);
     }
+    fields[count] = &fields_slice[last..];
+    count += 1;
     let name = fields[0];
     let args = &fields[1..count];
 

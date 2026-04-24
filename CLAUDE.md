@@ -66,6 +66,7 @@ Mode persisted to flash. Button: 1-4 clicks. Timeout: 800ms.
 - **Coord recovery = 6 samples** (not 5): returning from spoofed position is itself a teleport
 - **Spoof marker**: `spoof_detector::SPOOF_NSATS_MARKER` (=92) — impossible sat count planted in NAV-PVT/SOL/SAT/SVINFO and NMEA GGA under spoof
 - **Diagnostic mode**: `DIAG_MSG_DETAIL = true` in main.rs
+- **Unicore passthrough router is RTCM-aware** (`passthrough_forward_task` in `src/main_unicore.rs`): detect `0xD3` preamble before splitting on `$`, otherwise a `$` (0x24) byte inside an RTCM payload steals the rest of the frame into `LineAssembler` and it is silently dropped. Covers ExtRTCM 4074.
 
 ## Detailed Reference (Serena memories)
 
