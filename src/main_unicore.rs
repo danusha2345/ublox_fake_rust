@@ -871,16 +871,20 @@ async fn process_nmea_line(
         }
     }
 
-    // Secondary trigger on RMC: UC6580I often emits RMC before the paired GGA
-    // in the same epoch. If the first post-gap message is an `A`-status RMC at a
-    // spoofed position, the GGA-only detector hasn't fired yet — so the RMC would
-    // leak verbatim (coords=SPB, status=A) before the next GGA rebuild. Compare
-    // RMC lat/lon against the most recent buffered 3D fix; a jump beyond
-    // `TELEPORT_M` is treated as spoof onset so the RMC gets rebuilt with
-    // LAST_GOOD instead of forwarded raw.
-    if is_rmc && !SPOOF_DETECTED.load(Ordering::Acquire) {
+    // Secondary trigger on any coord-carrying GGA/RMC. The GGA-driven detector
+    // only runs on fq>0 samples, so two leaks slip past it:
+    //   (a) RMC arriving before the paired GGA with status=A at a spoofed position
+    //       (UC6580I epoch order can be RMC-first).
+    //   (b) An `fq=0 / V-status` message that still carries non-zero coords —
+    //       UC6580I emits such frames for ~1 tick before upgrading to fq>0, and
+    //       the raw coords can still be consumed by the drone.
+    // Fires on any checksum_ok message with non-zero coords whose jump vs the
+    // most recent buffered 3D fix exceeds TELEPORT_M. Capture LAST_GOOD via the
+    // lookback and flip SPOOF_DETECTED so the rebuild block below replaces the
+    // coords regardless of the fix-quality field.
+    if (is_gga || is_rmc) && !SPOOF_DETECTED.load(Ordering::Acquire) {
         if let Some(fix) = parsed {
-            if fix.checksum_ok && fix.fix_quality > 0 {
+            if fix.checksum_ok && (fix.lat_1e7 != 0 || fix.lon_1e7 != 0) {
                 if let Some((prev_lat, prev_lon, _)) = pos_buffer.get_position_at(0, now_ms) {
                     let jump_m = spoof_detector::SpoofDetector::calc_distance(
                         prev_lat,
