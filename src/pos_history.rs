@@ -38,25 +38,35 @@ impl PositionBuffer {
         }
     }
 
-    /// Returns the entry whose timestamp is closest to `seconds_ago` before `current_time_ms`.
-    /// `None` if the buffer is empty.
+    /// Returns the entry whose timestamp is closest to `seconds_ago` before `current_time_ms`,
+    /// considering only entries that are **at least** `seconds_ago` old. The age gate matters
+    /// when a spoof sample was just pushed (callers `push()` before analysing): without it,
+    /// the fresh spoofed entry wins as "closest to 2 s ago" against stale pre-gap fixes and
+    /// then gets stored as `LAST_GOOD`. `None` if no eligible entry exists.
     pub fn get_position_at(&self, seconds_ago: u32, current_time_ms: u32) -> Option<(i32, i32, i32)> {
         if self.count == 0 {
             return None;
         }
-        let target = current_time_ms.wrapping_sub(seconds_ago * 1000);
-        let mut best_idx = 0;
+        let lookback_ms = seconds_ago * 1000;
+        let target = current_time_ms.wrapping_sub(lookback_ms);
+        let mut best_idx: Option<usize> = None;
         let mut best_diff = u32::MAX;
         for i in 0..self.count {
             let idx = (self.write_idx + CAPACITY - 1 - i) % CAPACITY;
+            let age = current_time_ms.wrapping_sub(self.entries[idx].timestamp_ms);
+            if age < lookback_ms {
+                continue;
+            }
             let diff = self.entries[idx].timestamp_ms.abs_diff(target);
             if diff < best_diff {
                 best_diff = diff;
-                best_idx = idx;
+                best_idx = Some(idx);
             }
         }
-        let e = &self.entries[best_idx];
-        Some((e.lat, e.lon, e.alt))
+        best_idx.map(|idx| {
+            let e = &self.entries[idx];
+            (e.lat, e.lon, e.alt)
+        })
     }
 }
 

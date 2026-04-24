@@ -742,6 +742,44 @@ fn test_position_buffer_nofix_corruption_demo() {
     assert_eq!(lon, 0);
 }
 
+/// Regression (2026-04-24, Unicore mode 2 field capture log_2026-04-24_14-38-32):
+/// real fix @ Montana for ~10 s → 43 s no-fix gap → spoofer kicks in with a valid-looking
+/// fix at SPB coords. `process_nmea_line` pushes the fresh SPB sample into pos_buffer
+/// *before* invoking the detector; when the detector fires, `get_position_at(2, now)`
+/// must still return the *old* Montana entry — not the just-pushed spoof sample, even
+/// though the spoof sample's timestamp is numerically closer to `now - 2 s`.
+#[test]
+fn test_position_buffer_rejects_fresh_entry_on_lookback() {
+    let mut buf = PositionBuffer::new();
+
+    // 10 good Montana samples at t=0..1800 ms.
+    for i in 0u32..10 {
+        buf.push(BASE_LAT + (i as i32) * 100, BASE_LON, BASE_ALT, i * 200);
+    }
+
+    // 43 s gap (no pushes — no valid fix from the chip), then the spoofer
+    // drops a fresh "valid" fix at t=44000 ms. Callers push *before* analysing,
+    // so the spoof sample is already in the buffer when get_position_at runs.
+    let spoof_lat = BASE_LAT + 10_000_000;
+    buf.push(spoof_lat, BASE_LON + 10_000_000, BASE_ALT, 44_000);
+
+    let now_ms = 44_000u32;
+    let (lat, _lon, _alt) = buf
+        .get_position_at(2, now_ms)
+        .expect("stale Montana entries must still satisfy the age gate");
+
+    assert!(
+        lat < spoof_lat,
+        "get_position_at(2, now) returned the fresh spoof sample (lat={}) instead of a pre-gap entry",
+        lat,
+    );
+    assert!(
+        lat >= BASE_LAT && lat < BASE_LAT + 10 * 100,
+        "expected a Montana-range lat, got {}",
+        lat,
+    );
+}
+
 /// After satellite loss gap, buffer entries still hold pre-loss positions
 /// with timestamps far in the past. get_position_at(2, now) returns the closest
 /// available entry even if it's older than 2 seconds.

@@ -47,7 +47,7 @@ Inter-core: `Signal`/`Channel` (embassy-sync). Mode state: `AtomicU8`.
 ### Operating Modes
 | Mode | ID | LED | Description |
 |------|----|-----|-------------|
-| Emulation | 0 | green | Fake GNSS + SEC-SIGN |
+| Emulation | 0 | green/yellow | Fake GNSS + SEC-SIGN; yellow after invalid-satellite timeout |
 | Passthrough | 1 | blue | Forward real GNSS, spoof detection |
 | PassthroughRaw | 2 | purple | Transparent forwarding |
 | PassthroughOffset | 3 | white | Passthrough + coordinate offset |
@@ -67,7 +67,9 @@ Mode persisted to flash. Button: 1-4 clicks. Timeout: 800ms.
 - **Spoof marker**: `spoof_detector::SPOOF_NSATS_MARKER` (=92) — impossible sat count planted in NAV-PVT/SOL/SAT/SVINFO and NMEA GGA under spoof
 - **Diagnostic mode**: `DIAG_MSG_DETAIL = true` in main.rs
 - **Unicore UART signal integrity**: `src/main_unicore.rs` must mirror the proven u-blox hardware UART settings: GPIO0 UART0 TX pad = 12mA drive + pull-down + fast slew, and UART1 RX FIFO threshold = 1/4. If raw passthrough also outputs garbage at 921600, check these settings before protocol logic.
+- **Unicore mode 1 parity**: Emulation mirrors u-blox mode 1 timing: valid fix + green LED first, then invalid fix + yellow LED after `SATELLITES_INVALID_AFTER_MS`.
 - **Unicore passthrough router is RTCM-aware** (`passthrough_forward_task` in `src/main_unicore.rs`): detect `0xD3` preamble before splitting on `$`, otherwise a `$` (0x24) byte inside an RTCM payload steals the rest of the frame into `LineAssembler` and it is silently dropped. Covers ExtRTCM 4074.
+- **pos_buffer lookback age-gate**: callers `pos_buffer.push()` **before** `detector.analyze()`. After a long fix-loss gap (> 3 s ring capacity), the first new sample wins "closest-to-now-2s" against stale pre-gap entries if the gate is missing → `LAST_GOOD` captures the spoofed position. `pos_history::get_position_at` must only return entries with `age >= seconds_ago*1000`. Shared by u-blox and Unicore branches; sibling to the 2026-04-03 `has_3d_fix()` push-site guard but orthogonal. Regression log: `log_2026-04-24_14-38-32.txt`.
 
 ## Detailed Reference (Serena memories)
 
