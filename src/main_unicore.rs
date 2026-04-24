@@ -200,6 +200,16 @@ async fn main(spawner: Spawner) {
     );
     let (uart0_tx, uart0_rx) = uart0.split();
 
+    // Same electrical UART0 TX settings as the u-blox build. Default pad drive
+    // is marginal at 921600 baud on the drone harness and can show up as
+    // garbage in every Unicore mode, including raw passthrough.
+    rp_pac::PADS_BANK0.gpio(0).modify(|w| {
+        w.set_drive(rp_pac::pads::vals::Drive::_12M_A);
+        w.set_pde(true);
+        w.set_slewfast(true);
+    });
+    info!("GPIO0 (UART0 TX): 12mA drive, pull-down, fast slew");
+
     // UART1: real UC6580I source (921600, RX=GPIO5).
     static TX_BUF1: StaticCell<[u8; 128]> = StaticCell::new();
     static RX_BUF1: StaticCell<[u8; 4096]> = StaticCell::new();
@@ -211,6 +221,14 @@ async fn main(spawner: Spawner) {
         &mut RX_BUF1.init([0; 4096])[..],
         uart1_config,
     );
+    // Embassy's default RX FIFO interrupt threshold is too high for the dense
+    // UC6580I NMEA+RTCM stream at 921600 baud. Keep it aligned with the
+    // u-blox passthrough path and key-extraction path.
+    rp_pac::UART1.uartifls().write(|w| {
+        w.set_rxiflsel(0b001); // 1/4 full (4 bytes)
+        w.set_txiflsel(0b000);
+    });
+    info!("UART1 RX FIFO threshold set to 1/4 (4 bytes)");
     let (_uart1_tx, uart1_rx) = uart1.split();
 
     // Button (GPIO13 = PWR, GPIO14 = sense) — same pinout as u-blox build.
@@ -1129,7 +1147,7 @@ async fn led_task(
             if phase.is_multiple_of(2) { RGB8::new(60, 0, 0) } else { RGB8::new(0, 0, 0) }
         } else {
             let colour = match mode {
-                OperatingMode::Emulation       => RGB8::new(40, 20, 0),  // orange
+                OperatingMode::Emulation       => RGB8::new(0, 40, 0),   // green
                 OperatingMode::Passthrough     => RGB8::new(0, 30, 30),  // cyan
                 OperatingMode::PassthroughRaw  => RGB8::new(30, 0, 30),  // magenta
                 OperatingMode::PassthroughOffset => RGB8::new(40, 30, 0), // yellow

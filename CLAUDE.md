@@ -47,7 +47,7 @@ Inter-core: `Signal`/`Channel` (embassy-sync). Mode state: `AtomicU8`.
 ### Operating Modes
 | Mode | ID | LED | Description |
 |------|----|-----|-------------|
-| Emulation | 0 | green/yellow | Fake GNSS + SEC-SIGN |
+| Emulation | 0 | green | Fake GNSS + SEC-SIGN |
 | Passthrough | 1 | blue | Forward real GNSS, spoof detection |
 | PassthroughRaw | 2 | purple | Transparent forwarding |
 | PassthroughOffset | 3 | white | Passthrough + coordinate offset |
@@ -66,6 +66,7 @@ Mode persisted to flash. Button: 1-4 clicks. Timeout: 800ms.
 - **Coord recovery = 6 samples** (not 5): returning from spoofed position is itself a teleport
 - **Spoof marker**: `spoof_detector::SPOOF_NSATS_MARKER` (=92) — impossible sat count planted in NAV-PVT/SOL/SAT/SVINFO and NMEA GGA under spoof
 - **Diagnostic mode**: `DIAG_MSG_DETAIL = true` in main.rs
+- **Unicore UART signal integrity**: `src/main_unicore.rs` must mirror the proven u-blox hardware UART settings: GPIO0 UART0 TX pad = 12mA drive + pull-down + fast slew, and UART1 RX FIFO threshold = 1/4. If raw passthrough also outputs garbage at 921600, check these settings before protocol logic.
 - **Unicore passthrough router is RTCM-aware** (`passthrough_forward_task` in `src/main_unicore.rs`): detect `0xD3` preamble before splitting on `$`, otherwise a `$` (0x24) byte inside an RTCM payload steals the rest of the frame into `LineAssembler` and it is silently dropped. Covers ExtRTCM 4074.
 
 ## Detailed Reference (Serena memories)
