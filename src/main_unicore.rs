@@ -30,7 +30,7 @@ mod version {
     include!(concat!(env!("OUT_DIR"), "/version.rs"));
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -95,6 +95,9 @@ static MODE: AtomicU8 = AtomicU8::new(OperatingMode::PassthroughOffset as u8);
 
 static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 32> = Channel::new();
 static RAW_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 64> = Channel::new();
+
+static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
+static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
 
 type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { config::FLASH_SIZE_BYTES }>>;
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
@@ -971,6 +974,7 @@ async fn emulation_task() {
             booted = false;
             centis = start_centis;
             counter = 0;
+            SATELLITES_INVALID.store(false, Ordering::Release);
             continue;
         }
         if !booted {
@@ -978,14 +982,22 @@ async fn emulation_task() {
             booted = true;
             counter = 0;
             centis = start_centis;
+            OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
+            SATELLITES_INVALID.store(false, Ordering::Release);
         }
         counter = counter.wrapping_add(1);
         centis += 20;
 
-        // Fix is reported from the very first tick — no warm-up.
-        let valid = true;
-        let fix_quality: u8 = 1;
-        let nsats: u8 = 16;
+        // Keep mode-1 behavior aligned with the u-blox build: initially valid,
+        // then force invalid satellites after the configured output timeout.
+        let start_time = OUTPUT_START_MILLIS.load(Ordering::Acquire);
+        let elapsed_ms = (Instant::now().as_millis() as u32).wrapping_sub(start_time);
+        let satellites_invalid = elapsed_ms >= config::timers::SATELLITES_INVALID_AFTER_MS as u32;
+        SATELLITES_INVALID.store(satellites_invalid, Ordering::Release);
+
+        let valid = !satellites_invalid;
+        let fix_quality: u8 = if valid { 1 } else { 0 };
+        let nsats: u8 = if valid { 16 } else { 1 };
 
         // Unpack simulated time
         let total_s = centis / 100;
@@ -1039,16 +1051,18 @@ async fn emulation_task() {
             ];
             for (sys_id, prn_list) in sys_prns {
                 let mut sats: [u16; 12] = [0; 12];
-                for (i, &prn) in prn_list.iter().enumerate().take(12) {
-                    sats[i] = prn;
+                if valid {
+                    for (i, &prn) in prn_list.iter().enumerate().take(12) {
+                        sats[i] = prn;
+                    }
                 }
                 let gsa = GsaFields {
                     op_mode: GsaOpMode::Automatic,
-                    fix_type: 3,
+                    fix_type: if valid { 3 } else { 1 },
                     sats,
-                    pdop_x100: 99,
-                    hdop_x100: 99,
-                    vdop_x100: 99,
+                    pdop_x100: if valid { 99 } else { 9999 },
+                    hdop_x100: if valid { 99 } else { 9999 },
+                    vdop_x100: if valid { 99 } else { 9999 },
                     system_id: *sys_id,
                 };
                 let n = build_gsa(&mut buf, Talker::Gn, &gsa);
@@ -1059,25 +1073,36 @@ async fn emulation_task() {
         // GSV every 5th tick (rate=5): per-talker pages advertising the same
         // 16 SVs split across constellations. View count matches GGA nsats.
         if counter % 5 == 0 {
-            // (talker, signal_id, satellites for this talker's view)
-            let pages: &[(Talker, u8, &[(u16, u8, u16, u8)])] = &[
-                (Talker::Gp, 1, &[(5, 45, 90, 45), (13, 60, 180, 47), (15, 30, 270, 42), (20, 80, 0, 50)]),
-                (Talker::Gb, 1, &[(6, 35, 60, 43), (14, 50, 150, 45), (20, 70, 210, 44), (27, 25, 300, 41)]),
-                (Talker::Ga, 7, &[(2, 40, 45, 46), (11, 55, 135, 48), (18, 28, 225, 41)]),
-                (Talker::Gl, 1, &[(65, 42, 110, 44), (70, 68, 200, 46), (75, 22, 330, 40)]),
-                (Talker::Gq, 1, &[(193, 55, 180, 47), (194, 40, 240, 43)]),
-            ];
-            for (talker, sig, sats) in pages {
-                let mut arr: [GsvSat; 4] = [GsvSat::default(); 4];
-                for (i, s) in sats.iter().enumerate().take(4) {
-                    arr[i] = GsvSat {
-                        prn: s.0,
-                        elevation_deg: s.1,
-                        azimuth_deg: s.2,
-                        cno_dbhz: s.3,
-                    };
+            if valid {
+                // (talker, signal_id, satellites for this talker's view)
+                let pages: &[(Talker, u8, &[(u16, u8, u16, u8)])] = &[
+                    (Talker::Gp, 1, &[(5, 45, 90, 45), (13, 60, 180, 47), (15, 30, 270, 42), (20, 80, 0, 50)]),
+                    (Talker::Gb, 1, &[(6, 35, 60, 43), (14, 50, 150, 45), (20, 70, 210, 44), (27, 25, 300, 41)]),
+                    (Talker::Ga, 7, &[(2, 40, 45, 46), (11, 55, 135, 48), (18, 28, 225, 41)]),
+                    (Talker::Gl, 1, &[(65, 42, 110, 44), (70, 68, 200, 46), (75, 22, 330, 40)]),
+                    (Talker::Gq, 1, &[(193, 55, 180, 47), (194, 40, 240, 43)]),
+                ];
+                for (talker, sig, sats) in pages {
+                    let mut arr: [GsvSat; 4] = [GsvSat::default(); 4];
+                    for (i, s) in sats.iter().enumerate().take(4) {
+                        arr[i] = GsvSat {
+                            prn: s.0,
+                            elevation_deg: s.1,
+                            azimuth_deg: s.2,
+                            cno_dbhz: s.3,
+                        };
+                    }
+                    let n = build_gsv(&mut buf, *talker, 1, 1, nsats, &arr[..sats.len().min(4)], *sig);
+                    if n > 0 { enqueue(&buf[..n]); }
                 }
-                let n = build_gsv(&mut buf, *talker, 1, 1, nsats, &arr[..sats.len().min(4)], *sig);
+            } else {
+                let invalid_sat = [GsvSat {
+                    prn: 1,
+                    elevation_deg: 0,
+                    azimuth_deg: 0,
+                    cno_dbhz: 0,
+                }];
+                let n = build_gsv(&mut buf, Talker::Gp, 1, 1, nsats, &invalid_sat, 1);
                 if n > 0 { enqueue(&buf[..n]); }
             }
         }
@@ -1139,6 +1164,7 @@ async fn led_task(
         phase = phase.wrapping_add(1);
         let mode = OperatingMode::load();
         let spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
+        let sats_invalid = SATELLITES_INVALID.load(Ordering::Acquire);
 
         // Spoof detection in Passthrough/PassthroughOffset: fast-blink red.
         let value = if spoofed
@@ -1147,7 +1173,9 @@ async fn led_task(
             if phase.is_multiple_of(2) { RGB8::new(60, 0, 0) } else { RGB8::new(0, 0, 0) }
         } else {
             let colour = match mode {
-                OperatingMode::Emulation       => RGB8::new(0, 40, 0),   // green
+                OperatingMode::Emulation       => {
+                    if sats_invalid { RGB8::new(30, 20, 0) } else { RGB8::new(0, 30, 0) }
+                }
                 OperatingMode::Passthrough     => RGB8::new(0, 30, 30),  // cyan
                 OperatingMode::PassthroughRaw  => RGB8::new(30, 0, 30),  // magenta
                 OperatingMode::PassthroughOffset => RGB8::new(40, 30, 0), // yellow
@@ -1222,6 +1250,10 @@ async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
                 let current = OperatingMode::load();
                 if new_mode != current {
                     new_mode.store();
+                    if new_mode == OperatingMode::Emulation {
+                        OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
+                        SATELLITES_INVALID.store(false, Ordering::Release);
+                    }
                     SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
                     let mut flash = flash.lock().await;
                     flash_storage::save_mode(&mut flash, new_mode as u8).await;
