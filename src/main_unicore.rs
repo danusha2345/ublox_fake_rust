@@ -765,21 +765,36 @@ async fn process_nmea_line(
 
     // Cache the RMC date. GGA has no date of its own, so we combine it with
     // the last-seen RMC date to feed `GnssTime` into the shared detector.
+    // Accept V-status RMC too — the chip still emits date+time during no-fix
+    // ticks, and u-blox parity requires time-jump checks to run on the first
+    // post-gap frame even before fq flips to 1. We only gate on structural
+    // integrity (checksum + non-zero year), not on fix validity.
     if is_rmc {
         if let Some(fix) = parsed {
-            if fix.checksum_ok && fix.fix_quality > 0 && fix.date.year > 0 {
+            if fix.checksum_ok && fix.date.year > 0 {
                 time_cache.date = Some(fix.date);
                 time_cache.date_ms = now_ms;
             }
         }
     }
 
-    // --- Detector + pos_buffer: GGA only -------------------------------------
+    // --- Detector + pos_buffer: GGA (u-blox parity) --------------------------
+    // u-blox calls `detector.analyze()` on every NAV-PVT regardless of fix_type;
+    // the detector itself short-circuits on NoFix samples. Match that here: fire
+    // on every checksum-ok GGA, passing the fix_type derived from fq. Only push
+    // into pos_buffer on 3D-fix ticks to keep LAST_GOOD lookback uncontaminated.
     if is_gga {
         if let Some(fix) = parsed {
-            if fix.checksum_ok && fix.fix_quality > 0 {
-                // Store only valid 3D-fix samples (u-blox parity: skip no-fix).
-                pos_buffer.push(fix.lat_1e7, fix.lon_1e7, fix.alt_mm, now_ms);
+            if fix.checksum_ok {
+                let fix_type = if fix.fix_quality > 0 {
+                    spoof_detector::FixType::Fix3D
+                } else {
+                    spoof_detector::FixType::NoFix
+                };
+
+                if fix_type.has_3d_fix() {
+                    pos_buffer.push(fix.lat_1e7, fix.lon_1e7, fix.alt_mm, now_ms);
+                }
 
                 // Build GnssTime from GGA time + cached RMC date so that
                 // time-jump and system-clock-drift checks run on Unicore too.
@@ -820,7 +835,7 @@ async fn process_nmea_line(
                     lon: fix.lon_1e7,
                     alt_mm: fix.alt_mm,
                     time_ms: now_ms,
-                    fix_type: spoof_detector::FixType::Fix3D,
+                    fix_type,
                     h_acc_mm: 0,
                     num_sv: fix.nsats,
                     pdop: 100,
@@ -860,7 +875,11 @@ async fn process_nmea_line(
                 }
 
                 // Compute dynamic offset at first real 3D fix (Offset mode only).
-                if apply_offset && dynamic_offset.is_none() && fix.nsats >= 4 {
+                if fix_type.has_3d_fix()
+                    && apply_offset
+                    && dynamic_offset.is_none()
+                    && fix.nsats >= 4
+                {
                     *dynamic_offset = Some(DynamicOffset {
                         lat_1e7: config::offset_target::LAT_1E7.saturating_sub(fix.lat_1e7),
                         lon_1e7: config::offset_target::LON_1E7.saturating_sub(fix.lon_1e7),
