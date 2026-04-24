@@ -43,7 +43,9 @@ use embassy_rp::peripherals::PIO0;
 #[cfg(not(feature = "rp2354"))]
 use embassy_rp::pio::Pio;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config as UartConfig};
+use core::cell::RefCell;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Ticker, Timer};
@@ -87,7 +89,7 @@ impl OperatingMode {
     fn store(self) { MODE.store(self as u8, Ordering::Release); }
 }
 
-static MODE: AtomicU8 = AtomicU8::new(OperatingMode::PassthroughOffset as u8);
+static MODE: AtomicU8 = AtomicU8::new(OperatingMode::Passthrough as u8);
 
 // ---------------------------------------------------------------------------
 // Shared channels
@@ -98,6 +100,95 @@ static RAW_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 
 
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
 static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
+
+/// Boot-handshake capture: collect the first N checksum-ok config NMEA lines
+/// (all non-streaming sentences — i.e. not GGA/RMC/GSA/GSV/GLL/VTG/ZDA/TXT/
+/// PNOISE) in each direction into a RAM buffer, then stop. `boot_log_dump_task`
+/// periodically prints the buffer so an `attach` after boot still shows the
+/// captured handshake.
+const BOOT_LOG_MAX: u8 = 15;
+const BOOT_LOG_LINE_MAX: usize = 128;
+const BOOT_LOG_TOTAL: usize = 3 * BOOT_LOG_MAX as usize;
+
+#[derive(Clone, Copy)]
+struct BootLogLine {
+    direction: u8,
+    len: u8,
+    buf: [u8; BOOT_LOG_LINE_MAX],
+}
+
+impl BootLogLine {
+    const EMPTY: Self = Self {
+        direction: 0,
+        len: 0,
+        buf: [0; BOOT_LOG_LINE_MAX],
+    };
+}
+
+struct BootLogBuf {
+    entries: [BootLogLine; BOOT_LOG_TOTAL],
+    count: usize,
+}
+
+impl BootLogBuf {
+    const fn new() -> Self {
+        Self {
+            entries: [BootLogLine::EMPTY; BOOT_LOG_TOTAL],
+            count: 0,
+        }
+    }
+}
+
+static BOOT_LOG: BlockingMutex<CriticalSectionRawMutex, RefCell<BootLogBuf>> =
+    BlockingMutex::new(RefCell::new(BootLogBuf::new()));
+static BOOT_LOG_DRONE_TO_CHIP: AtomicU8 = AtomicU8::new(0);
+static BOOT_LOG_CHIP_TO_US: AtomicU8 = AtomicU8::new(0);
+static BOOT_LOG_US_TO_DRONE: AtomicU8 = AtomicU8::new(0);
+
+/// Append a captured line (already trimmed of CR/LF) into `BOOT_LOG`.
+/// Direction: 0 = DRONE→CHIP, 1 = CHIP→US, 2 = US→DRONE.
+fn boot_log_push(direction: u8, line: &[u8]) {
+    BOOT_LOG.lock(|m| {
+        let mut log = m.borrow_mut();
+        if log.count >= BOOT_LOG_TOTAL {
+            return;
+        }
+        let idx = log.count;
+        let n = line.len().min(BOOT_LOG_LINE_MAX);
+        log.entries[idx].direction = direction;
+        log.entries[idx].len = n as u8;
+        log.entries[idx].buf[..n].copy_from_slice(&line[..n]);
+        log.count += 1;
+    });
+}
+
+/// Periodically dump the entire boot log to RTT so late `probe-rs attach`
+/// sessions can still see the handshake after the defmt ring has wrapped.
+#[embassy_executor::task]
+async fn boot_log_dump_task() {
+    Timer::after(Duration::from_secs(4)).await;
+    loop {
+        BOOT_LOG.lock(|m| {
+            let log = m.borrow();
+            if log.count == 0 {
+                return;
+            }
+            info!("=== BOOT LOG ({} entries) ===", log.count as u32);
+            for i in 0..log.count {
+                let e = &log.entries[i];
+                let tag = match e.direction {
+                    0 => "DRONE→CHIP",
+                    1 => "CHIP→US",
+                    _ => "US→DRONE",
+                };
+                let data = &e.buf[..e.len as usize];
+                info!("#{} [{}] {=[u8]:a}", (i + 1) as u32, tag, data);
+            }
+            info!("=== END BOOT LOG ===");
+        });
+        Timer::after(Duration::from_secs(15)).await;
+    }
+}
 
 type FlashMutex = Mutex<CriticalSectionRawMutex, Flash<'static, FLASH, Async, { config::FLASH_SIZE_BYTES }>>;
 static FLASH_CELL: StaticCell<FlashMutex> = StaticCell::new();
@@ -180,9 +271,9 @@ async fn main(spawner: Spawner) {
             .map(|s| s.as_str() != version::FW_VERSION)
             .unwrap_or(true);
         if version_changed {
-            info!("New firmware version, resetting mode to PassthroughOffset");
-            OperatingMode::PassthroughOffset.store();
-            flash_storage::save_mode(&mut flash, OperatingMode::PassthroughOffset as u8).await;
+            info!("New firmware version, resetting mode to Passthrough");
+            OperatingMode::Passthrough.store();
+            flash_storage::save_mode(&mut flash, OperatingMode::Passthrough as u8).await;
         } else if let Some(b) = flash_storage::load_mode(&mut flash) {
             OperatingMode::from_u8(b).store();
             info!("Loaded mode from flash: {:?}", OperatingMode::load());
@@ -257,6 +348,7 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(passthrough_forward_task());
     spawner.must_spawn(emulation_task());
     spawner.must_spawn(button_task(btn_flex, flash_mutex));
+    spawner.must_spawn(boot_log_dump_task());
 
     info!("All tasks spawned — mode = {:?}", OperatingMode::load());
 
@@ -271,11 +363,62 @@ async fn main(spawner: Spawner) {
 
 #[embassy_executor::task]
 async fn uart0_tx_task(mut tx: BufferedUartTx) {
+    let mut diag_asm: unicore::nmea::LineAssembler<320> = unicore::nmea::LineAssembler::new();
     loop {
         let frame = TX_CHANNEL.receive().await;
+        // Boot-handshake capture: log only the first BOOT_LOG_MAX config lines
+        // (non-streaming sentences). Guarded by counter so it's a no-op once
+        // capped.
+        if BOOT_LOG_US_TO_DRONE.load(Ordering::Relaxed) < BOOT_LOG_MAX {
+            for &b in frame.iter() {
+                if let Some(line) = diag_asm.feed(b) {
+                    if is_config_line(line)
+                        && BOOT_LOG_US_TO_DRONE.load(Ordering::Relaxed) < BOOT_LOG_MAX
+                    {
+                        let n = BOOT_LOG_US_TO_DRONE.fetch_add(1, Ordering::Relaxed);
+                        if n < BOOT_LOG_MAX {
+                            let trimmed = strip_crlf(line);
+                            info!("[US→DRONE #{}] {=[u8]:a}", (n + 1) as u32, trimmed);
+                            boot_log_push(2, trimmed);
+                        }
+                    }
+                }
+            }
+        }
         if let Err(e) = tx.write_all(&frame).await {
             warn!("uart0 tx error: {:?}", defmt::Debug2Format(&e));
         }
+    }
+}
+
+/// Strip trailing `\r\n` for prettier log output.
+fn strip_crlf(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Is this NMEA line part of the config/boot handshake (as opposed to periodic
+/// streaming data)? Filters out high-rate sentences the chip emits at 5 Hz.
+fn is_config_line(line: &[u8]) -> bool {
+    let body = strip_crlf(line);
+    if body.len() < 4 || body[0] != b'$' {
+        return false;
+    }
+    // Proprietary sentences ($P...) are interesting (PDTINFO, PSMT, …) except
+    // for PNOISE which is a periodic telemetry stream.
+    if body[1] == b'P' {
+        return body.len() < 7 || &body[1..7] != *b"PNOISE";
+    }
+    // Standard NMEA: skip the noisy periodic sentences.
+    if body.len() < 6 {
+        return true;
+    }
+    match &body[3..6] {
+        b"GGA" | b"RMC" | b"GSA" | b"GSV" | b"GLL" | b"VTG" | b"ZDA" | b"TXT" => false,
+        _ => true,
     }
 }
 
@@ -287,9 +430,27 @@ async fn uart0_tx_task(mut tx: BufferedUartTx) {
 async fn uart0_rx_task(mut rx: BufferedUartRx) {
     let mut buf = [0u8; 128];
     let mut asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
+    let mut diag_asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
     loop {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
+                // Boot capture from drone bus (config lines only, capped).
+                if BOOT_LOG_DRONE_TO_CHIP.load(Ordering::Relaxed) < BOOT_LOG_MAX {
+                    for &b in &buf[..n] {
+                        if let Some(line) = diag_asm.feed(b) {
+                            if is_config_line(line)
+                                && BOOT_LOG_DRONE_TO_CHIP.load(Ordering::Relaxed) < BOOT_LOG_MAX
+                            {
+                                let cnt = BOOT_LOG_DRONE_TO_CHIP.fetch_add(1, Ordering::Relaxed);
+                                if cnt < BOOT_LOG_MAX {
+                                    let trimmed = strip_crlf(line);
+                                    info!("[DRONE→CHIP #{}] {=[u8]:a}", (cnt + 1) as u32, trimmed);
+                                    boot_log_push(0, trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Only respond to commands while we're acting as the chip.
                 if OperatingMode::load() != OperatingMode::Emulation {
                     continue;
@@ -495,9 +656,28 @@ async fn enqueue_chunked(bytes: &[u8]) {
 #[embassy_executor::task]
 async fn uart1_rx_task(mut rx: BufferedUartRx) {
     let mut buf = [0u8; 256];
+    let mut diag_asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
     loop {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
+                // Boot capture of config replies from the chip (capped; no-op
+                // once we've gathered BOOT_LOG_MAX).
+                if BOOT_LOG_CHIP_TO_US.load(Ordering::Relaxed) < BOOT_LOG_MAX {
+                    for &b in &buf[..n] {
+                        if let Some(line) = diag_asm.feed(b) {
+                            if is_config_line(line)
+                                && BOOT_LOG_CHIP_TO_US.load(Ordering::Relaxed) < BOOT_LOG_MAX
+                            {
+                                let cnt = BOOT_LOG_CHIP_TO_US.fetch_add(1, Ordering::Relaxed);
+                                if cnt < BOOT_LOG_MAX {
+                                    let trimmed = strip_crlf(line);
+                                    info!("[CHIP→US #{}] {=[u8]:a}", (cnt + 1) as u32, trimmed);
+                                    boot_log_push(1, trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
                 if OperatingMode::load() == OperatingMode::Emulation {
                     continue; // drop while we are emulating
                 }
@@ -722,7 +902,9 @@ fn rewrite_coords(line: &[u8], coords: (i32, i32, i32), is_gga: bool, out: &mut 
 ///   - Dynamic offset computed once at the first valid fix; never recomputed.
 ///   - While in PassthroughOffset with the offset still unknown, coordinate-
 ///     carrying messages are **suppressed** (not forwarded) to avoid leaking
-///     the real position. Non-coordinate messages (GSA/GSV/VTG/…) pass.
+///     the real position. Auxiliary sentences (GSA/GSV/ZDA/GST/…) pass; GLL
+///     and VTG are dropped while spoof or offset rewrite is active because
+///     they would leak the chip's raw lat/lon (GLL) or velocity (VTG).
 /// Tracks NMEA time/date state needed to synthesise `spoof_detector::GnssTime`
 /// from the combined GGA (HH:MM:SS) + RMC (DD/MM/YY) streams.
 ///
@@ -870,6 +1052,10 @@ async fn process_nmea_line(
                         }
                         SPOOF_DETECTED.store(true, Ordering::Release);
                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                        warn!(
+                            "SPOOF [primary detector] fq={} lat={} lon={}",
+                            fix.fix_quality, fix.lat_1e7, fix.lon_1e7
+                        );
                     } else if !is_spoofed && was_spoofed {
                         let start = SPOOF_RECOVERY_START_MS.load(Ordering::Acquire);
                         if start == 0 {
@@ -965,6 +1151,13 @@ async fn process_nmea_line(
                                 }
                                 SPOOF_DETECTED.store(true, Ordering::Release);
                                 SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                                warn!(
+                                    "SPOOF [time-jump] prev_unix={} curr_unix={} diff={}s tag={}",
+                                    prev_unix as i32,
+                                    curr_unix as i32,
+                                    (curr_unix - prev_unix) as i32,
+                                    if is_gga { "GGA" } else { "RMC" },
+                                );
                             }
                         }
                     }
@@ -1008,6 +1201,15 @@ async fn process_nmea_line(
                         }
                         SPOOF_DETECTED.store(true, Ordering::Release);
                         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                        warn!(
+                            "SPOOF [coord-jump] jump_m={} prev_lat={} prev_lon={} lat={} lon={} tag={}",
+                            jump_m as i32,
+                            prev_lat,
+                            prev_lon,
+                            fix.lat_1e7,
+                            fix.lon_1e7,
+                            if is_gga { "GGA" } else { "RMC" },
+                        );
                     }
                 }
             }
@@ -1016,9 +1218,27 @@ async fn process_nmea_line(
 
     let spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
 
-    // Non-GGA/RMC messages (GSA/GSV/VTG/…) always pass verbatim — they don't
-    // carry a position to rewrite or spoof.
+    // GLL carries lat/lon, VTG carries course/speed. UC6580I keeps both off by
+    // default but a drone can enable them via `$CFGMSG,0,1,1` / `$CFGMSG,0,5,1`
+    // and persist that in NVM via `$CFGSAVE`. If we forward them verbatim while
+    // spoof rebuild or offset rewrite is patching GGA/RMC, raw real coordinates
+    // (GLL) or velocity (VTG) leak to the drone.
+    let is_gll = line.len() >= 6 && &line[3..6] == b"GLL";
+    let is_vtg = line.len() >= 6 && &line[3..6] == b"VTG";
+
+    // Non-GGA/RMC messages (GSA/GSV/ZDA/GST/…) pass verbatim. Exceptions:
+    //   - spoof active        → drop GLL+VTG to match the GGA/RMC rebuild;
+    //   - offset mode active  → drop GLL (we don't rewrite its format and it
+    //                            would leak the real chip coords next to the
+    //                            offset GGA/RMC). VTG can stay — velocity is
+    //                            invariant under a constant LLH offset.
     if !(is_gga || is_rmc) {
+        if spoofed && (is_gll || is_vtg) {
+            return;
+        }
+        if apply_offset && is_gll {
+            return;
+        }
         enqueue(line);
         return;
     }
@@ -1375,6 +1595,7 @@ async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
                 if series_start.is_none() {
                     series_start = Some(Instant::now());
                 }
+                info!("btn press #{} counted", press_count);
             }
         }
         last_level = level;
@@ -1388,7 +1609,7 @@ async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
                     1 => OperatingMode::Emulation,
                     2 => OperatingMode::Passthrough,
                     3 => OperatingMode::PassthroughRaw,
-                    _ => OperatingMode::PassthroughOffset,
+                    _ => OperatingMode::Passthrough,
                 };
                 let current = OperatingMode::load();
                 if new_mode != current {
