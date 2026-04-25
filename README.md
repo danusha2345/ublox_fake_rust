@@ -1,29 +1,36 @@
-# u-blox GNSS M10 Emulator (Rust/Embassy)
+# GNSS Emulator: u-blox M10 / Unicore UC6580I (Rust/Embassy)
 
-Эмулятор GNSS приёмника u-blox серии M10 на микроконтроллерах RP2350/RP2354.
+Эмулятор GNSS приёмников u-blox M10 и Unicore UC6580I на микроконтроллерах RP2350/RP2354.
 Написан на Rust с использованием асинхронного фреймворка Embassy.
 
 > **Примечание**: RP2040 больше не поддерживается — требуется ~221 KB RAM для буферов, что превышает доступные 264 KB.
 
 ## Назначение
 
-Устройство эмулирует работу GNSS приёмника u-blox и может работать в четырёх режимах:
-- **Emulation** — генерация фиктивных GNSS данных с криптографической подписью SEC-SIGN
+Проект собирается в двух вариантах:
+- **u-blox M10** (`ublox_fake`) — UBX + SEC-SIGN ECDSA, основной target.
+- **Unicore UC6580I** (`ublox_fake_uc`, feature `unicore`) — NMEA 0183 + RTCM3 + Extended RTCM 4074, без SEC-SIGN.
+
+Обе прошивки поддерживают четыре режима:
+- **Emulation** — генерация фиктивных GNSS данных (u-blox: UBX + SEC-SIGN, Unicore: NMEA/RTCM)
 - **Passthrough** — ретрансляция данных от реального GNSS модуля с детекцией GPS-спуфинга
 - **PassthroughRaw** — прозрачная ретрансляция данных без какой-либо обработки
 - **PassthroughOffset** — ретрансляция с подменой координат и детекцией спуфинга
 
-Основное применение — тестирование и исследование систем, использующих u-blox GNSS с аутентификацией SEC-SIGN (например, дроны DJI).
+Основное применение — тестирование и исследование систем, использующих u-blox GNSS с аутентификацией SEC-SIGN или Unicore UC6580I NMEA/RTCM поток.
+
+https://github.com/user-attachments/assets/009fe2d5-b790-4971-bd18-5e043e086aaa
 
 ## Особенности
 
-- Полная реализация протокола UBX (17 NAV сообщений, 4 MON сообщения, SEC-SIGN)
-- Криптографическая подпись ECDSA SECP192R1 (чистый Rust, без C зависимостей)
+- Полная реализация протокола UBX для u-blox target (17 NAV сообщений, 4 MON сообщения, SEC-SIGN)
+- Альтернативная прошивка UC6580I: NMEA, RTCM3, ExtRTCM 4074 и live-verified command replies
+- Криптографическая подпись ECDSA SECP192R1 для u-blox target (чистый Rust, без C зависимостей)
 - Поддержка приватных ключей DJI Air 3, Air 3S, Mavic 4 Pro и Mavic 3 Pro
 - Двухядерная асинхронная архитектура Embassy
 - Hot-switch режимов без перезагрузки
 - Сохранение режима во flash память
-- Динамическое изменение baudrate и частоты NAV сообщений
+- Динамическое изменение baudrate и частоты NAV сообщений в u-blox target
 - WS2812B LED индикация режима работы
 
 ## Аппаратные требования
@@ -67,6 +74,10 @@ make rp2350
 # Сборка UF2 для RP2354 (встроенная 2MB flash)
 make rp2354
 
+# Сборка UC6580I/NMEA прошивки
+make rp2350-unicore
+make rp2354-unicore
+
 # Очистка
 make clean
 ```
@@ -93,6 +104,8 @@ Makefile автоматически:
 # Способ 2: Через probe-rs (требуется отладочный адаптер)
 make flash          # RP2350 (по умолчанию)
 make flash-rp2354   # RP2354 (встроенная flash)
+make flash-unicore  # RP2350 + UC6580I
+make flash-unicore-rp2354  # RP2354 + UC6580I
 
 # или напрямую
 cargo run --release                                                              # RP2350
@@ -101,7 +114,18 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 
 ## Архитектура
 
-### Двухядерная модель
+### Варианты прошивки
+
+| Target | Бинарь | Сборка | Протокол на UART0 | Основные файлы |
+|--------|--------|--------|-------------------|----------------|
+| u-blox M10 | `ublox_fake` | `make rp2350` / `make rp2354` | UBX + SEC-SIGN | `src/main.rs`, `src/ubx/`, `src/sec_sign.rs` |
+| Unicore UC6580I | `ublox_fake_uc` | `make rp2350-unicore` / `make rp2354-unicore` | NMEA 0183 + RTCM3 + ExtRTCM 4074 | `src/main_unicore.rs`, `src/unicore/` |
+
+Подробная протокольная справка по UC6580I: `docs/UC6580I.md`.
+
+### Двухядерная модель u-blox target
+
+Диаграмма ниже описывает основную u-blox прошивку с UBX и SEC-SIGN. Unicore target использует ту же Embassy/dual-core основу, но вместо SEC-SIGN задач работает с NMEA/RTCM потоком и `src/unicore/`.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -140,17 +164,19 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 
 ### Межъядерная синхронизация
 
+`SEC_SIGN_*` каналы используются только в u-blox target. Unicore target переиспользует общий UART/RAW RX каркас без SEC-SIGN задач.
+
 | Канал/Сигнал | Направление | Назначение |
 |--------------|-------------|------------|
-| `TX_CHANNEL` (32 msg) | Tasks → uart0_tx | Очередь UBX сообщений для отправки |
+| `TX_CHANNEL` (32 msg) | Tasks → uart0_tx | Очередь UBX/NMEA/RTCM сообщений для отправки |
 | `RAW_RX_CHANNEL` (64×256B) | uart1_rx → gnss_processing | Сырые байты от UART1 |
-| `GNSS_RX_CHANNEL` (128 msg) | gnss_processing → uart0_tx | Распарсенные UBX фреймы (passthrough) |
+| `GNSS_RX_CHANNEL` (128 msg) | gnss_processing → uart0_tx | Распарсенные UBX фреймы (u-blox passthrough) |
 | `SEC_SIGN_REQUEST` | Core0 → Core1 | Запрос вычисления подписи |
 | `SEC_SIGN_RESULT` | Core1 → Core0 | Результат вычисления (r, s) |
 | `SEC_SIGN_IN_PROGRESS` | Атомик | Пауза TX во время вычисления |
 | `MODE` | Атомик | Текущий режим работы |
 
-### Поток данных SEC-SIGN
+### Поток данных SEC-SIGN (только u-blox target)
 
 ```
 1. nav_message_task (Core0) / mon_message_task (Core0)
@@ -179,6 +205,8 @@ CARGO_TARGET_THUMBV8M_MAIN_NONE_EABIHF_RUNNER="probe-rs run --chip RP2354" cargo
 ```
 
 ## Режимы работы
+
+Разделы Emulation, Passthrough, PassthroughRaw и PassthroughOffset ниже описывают u-blox target. Особенности Unicore UC6580I вынесены в отдельный раздел.
 
 ### Emulation (LED зелёный/жёлтый)
 
@@ -214,10 +242,14 @@ LED индикация в режиме Emulation:
 | Прыжок GNSS времени вперёд | > 5 сек | Нереалистичный скачок времени |
 | Дрейф системных часов | > 10 сек | Расхождение GNSS и внутренних часов |
 
+**Дополнительные проверки:**
+- Прыжок высоты > 10 м за сэмпл входит в активную coordinate-anomaly проверку.
+- `last_good` не обновляется дальше 5 км от `origin`, чтобы медленный спуфер не утаскивал доверенную точку.
+- Уход дальше 10 км от `origin` считается аномалией.
+
 **Отключённые (код сохранён):**
-- Высота (скачок > 10м) — отключено
-- Ускорение (> 20 м/с²) — отключено
-- CNO аномалия (одинаковый уровень сигнала) — отключено
+- Ускорение (> 20 м/с²) — вычисляется, но не входит в `is_anomaly`
+- CNO аномалия (одинаковый уровень сигнала) — отключена из-за ложных срабатываний
 
 **При обнаружении спуфинга:**
 1. Сохраняются последние хорошие координаты (2 сек до атаки)
@@ -230,7 +262,7 @@ LED индикация в режиме Emulation:
 - **Time-based recovery**: при возврате GNSS времени к ожидаемому значению (±5 сек от проекции)
 - **Coordinate-based recovery**: 5 секунд чистых данных + возврат к исходной позиции (< 2000м)
 - При восстановлении перекалибровываются системные часы с новым GNSS временем
-- Сбрасывается хэш-аккумулятор SEC_SIGN_ACC
+- Хэш-аккумулятор SEC-SIGN **не сбрасывается** на spoof recovery, чтобы уже отправленные изменённые NAV кадры остались в подписи. Сброс делается только при переключении режима.
 - Возврат к нормальной ретрансляции
 
 Реализация: `spoof_detector.rs` (алгоритмы), `passthrough.rs` (UBX парсер, модификация)
@@ -269,7 +301,35 @@ LED индикация в режиме Emulation:
 
 ECEF-координаты пересчитываются на каждом фрейме для геометрической согласованности с LLH (функция `llh_to_ecef` нелинейна — фиксированный ECEF offset расходится с LLH на больших расстояниях).
 
-Смещения настраиваются в `config.rs` → модуль `coordinate_offset`.
+Смещения настраиваются в `config.rs` → модуль `offset_target`.
+
+### Unicore UC6580I target
+
+Unicore прошивка собирается отдельным бинарём `ublox_fake_uc` с feature `unicore`. SEC-SIGN и CFG-0x41 key extraction в этом target не используются; вместо UBX на UART0 выдаётся поток, похожий на реальный UC6580I:
+
+- boot dump с `$PDTINFO`, reset/init строками и начальными ExtRTCM 4074 кадрами;
+- 5 Гц NMEA (`GGA`, `RMC`, `GSA`, `GSV`, `PNOISE`) в Emulation;
+- RTCM3 sample stream: 1077, 1097, 1019, 1046, 1013 и Unicore proprietary 4074;
+- live-verified ответы на `$PDTINFO`, `$PRODUCTINFO`, `$CFGSYS`, `$CFGMSG`, `$CFGPRT`, `$CFGKEY`, `$CFGSAVE` и близкие команды.
+
+Режимы соответствуют u-blox target по смыслу, но работают с NMEA/RTCM:
+
+| Режим | Unicore поведение |
+|-------|-------------------|
+| Emulation | Генерирует boot dump, NMEA и RTCM/ExtRTCM поток. Первые 20 сек fix валидный (`fix_quality=1`, `nsats=16`), затем invalid (`fix_quality=0`, `nsats=1`). |
+| Passthrough | RTCM3 кадры идут byte-for-byte, NMEA `GGA/RMC` разбираются для spoof detection и могут быть перестроены. |
+| PassthroughRaw | Полностью прозрачная ретрансляция байтов, без NMEA/RTCM parsing и spoof detection. |
+| PassthroughOffset | Как Passthrough, но переписывает координаты в `GGA/RMC` к `config::offset_target`; пока offset не вычислен, координатные NMEA строки подавляются. |
+
+Spoof handling в Unicore:
+
+- основной детектор получает checksum-ok `GGA`; дату для GNSS time берёт из свежего `RMC`;
+- secondary trigger ловит скачок времени на `GGA/RMC` и скачок координат даже при `fq=0` или RMC-before-GGA;
+- spoofed `GGA` перестраивается как invalid fix с `nsats=1`, большим HDOP и `LAST_GOOD` координатами;
+- spoofed `RMC` перестраивается как `V/N`, speed/course обнуляются;
+- `GLL` и `VTG` дропаются во время spoof, чтобы не утекали raw координаты или скорость; в offset mode `GLL` тоже дропается.
+
+LED в Unicore на RP2350 отличается от u-blox цветов: Emulation зелёный/жёлтый, Passthrough cyan, PassthroughRaw magenta, PassthroughOffset жёлтый, spoof — быстрый красный blink. На RP2354 используется blink count 1..4.
 
 ### Переключение режимов
 
@@ -278,23 +338,24 @@ ECEF-координаты пересчитываются на каждом фр�
   - **2 нажатия** → Passthrough
   - **3 нажатия** → PassthroughRaw
   - **4 нажатия** → PassthroughOffset
-- **Индикация LED (RP2350 — WS2812B цветной)**:
+- **Индикация LED (RP2350 u-blox target — WS2812B цветной)**:
   - Зелёный/жёлтый — Emulation (жёлтый = спутники невалидны)
   - Синий — Passthrough
   - Пурпурный — PassthroughRaw
   - Белый — PassthroughOffset
   - Быстро моргающий красный — спуфинг обнаружен
-- **Индикация LED (RP2354 — простой GPIO, blink code)**:
+- **Индикация LED (RP2354 оба target — простой GPIO, blink code)**:
   - 1 вспышка — Emulation
   - 2 вспышки — Passthrough
   - 3 вспышки — PassthroughRaw
   - 4 вспышки — PassthroughOffset
   - Быстрое непрерывное мигание — спуфинг обнаружен
 - **Персистентность**: режим сохраняется во flash и восстанавливается после питания
+- При первой загрузке новой версии firmware u-blox target сбрасывается в PassthroughOffset, Unicore target — в Passthrough; если сохранённый режим уже есть и версия не менялась, он загружается из flash.
 
 ### Таймер невалидных спутников (20 сек)
 
-Через 20 секунд после старта эмуляции спутники становятся невалидными:
+Через 20 секунд после старта эмуляции спутники становятся невалидными. Для u-blox target это выглядит так:
 
 | Сообщение | Невалидное состояние |
 |-----------|----------------------|
@@ -304,12 +365,16 @@ ECEF-координаты пересчитываются на каждом фр�
 | NAV-SAT | 1 спутник, cno=8 dBHz, не используется |
 | NAV-SVINFO | 1 спутник, низкое качество |
 
+В Unicore target после этого же таймера `GGA` уходит в `fix_quality=0`, `nsats=1`, а `RMC` — в invalid status.
+
 Таймер сбрасывается **только** при:
 - Переключении в режим Emulation (кнопкой)
 
 **Примечание:** CFG-RST от дрона **не** сбрасывает таймер (это сделано намеренно).
 
 ## Поддерживаемые UBX сообщения
+
+Этот раздел относится к u-blox target. Unicore target вместо UBX использует NMEA 0183, RTCM3 и proprietary ExtRTCM 4074.
 
 ### Выходные (генерируемые/ретранслируемые)
 
@@ -365,6 +430,8 @@ ECEF-координаты пересчитываются на каждом фр�
 | 0x27 | 0x03 | SEC-UNIQID | Poll unique ID |
 
 ## SEC-SIGN криптография
+
+Этот раздел относится только к u-blox target. Unicore target SEC-SIGN не считает и не обрабатывает CFG-0x41 ключи.
 
 ### Алгоритм
 
@@ -475,13 +542,18 @@ pub const SEC_SIGN_PERIOD_MAVIC4_MS: u64 = 2000; // Mavic 4 Pro: каждые 2 
 pub const SEC_SIGN_PERIOD_MAVIC3PRO_MS: u64 = 2000; // Mavic 3 Pro: каждые 2 сек
 
 // Координаты по умолчанию — Emulation (автоматически конвертируются в ECEF)
-pub const LATITUDE: f64 = 25.966443;    // Golden Beach, FL
-pub const LONGITUDE: f64 = -80.122371;
-pub const ALTITUDE_M: i32 = 100;
+pub mod default_position {
+    pub const LATITUDE: f64 = 25.966443;    // Golden Beach, FL
+    pub const LONGITUDE: f64 = -80.122371;
+    pub const ALTITUDE_M: i32 = 100;
+}
 
-// Целевые координаты — PassthroughOffset (offset_target)
-pub const LATITUDE: f64 = 46.3407;      // Seney, Michigan
-pub const LONGITUDE: f64 = -85.9407;
+// Целевые координаты — PassthroughOffset
+pub mod offset_target {
+    pub const LATITUDE: f64 = 46.3407;      // Seney, Michigan
+    pub const LONGITUDE: f64 = -85.9407;
+    pub const ALTITUDE_M: i32 = 100;
+}
 ```
 
 При изменении координат в `config.rs` автоматически обновляются все NAV сообщения:
@@ -490,7 +562,7 @@ pub const LONGITUDE: f64 = -85.9407;
 
 ### Динамическая конфигурация (runtime)
 
-Через UBX команды можно изменить:
+В u-blox target через UBX команды можно изменить:
 - **Baudrate**: CFG-PRT или CFG-VALSET (ключ `0x40520001`)
 - **NAV частота**: CFG-RATE или CFG-VALSET (ключи `0x30210001`, `0x30210002`)
 - **Сообщения**: CFG-MSG или CFG-VALSET (ключи `0x2091xxxx`)
@@ -505,16 +577,24 @@ ublox_fake_rust/
 ├── .cargo/config.toml      # Cargo настройки (target, runner)
 ├── CLAUDE.md               # Документация для Claude Code
 └── src/
-    ├── main.rs             # Точка входа, tasks, межъядерная связь
+    ├── main.rs             # u-blox target: tasks, UBX, SEC-SIGN
+    ├── main_unicore.rs     # Unicore target: NMEA/RTCM, UC6580I command replies
     ├── config.rs           # Константы: пины, тайминги, координаты
     ├── coordinates.rs      # LLH→ECEF конвертация (WGS84)
     ├── ubx/
     │   ├── mod.rs          # UBX протокол: классы, checksum, traits
     │   ├── messages.rs     # Структуры всех UBX сообщений
     │   └── parser.rs       # State machine парсер входящих команд
+    ├── unicore/
+    │   ├── boot.rs         # UC6580I boot/init строки
+    │   ├── cmd.rs          # Ответы на Unicore текстовые команды
+    │   ├── nmea.rs         # NMEA build/parse/checksum helpers
+    │   ├── rtcm3.rs        # RTCM3 framing/checksum helpers
+    │   └── extrtcm.rs      # Proprietary ExtRTCM 4074 helpers
     ├── sec_sign.rs         # ECDSA P-192 подпись, SHA256 аккумулятор
     ├── led.rs              # WS2812 LED драйвер (обёртка над embassy-rp)
-    ├── passthrough.rs      # UBX парсер, буфер позиций, модификация NAV
+    ├── passthrough.rs      # UBX passthrough, spoof/offset модификация NAV
+    ├── pos_history.rs      # Кольцевой буфер последних хороших позиций
     ├── spoof_detector.rs   # Алгоритмы детекции GPS-спуфинга
     ├── flash_storage.rs    # Сохранение режима и ключей во flash
     └── key_extract.rs      # Извлечение SEC-SIGN ключей из реального GNSS
@@ -547,6 +627,8 @@ ublox_fake_rust/
 
 ## Использование RAM/Flash
 
+Текущие значения ниже относятся к release-сборке u-blox target; Unicore target меньше по криптографическому стеку, потому что SEC-SIGN не используется.
+
 | Метрика | Значение | Примечание |
 |---------|----------|------------|
 | .text (код) | ~97 КБ | Pure Rust P-192 (vs 56 КБ C/micro-ecc) |
@@ -555,9 +637,9 @@ ublox_fake_rust/
 ## Известные ограничения
 
 1. **Координаты эмуляции статичны** — настраиваются в `config.rs`, но не меняются во время работы (нет симуляции движения). В PassthroughOffset координаты динамические.
-2. **Нет GPS week rollover** — week hardcoded (2349)
+2. **Нет GPS week rollover в u-blox target** — week hardcoded (2349)
 3. **Один LED** — нет отдельной индикации ошибок (только цвет и мигание)
-4. **Mavic 4 Pro** — уникальные ключи на каждый экземпляр. Используйте авто-извлечение ключей при загрузке.
+4. **Mavic 4 Pro SEC-SIGN** — уникальные ключи на каждый экземпляр в u-blox target. Используйте авто-извлечение ключей при загрузке.
 
 ## Лицензия
 

@@ -1611,7 +1611,8 @@ async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
                     1 => OperatingMode::Emulation,
                     2 => OperatingMode::Passthrough,
                     3 => OperatingMode::PassthroughRaw,
-                    _ => OperatingMode::Passthrough,
+                    4 => OperatingMode::PassthroughOffset,
+                    _ => OperatingMode::PassthroughOffset,
                 };
                 let current = OperatingMode::load();
                 if new_mode != current {
