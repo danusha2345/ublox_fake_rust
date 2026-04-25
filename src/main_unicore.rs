@@ -4,8 +4,8 @@
 //!   0 Emulation          — fake UC6580I stream: boot-dump + NMEA + ExtRTCM 4074.
 //!   1 Passthrough        — forward UART1 (real UC6580I) → UART0 (drone); reassembles
 //!                          `$GxGGA`/`$GxRMC` to run the shared spoof detector and,
-//!                          when spoofing is flagged, rebuilds GGA/RMC with the
-//!                          `SPOOF_NSATS_MARKER` fingerprint. RTCM3 frames (incl.
+//!                          when spoofing is flagged, rebuilds GGA/RMC as invalid
+//!                          with one visible satellite. RTCM3 frames (incl.
 //!                          proprietary msg 4074) pass byte-for-byte.
 //!   2 PassthroughRaw     — byte-for-byte forward, no parsing or spoof detection.
 //!   3 PassthroughOffset  — same as Passthrough, plus rewrites GGA/RMC latitude/
@@ -211,8 +211,6 @@ static SPOOF_RECOVERY_START_MS: portable_atomic::AtomicU32 = portable_atomic::At
 /// + dynamic_offset so stale LAST_GOOD cannot bleed into the new mode.
 static SPOOF_DETECTOR_RESET: AtomicBool = AtomicBool::new(false);
 
-use spoof_detector::SPOOF_NSATS_MARKER;
-
 /// Minimum clean-fix window before we drop SPOOF_DETECTED back to false
 /// (u-blox parity: one good reading is not enough).
 const SPOOF_RECOVERY_TIMEOUT_MS: u32 = 5_000;
@@ -223,6 +221,10 @@ const SPOOF_LOOKBACK_SECONDS: u32 = 2;
 
 /// Large HDOP value planted in spoofed GGA (tells the drone the fix is poor).
 const SPOOF_HIGH_HDOP_X100: u16 = 9_999;
+
+/// Satellite count reported in spoofed GGA. Keep the fix invalid while showing
+/// one visible satellite on the Unicore NMEA path.
+const SPOOF_INVALID_NSATS: u8 = 1;
 
 /// Placeholder geoid separation for rebuilt GGA under spoof. Real value would
 /// require the original sentence's geoid_sep to round-trip, which the
@@ -846,14 +848,14 @@ async fn passthrough_forward_task() {
     }
 }
 
-/// Build a spoofed GGA frame (degraded fix_quality + SPOOF_NSATS_MARKER). Returns
+/// Build a spoofed GGA frame (invalid fix + one visible satellite). Returns
 /// written byte count in `out`, or 0 on build failure.
 fn build_spoofed_gga(existing: &unicore::nmea::NmeaFix, coords: (i32, i32, i32), out: &mut [u8]) -> usize {
     let g = unicore::nmea::GgaFields {
         time: existing.time,
         lat_1e7: coords.0, lon_1e7: coords.1,
         fix_quality: 0,
-        nsats: SPOOF_NSATS_MARKER,
+        nsats: SPOOF_INVALID_NSATS,
         hdop_x100: SPOOF_HIGH_HDOP_X100,
         alt_mm: coords.2,
         geoid_sep_mm: SPOOF_DEFAULT_GEOID_SEP_MM,

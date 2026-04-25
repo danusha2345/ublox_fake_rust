@@ -10,10 +10,9 @@
 
 use defmt::*;
 
-/// Impossible satellite count (max real constellation is ~40) used as an
-/// out-of-band "this frame is spoofed" marker across UBX NAV-* and NMEA
-/// GGA fields.
-pub const SPOOF_NSATS_MARKER: u8 = 92;
+/// Satellite count used in degraded UBX NAV-* frames while spoofing is active.
+#[allow(dead_code)]
+pub const SPOOF_NSATS_MARKER: u8 = 2;
 
 /// Spoofing detection thresholds
 pub mod thresholds {

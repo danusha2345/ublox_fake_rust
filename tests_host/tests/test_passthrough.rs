@@ -514,7 +514,7 @@ fn test_round_trip_build_parse_offset_verify() {
 // Group 3: Spoof modification
 // ============================================================================
 
-/// modify_nav_pvt_spoof replaces coords, zeros velocity, and sets fix_type=0 / num_sv=92.
+/// modify_nav_pvt_spoof replaces coords, zeros velocity, and sets fix_type=0 / num_sv=2.
 #[test]
 fn test_modify_nav_pvt_spoof_replaces_coords_and_degrades_status() {
     let mut frame = build_nav_pvt_frame(BASE_LAT, BASE_LON, BASE_ALT, 3, 12);
@@ -539,7 +539,7 @@ fn test_modify_nav_pvt_spoof_replaces_coords_and_degrades_status() {
     // Status degraded
     assert_eq!(frame[6 + 20], 0, "fix_type must be 0");
     assert_eq!(frame[6 + 21], 0, "flags must be 0");
-    assert_eq!(frame[6 + 23], 92, "num_sv must be 92 (spoof marker)");
+    assert_eq!(frame[6 + 23], 2, "num_sv must be 2 during spoof");
 }
 
 /// modify_nav_posecef_spoof replaces ECEF coords and sets pAcc=9999999.
@@ -592,15 +592,15 @@ fn test_modify_nav_status_degrades_fix_and_flags() {
     assert_eq!(frame[6 + 5], 0, "flags must be 0 after modify_nav_status");
 }
 
-/// modify_nav_sat sets num_svs=92 at payload offset 5.
+/// modify_nav_sat sets num_svs=2 at payload offset 5.
 #[test]
-fn test_modify_nav_sat_sets_num_svs_92() {
+fn test_modify_nav_sat_sets_num_svs_2() {
     let mut frame = build_nav_sat_frame(14);
     assert_eq!(frame[6 + 5], 14, "Pre-condition: num_svs should be 14");
 
     modify_nav_sat(&mut frame);
 
-    assert_eq!(frame[6 + 5], 92, "num_svs must be 92 (spoof marker)");
+    assert_eq!(frame[6 + 5], 2, "num_svs must be 2 during spoof");
 }
 
 // ============================================================================
@@ -986,7 +986,7 @@ fn test_full_pipeline_offset_then_spoof_replace() {
 
     // Verify status degraded
     assert_eq!(frame[6 + 20], 0, "fix_type should be 0");
-    assert_eq!(frame[6 + 23], 92, "num_sv should be 92 (spoof marker)");
+    assert_eq!(frame[6 + 23], 2, "num_sv should be 2 during spoof");
 }
 
 /// Verify ECEF consistency: offset LLH → ECEF should match for both

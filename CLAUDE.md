@@ -35,7 +35,7 @@ Inter-core: `Signal`/`Channel` (embassy-sync). Mode state: `AtomicU8`.
 - `src/ubx/` — UBX protocol (messages, parser)
 - `src/unicore/` — NMEA / RTCM / ExtRTCM 4074 protocol (unicore feature only)
 - `src/sec_sign.rs` — SHA256 + ECDSA SECP192R1
-- `src/spoof_detector.rs` — GPS spoofing detection (pure logic, host-testable). Exports `SPOOF_NSATS_MARKER = 92` consumed by both builds.
+- `src/spoof_detector.rs` — GPS spoofing detection (pure logic, host-testable). Exports `SPOOF_NSATS_MARKER = 2` for the UBX path.
 - `src/pos_history.rs` — shared `PositionBuffer` (3 s ring @ 5 Hz) + `DynamicOffset`, used by both UBX and NMEA paths
 - `src/passthrough.rs` — UBX frame parser + NAV modification (re-exports `pos_history` types for backward compat)
 - `src/config.rs` — pins, timing, default position
@@ -64,7 +64,7 @@ Mode persisted to flash. Button: 1-4 clicks. Timeout: 800ms.
 - **SEC-UNIQID race**: Mavic 4 Pro sends SEC-UNIQID BEFORE CFG-VALSET. Workaround: set `DRONE_MODEL` in `main.rs` (default=2 Air 3S)
 - **accumulate() BEFORE write_all()**: prevents hash race between uart0_tx and sec_sign_timer on Core1
 - **Coord recovery = 6 samples** (not 5): returning from spoofed position is itself a teleport
-- **Spoof marker**: `spoof_detector::SPOOF_NSATS_MARKER` (=92) — impossible sat count planted in NAV-PVT/SOL/SAT/SVINFO and NMEA GGA under spoof
+- **Spoof marker**: `spoof_detector::SPOOF_NSATS_MARKER` (=2) is planted in UBX NAV-PVT/SOL/SAT/SVINFO under spoof; Unicore spoofed GGA reports invalid fix with 1 visible satellite
 - **Diagnostic mode**: `DIAG_MSG_DETAIL = true` in main.rs
 - **Unicore UART signal integrity**: `src/main_unicore.rs` must mirror the proven u-blox hardware UART settings: GPIO0 UART0 TX pad = 12mA drive + pull-down + fast slew, and UART1 RX FIFO threshold = 1/4. If raw passthrough also outputs garbage at 921600, check these settings before protocol logic.
 - **Unicore mode 1 parity**: Emulation mirrors u-blox mode 1 timing: valid fix + green LED first, then invalid fix + yellow LED after `SATELLITES_INVALID_AFTER_MS`.

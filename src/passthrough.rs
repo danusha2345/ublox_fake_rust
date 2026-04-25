@@ -384,7 +384,7 @@ pub fn modify_nav_pvt_spoof(frame: &mut [u8], lat: i32, lon: i32, alt: i32) {
     // Degrade status
     frame[6 + 20] = 0; // fix_type = 0
     frame[6 + 21] = 0; // flags = 0
-    frame[6 + 23] = 92; // num_sv = 92 (spoof marker)
+    frame[6 + 23] = crate::spoof_detector::SPOOF_NSATS_MARKER;
 }
 
 /// Modify NAV-POSLLH (0x01 0x02) during spoofing: replace coordinates + degrade accuracy
@@ -465,7 +465,7 @@ pub fn modify_nav_sol_spoof(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: 
     frame[6 + 36..6 + 40].copy_from_slice(&0i32.to_le_bytes()); // ecefVZ
     // Degrade status
     frame[6 + 10] = 0;  // gps_fix = 0
-    frame[6 + 47] = 92; // num_sv = 92 (spoof marker)
+    frame[6 + 47] = crate::spoof_detector::SPOOF_NSATS_MARKER;
 }
 
 /// Extract position data from NAV-PVT payload
