@@ -331,6 +331,51 @@ Spoof handling в Unicore:
 
 LED в Unicore на RP2350 отличается от u-blox цветов: Emulation зелёный/жёлтый, Passthrough cyan, PassthroughRaw magenta, PassthroughOffset жёлтый, spoof — быстрый красный blink. На RP2354 используется blink count 1..4.
 
+#### Обновление boot dump через `boot-capture`
+
+`src/unicore/boot_dump.bin` — байт-точная копия первых ~6.7 КБ потока с реального UC6580I (header + `$RECVCFG/$PECFG/$CHCFG/$PTINFOPKG` + UTC×5 + IONO×3 + `$SVEPH_*` × 20 + первый burst RTCM/ExtRTCM 4074). Эмулятор воспроизводит его в Emulation одним блоком при первом тике (`enqueue_chunked(BOOT_DUMP)`).
+
+Чтобы захватить свежий boot dump прямо платой без внешнего логгера, существует opt-in cargo-feature `boot-capture`:
+
+```bash
+PATH="/home2/.cargo/bin:$PATH" cargo build --release \
+    --features unicore,boot-capture --bin ublox_fake_uc
+make flash    # или make flash-rp2354
+```
+
+Что делает feature:
+- В `uart1_rx_task` (`src/main_unicore.rs`) добавляется one-shot линейный буфер `[u8; 8192]` в RAM. После первого байта от чипа байты копируются в буфер до тех пор, пока не сработает любое из условий: буфер заполнен / прошло 4 с / встретилась подстрока `$GNRMC` (начало steady-state).
+- Параллельная задача `raw_boot_dump_task` каждые 10 с эмитит замороженный буфер через defmt-rtt в формате `==RAWCAP BEGIN epoch=N len=L crc=XXXX==` + `RAWCAP N off hex…` (32 байта/строка) + `==RAWCAP END==`. Цикл бесконечный — поздний `probe-rs attach` всё равно увидит дамп на следующем тике.
+- Длинная пауза (>500 мс) на UART1 RX за которой идут новые байты считается перезагрузкой чипа: буфер ре-армируется, `EPOCH` инкрементируется.
+- В `Emulation` режиме захват не работает (не имеет смысла — мы сами генерируем поток).
+
+Flash платы → переключиться в Passthrough (двойной клик кнопки) → подключить реальный UC6580I на UART1 RX (GPIO5) → запустить:
+
+```bash
+probe-rs attach --chip RP235x ./target/.../release/ublox_fake_uc | tee /tmp/cap.log
+# подождать ≥ 30 секунд, чтобы попало 3+ цикла дампа
+```
+
+Декодировать в `.bin`:
+
+```bash
+python3 tools/decode_rtt_boot_capture.py \
+    --input /tmp/cap.log \
+    --out /tmp/new_boot_dump.bin \
+    --diff src/unicore/boot_dump.bin
+```
+
+Декодер парсит маркеры, реассемблирует чанки по offset, сверяет CRC32 из заголовка с пересчитанным, и при множественных эпохах берёт последнюю полную (свежий чип-boot). Если установлен `--diff` — печатает first-diff offset и Δlen относительно текущего файла.
+
+Если структура корректная (тесты в `src/unicore/boot.rs` — 9 ассертов: размер 6000–8000, чистый префикс `\r\nUC6580I-00`, наличие RECVCFG/PECFG/CHCFG/PTINFOPKG/UTC×5/IONO×3/SVEPH burst, отсутствие `$GNRMC`), копируем поверх:
+
+```bash
+cp /tmp/new_boot_dump.bin src/unicore/boot_dump.bin
+cd tests_host && cargo test boot_dump
+```
+
+Production-сборка делается без флага: `make rp2350-unicore` / `make rp2354-unicore`. LTO выбрасывает буфер и таску, накладных нет.
+
 ### Переключение режимов
 
 - **Кнопка**: выбор режима по количеству коротких нажатий (таймаут 800мс между нажатиями):

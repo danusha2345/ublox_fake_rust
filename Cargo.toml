@@ -64,6 +64,11 @@ rp2354 = ["rp2350"]  # RP2354 uses same HAL as RP2350, different pin config
 # Disables SEC-SIGN/key-extract (LTO drops the ECDSA stack) and switches
 # the UART0 protocol to NMEA 0183 + RTCM v3 + proprietary ExtRTCM 4074.
 unicore = []
+# Capture UC6580I boot stream from UART1 RX into RAM and periodically
+# re-emit via defmt-rtt. Opt-in (~8 KB .bss). Only active in Passthrough
+# modes. Combine with `unicore` and use tools/decode_rtt_boot_capture.py
+# to reconstruct boot_dump.bin from probe-rs output.
+boot-capture = []
 
 [profile.dev]
 debug = 2
