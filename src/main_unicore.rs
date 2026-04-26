@@ -1860,56 +1860,82 @@ async fn simple_led_task(mut led: Output<'static>) {
 
 #[embassy_executor::task]
 async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
+    use config::button::*;
+
     btn.set_as_input();
     btn.set_pull(Pull::Down);
-    let mut last_level = btn.is_high();
-    let mut press_count: u8 = 0;
-    let mut series_start: Option<Instant> = None;
+
+    Timer::after(Duration::from_millis(1000)).await;
+
+    let mut click_count: u8 = 0;
+    let mut last_click_time: Option<Instant> = None;
+    let mut was_high = btn.is_high();
 
     loop {
-        Timer::after(Duration::from_millis(config::button::POLL_PERIOD_MS)).await;
-        let level = btn.is_high();
+        Timer::after(Duration::from_millis(POLL_PERIOD_MS)).await;
+        let is_high = btn.is_high();
 
-        // Rising edge (debounced by 50ms).
-        if level && !last_level {
-            Timer::after(Duration::from_millis(config::button::DEBOUNCE_MS)).await;
-            if btn.is_high() {
-                press_count += 1;
-                if series_start.is_none() {
-                    series_start = Some(Instant::now());
-                }
-                info!("btn press #{} counted", press_count);
-            }
-        }
-        last_level = level;
-
-        // Window expired — apply mode selection.
-        if let Some(start) = series_start {
-            if start.elapsed().as_millis() >= config::button::MULTI_CLICK_TIMEOUT_MS as u64
-                && press_count > 0
-            {
-                let new_mode = match press_count {
-                    1 => OperatingMode::Emulation,
-                    2 => OperatingMode::Passthrough,
-                    3 => OperatingMode::PassthroughRaw,
-                    4 => OperatingMode::PassthroughOffset,
-                    _ => OperatingMode::PassthroughOffset,
-                };
-                let current = OperatingMode::load();
-                if new_mode != current {
-                    new_mode.store();
-                    if new_mode == OperatingMode::Emulation {
-                        OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
-                        SATELLITES_INVALID.store(false, Ordering::Release);
+        if click_count > 0 {
+            if let Some(last) = last_click_time {
+                if last.elapsed().as_millis() >= MULTI_CLICK_TIMEOUT_MS {
+                    let new_mode = match click_count {
+                        1 => OperatingMode::Emulation,
+                        2 => OperatingMode::Passthrough,
+                        3 => OperatingMode::PassthroughRaw,
+                        4 => OperatingMode::PassthroughOffset,
+                        _ => OperatingMode::PassthroughOffset,
+                    };
+                    let current = OperatingMode::load();
+                    if new_mode != current {
+                        new_mode.store();
+                        if new_mode == OperatingMode::Emulation {
+                            OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
+                            SATELLITES_INVALID.store(false, Ordering::Release);
+                        }
+                        SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
+                        let mut flash = flash.lock().await;
+                        flash_storage::save_mode(&mut flash, new_mode as u8).await;
+                        info!("Mode: {:?} -> {:?} (clicks={})", current, new_mode, click_count);
+                    } else {
+                        info!("Mode unchanged: {:?} (clicks={})", new_mode, click_count);
                     }
-                    SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
-                    let mut flash = flash.lock().await;
-                    flash_storage::save_mode(&mut flash, new_mode as u8).await;
-                    info!("Mode: {:?} → {:?}", current, new_mode);
+                    click_count = 0;
+                    last_click_time = None;
                 }
-                press_count = 0;
-                series_start = None;
             }
         }
+
+        if is_high && !was_high {
+            info!("button_task: edge detected (0->1), debouncing");
+            Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+            if btn.is_high() {
+                click_count = click_count.saturating_add(1).min(4);
+                info!("button_task: click #{}", click_count);
+                info!("button_task: waiting for release...");
+
+                let mut high_count: u32 = 0;
+                loop {
+                    if !btn.is_high() {
+                        info!("button_task: released!");
+                        break;
+                    }
+                    Timer::after(Duration::from_millis(50)).await;
+                    high_count += 1;
+
+                    if high_count.is_multiple_of(5) {
+                        info!("button_task: still HIGH, attempting E9 discharge kick");
+                        btn.set_as_output();
+                        btn.set_low();
+                        Timer::after(Duration::from_micros(50)).await;
+                        btn.set_as_input();
+                        btn.set_pull(Pull::Down);
+                        Timer::after(Duration::from_micros(50)).await;
+                    }
+                }
+
+                last_click_time = Some(Instant::now());
+            }
+        }
+        was_high = is_high;
     }
 }
