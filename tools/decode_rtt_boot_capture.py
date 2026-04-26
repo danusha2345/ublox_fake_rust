@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Decode UC6580I boot stream from a probe-rs RTT log.
+"""Decode UC6580I boot stream(s) from a probe-rs RTT log.
 
-The board (built with `--features unicore,boot-capture`) captures the chip's
-first ~6.7 KB into RAM and re-emits it every 10 s as defmt log lines:
+The board (built with `--features unicore,boot-capture`) captures up to two
+streams into separate RAM buffers and re-emits each every 10 s as defmt log
+lines. Two marker prefixes select the side:
 
-    ==RAWCAP BEGIN epoch=N len=L crc=XXXXXXXX==
-    RAWCAP N 0 d3 00 03 ...
-    RAWCAP N 32 fe a0 00 ...
-    ...
-    ==RAWCAP END epoch=N len=L==
+    chip side (UART1 RX, ~6.7 KB, freezes on `$GNRMC`):
+        ==RAWCAP BEGIN epoch=N len=L crc=XXXXXXXX==
+        RAWCAP N 0 [d3, 00, 03, ...]
+        ==RAWCAP END epoch=N len=L==
 
-This script reconstructs the byte stream, verifies CRC32, and writes a binary
-file suitable for `src/unicore/boot_dump.bin`.
+    drone side (UART0 RX, ≤8 KB, freezes on `$CFGKEY` or 25 s timeout):
+        ==RAWCAP_DR BEGIN epoch=N len=L crc=XXXXXXXX==
+        RAWCAP_DR N 0 [ff, 7f, 7f, ...]
+        ==RAWCAP_DR END epoch=N len=L==
+
+This script reconstructs the byte stream(s), verifies CRC32, and writes a
+binary file. Pick the side with `--side chip` (default) or `--side drone`.
 
 Usage:
-    python3 decode_rtt_boot_capture.py --input cap.log --out new_dump.bin
-    python3 decode_rtt_boot_capture.py --input cap.log --out new_dump.bin \
+    python3 decode_rtt_boot_capture.py --input cap.log --out chip.bin
+    python3 decode_rtt_boot_capture.py --input cap.log --out drone.bin --side drone
+    python3 decode_rtt_boot_capture.py --input cap.log --out chip.bin \
         --diff src/unicore/boot_dump.bin
 """
 from __future__ import annotations
@@ -26,13 +32,25 @@ import sys
 import zlib
 from pathlib import Path
 
-BEGIN_RE = re.compile(
-    r"==RAWCAP BEGIN epoch=(?P<epoch>\d+) len=(?P<len>\d+) crc=(?P<crc>[0-9a-fA-F]+)=="
-)
-END_RE = re.compile(r"==RAWCAP END epoch=(?P<epoch>\d+) len=(?P<len>\d+)==")
-LINE_RE = re.compile(
-    r"(?:^|\s)RAWCAP\s+(?P<epoch>\d+)\s+(?P<offset>\d+)\s+(?P<hex>[0-9a-fA-F\s]+?)\s*$"
-)
+def _build_regex(tag: str) -> tuple[re.Pattern, re.Pattern, re.Pattern]:
+    """Build the BEGIN / END / LINE regex trio for marker prefix `tag`."""
+    begin = re.compile(
+        rf"=={tag} BEGIN epoch=(?P<epoch>\d+) len=(?P<len>\d+) crc=(?P<crc>[0-9a-fA-F]+)=="
+    )
+    end = re.compile(
+        rf"=={tag} END epoch=(?P<epoch>\d+) len=(?P<len>\d+)=="
+    )
+    line = re.compile(
+        # Defmt {=[u8]:02x} formatter renders bytes as `[d3, 00, 03, ...]`.
+        # Accept both that form and bare space-separated hex (`d3 00 03`).
+        rf"(?:^|\s){tag}\s+(?P<epoch>\d+)\s+(?P<offset>\d+)\s+(?P<hex>[\[\]0-9a-fA-F,\s]+?)\s*(?:\(.*\))?$"
+    )
+    return begin, end, line
+
+
+# Side → (begin, end, line) regex tuple.
+_SIDE_TAGS = {"chip": "RAWCAP", "drone": "RAWCAP_DR"}
+_REGEX = {side: _build_regex(tag) for side, tag in _SIDE_TAGS.items()}
 
 
 class Epoch:
@@ -63,31 +81,52 @@ class Epoch:
         return bytes(out)
 
 
-def parse_log(text: str) -> list[Epoch]:
+def parse_log(text: str, side: str) -> list[Epoch]:
+    """Extract epochs for one side (`chip` or `drone`)."""
+    if side not in _REGEX:
+        raise ValueError(f"unknown side {side!r}, expected one of {list(_REGEX)}")
+    begin_re, end_re, line_re = _REGEX[side]
+    # Other side's regex is used to skip lines that belong to the OTHER tag —
+    # otherwise `RAWCAP_DR` lines would also match the `chip` LINE_RE because
+    # `RAWCAP` is a prefix of `RAWCAP_DR`.
+    other_tag = "RAWCAP_DR" if side == "chip" else "RAWCAP"
+    other_marker = re.compile(rf"(?:^|\s){other_tag}(?:\s|=)")
+
     epochs: dict[int, Epoch] = {}
-    current: Epoch | None = None
 
     for line in text.splitlines():
-        m = BEGIN_RE.search(line)
+        # Skip lines that belong to the other side first.
+        if side == "chip" and other_marker.search(line):
+            continue
+        m = begin_re.search(line)
         if m:
             ep = int(m["epoch"])
             ln = int(m["len"])
             crc = int(m["crc"], 16)
-            current = Epoch(ep, ln, crc)
-            epochs[ep] = current
+            epochs[ep] = Epoch(ep, ln, crc)
             continue
-        m = END_RE.search(line)
+        m = end_re.search(line)
         if m:
             ep = int(m["epoch"])
             if ep in epochs:
                 epochs[ep].ended = True
-            current = None
             continue
-        m = LINE_RE.search(line)
+        m = line_re.search(line)
         if m:
             ep = int(m["epoch"])
             off = int(m["offset"])
-            hex_str = m["hex"].replace(" ", "").replace("\t", "")
+            # Defmt formats `{=[u8]:02x}` as `[d3, 00, 03, ...]` (commas + brackets).
+            # Strip both and the older bare-hex form before fromhex().
+            hex_str = (
+                m["hex"]
+                .replace("[", "")
+                .replace("]", "")
+                .replace(",", "")
+                .replace(" ", "")
+                .replace("\t", "")
+            )
+            if not hex_str or len(hex_str) % 2 != 0:
+                continue
             try:
                 data = bytes.fromhex(hex_str)
             except ValueError:
@@ -139,17 +178,24 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", required=True, type=Path, help="probe-rs RTT log file")
     ap.add_argument("--out", required=True, type=Path, help="output .bin path")
+    ap.add_argument(
+        "--side",
+        choices=("chip", "drone"),
+        default="chip",
+        help="which capture buffer to decode (default: chip)",
+    )
     ap.add_argument("--epoch", type=int, default=None, help="specific epoch to extract (default: latest complete)")
     ap.add_argument("--diff", type=Path, default=None, help="compare against existing boot_dump.bin")
     args = ap.parse_args()
 
     text = args.input.read_text(encoding="utf-8", errors="replace")
-    epochs = parse_log(text)
+    epochs = parse_log(text, args.side)
     if not epochs:
-        print("ERROR: no RAWCAP markers found in input", file=sys.stderr)
+        tag = _SIDE_TAGS[args.side]
+        print(f"ERROR: no {tag} markers found in input", file=sys.stderr)
         return 1
 
-    print(f"Found {len(epochs)} epoch(s):", file=sys.stderr)
+    print(f"Found {len(epochs)} {args.side} epoch(s):", file=sys.stderr)
     for e in epochs:
         blob = e.assemble()
         ok = "complete" if (e.ended and blob is not None) else "incomplete"

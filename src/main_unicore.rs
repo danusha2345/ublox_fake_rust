@@ -211,27 +211,60 @@ mod raw_capture {
     use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32};
 
     pub const CAP_LEN: usize = 8192;
-    pub const FREEZE_AFTER_MS: u32 = 4_000;
     pub const REARM_GAP_MS: u32 = 500;
-    /// Steady-state marker — first 6 bytes of `$GNRMC,…\r\n`. Sufficient as a
-    /// substring sentinel to freeze before any 5 Hz NMEA pollutes the buffer.
-    pub const SENTINEL: &[u8] = b"$GNRMC";
+
+    // ---- Chip → board side (UART1 RX) ----------------------------------
+    /// Freeze ~4 s after first byte (boot dump completes in ~3 s).
+    pub const FREEZE_AFTER_MS_CH: u32 = 4_000;
+    /// First 6 bytes of `$GNRMC,…\r\n` — fires once the chip enters its 5 Hz
+    /// stream so we don't pollute the buffer with steady-state NMEA.
+    pub const SENTINEL_CH: &[u8] = b"$GNRMC";
+
+    // ---- Drone → board side (UART0 RX) --------------------------------
+    /// Long timeout because `$CFGKEY` arrives ~20 s after the first command
+    /// on real drones (Air 3S / Mavic). 25 s gives margin.
+    pub const FREEZE_AFTER_MS_DR: u32 = 25_000;
+    /// `$CFGKEY` is the last config command in the standard handshake;
+    /// freezing on it captures every preceding command without idle padding.
+    pub const SENTINEL_DR: &[u8] = b"$CFGKEY";
 
     pub struct CapBuf(pub UnsafeCell<[u8; CAP_LEN]>);
-    // SAFETY: single writer (`uart1_rx_task` on core 0). Readers (`raw_boot_dump_task`)
-    // synchronise via `DONE.load(Acquire)` after writes are made visible
-    // by `WRITE_IDX.store(Release)`. Single-core Unicore build → no preemption.
+    // SAFETY: each buffer has a single writer task on core 0. Readers
+    // (`raw_boot_dump_task`) synchronise via `DONE.load(Acquire)` after writes
+    // are made visible by `WRITE_IDX.store(Release)`. Single-core Unicore
+    // build → no preemption.
     unsafe impl Sync for CapBuf {}
 
-    pub static BUF: CapBuf = CapBuf(UnsafeCell::new([0u8; CAP_LEN]));
-    pub static WRITE_IDX: AtomicU16 = AtomicU16::new(0);
-    pub static DONE: AtomicBool = AtomicBool::new(false);
-    /// 0 = capture not started yet (no bytes seen).
-    pub static FIRST_MS: AtomicU32 = AtomicU32::new(0);
-    /// 0 = no bytes seen yet (also used as the silence-gap reference).
-    pub static LAST_MS: AtomicU32 = AtomicU32::new(0);
-    /// Bumped on every re-arm. Consumers prefer the highest fully-emitted epoch.
-    pub static EPOCH: AtomicU16 = AtomicU16::new(0);
+    /// Per-direction state — atomics + `UnsafeCell`-wrapped buffer.
+    pub struct Channel {
+        pub buf: CapBuf,
+        pub write_idx: AtomicU16,
+        pub done: AtomicBool,
+        /// 0 = capture not started yet (no bytes seen).
+        pub first_ms: AtomicU32,
+        /// 0 = no bytes seen yet (also used as the silence-gap reference).
+        pub last_ms: AtomicU32,
+        /// Bumped on every re-arm. Consumers prefer the highest fully-emitted epoch.
+        pub epoch: AtomicU16,
+    }
+
+    impl Channel {
+        pub const fn new() -> Self {
+            Self {
+                buf: CapBuf(UnsafeCell::new([0u8; CAP_LEN])),
+                write_idx: AtomicU16::new(0),
+                done: AtomicBool::new(false),
+                first_ms: AtomicU32::new(0),
+                last_ms: AtomicU32::new(0),
+                epoch: AtomicU16::new(0),
+            }
+        }
+    }
+
+    /// Chip-side (UART1 RX). Backwards-compat alias retained.
+    pub static CH: Channel = Channel::new();
+    /// Drone-side (UART0 RX).
+    pub static DR: Channel = Channel::new();
 
     /// CRC32 (IEEE 802.3 / zlib polynomial 0xEDB88320), table-less.
     /// Tiny inline implementation — avoids pulling in the `crc` crate.
@@ -256,48 +289,137 @@ mod raw_capture {
     }
 }
 
+/// Push a slice into a `raw_capture::Channel`, applying the freeze rules.
+/// Called from inside a single writer task — `static` access is sound.
+#[cfg(feature = "boot-capture")]
+fn raw_capture_feed(
+    ch: &raw_capture::Channel,
+    tag: &'static str,
+    freeze_after_ms: u32,
+    sentinel: &[u8],
+    bytes: &[u8],
+) {
+    use raw_capture::{contains_subseq, CAP_LEN, REARM_GAP_MS};
+    let now_ms = Instant::now().as_millis() as u32;
+    let last = ch.last_ms.swap(now_ms, Ordering::Relaxed);
+    let mut done = ch.done.load(Ordering::Acquire);
+    // Re-arm: long silence after a previous freeze + new bytes →
+    // assume the source rebooted, start a fresh capture.
+    if done && last != 0 && now_ms.wrapping_sub(last) > REARM_GAP_MS {
+        ch.write_idx.store(0, Ordering::Release);
+        ch.first_ms.store(0, Ordering::Relaxed);
+        ch.done.store(false, Ordering::Release);
+        ch.epoch.fetch_add(1, Ordering::Relaxed);
+        done = false;
+    }
+    if done {
+        return;
+    }
+    let first = ch.first_ms.load(Ordering::Relaxed);
+    let first = if first == 0 {
+        ch.first_ms.store(now_ms, Ordering::Relaxed);
+        now_ms
+    } else {
+        first
+    };
+    let idx = ch.write_idx.load(Ordering::Relaxed) as usize;
+    let room = CAP_LEN.saturating_sub(idx);
+    let take = room.min(bytes.len());
+    if take == 0 {
+        // Buffer full but DONE not set yet — set it now.
+        ch.done.store(true, Ordering::Release);
+        return;
+    }
+    // SAFETY: single-writer task, single-core build.
+    unsafe {
+        let buf_mut: &mut [u8; CAP_LEN] = &mut *ch.buf.0.get();
+        buf_mut[idx..idx + take].copy_from_slice(&bytes[..take]);
+    }
+    let new_idx = idx + take;
+    ch.write_idx.store(new_idx as u16, Ordering::Release);
+    let elapsed = now_ms.wrapping_sub(first);
+    let saw_sentinel = unsafe {
+        let buf_ref: &[u8; CAP_LEN] = &*ch.buf.0.get();
+        contains_subseq(&buf_ref[..new_idx], sentinel)
+    };
+    if new_idx >= CAP_LEN || elapsed >= freeze_after_ms || saw_sentinel {
+        ch.done.store(true, Ordering::Release);
+        info!(
+            "boot-capture frozen [{}]: epoch={=u16} len={=u16} elapsed_ms={=u32}",
+            tag,
+            ch.epoch.load(Ordering::Relaxed),
+            new_idx as u16,
+            elapsed,
+        );
+    }
+}
+
+/// Emit one channel's frozen buffer to RTT. `tag` selects the marker prefix
+/// (`CHIP` → `RAWCAP …`, `DRONE` → `RAWCAP_DR …`); the parser script keys on it.
+#[cfg(feature = "boot-capture")]
+fn emit_channel(ch: &raw_capture::Channel, tag: &'static str) {
+    use raw_capture::{crc32_ieee, CAP_LEN};
+    let done = ch.done.load(Ordering::Acquire);
+    let len = ch.write_idx.load(Ordering::Acquire) as usize;
+    let epoch = ch.epoch.load(Ordering::Relaxed);
+    if !done || len == 0 || len > CAP_LEN {
+        return;
+    }
+    // SAFETY: writer task has reached `DONE=true`, so no further mutation.
+    let slice: &[u8] = unsafe {
+        let buf_ref: &[u8; CAP_LEN] = &*ch.buf.0.get();
+        &buf_ref[..len]
+    };
+    let crc = crc32_ieee(slice);
+    if tag == "DRONE" {
+        info!(
+            "==RAWCAP_DR BEGIN epoch={=u16} len={=u16} crc={=u32:08x}==",
+            epoch, len as u16, crc,
+        );
+    } else {
+        info!(
+            "==RAWCAP BEGIN epoch={=u16} len={=u16} crc={=u32:08x}==",
+            epoch, len as u16, crc,
+        );
+    }
+    // 32 raw bytes per line → defmt {=[u8]:02x} renders as `[xx, xx, ...]`.
+    let mut off = 0usize;
+    while off < len {
+        let end = (off + 32).min(len);
+        if tag == "DRONE" {
+            info!(
+                "RAWCAP_DR {=u16} {=u16} {=[u8]:02x}",
+                epoch,
+                off as u16,
+                &slice[off..end],
+            );
+        } else {
+            info!(
+                "RAWCAP {=u16} {=u16} {=[u8]:02x}",
+                epoch,
+                off as u16,
+                &slice[off..end],
+            );
+        }
+        off = end;
+    }
+    if tag == "DRONE" {
+        info!("==RAWCAP_DR END epoch={=u16} len={=u16}==", epoch, len as u16);
+    } else {
+        info!("==RAWCAP END epoch={=u16} len={=u16}==", epoch, len as u16);
+    }
+}
+
 /// Periodically re-emit the captured boot stream as hex-chunked defmt log lines.
-/// Runs only with the `boot-capture` feature.
+/// Runs only with the `boot-capture` feature. Emits both directions (chip and
+/// drone) when each is frozen.
 #[cfg(feature = "boot-capture")]
 #[embassy_executor::task]
 async fn raw_boot_dump_task() {
-    use raw_capture::*;
     Timer::after(Duration::from_secs(6)).await;
     loop {
-        let done = DONE.load(Ordering::Acquire);
-        let len = WRITE_IDX.load(Ordering::Acquire) as usize;
-        let epoch = EPOCH.load(Ordering::Relaxed);
-        if done && len > 0 && len <= CAP_LEN {
-            // SAFETY: writer task has reached `DONE=true`, so no further mutation.
-            let slice: &[u8] = unsafe {
-                let buf_ref: &[u8; CAP_LEN] = &*BUF.0.get();
-                &buf_ref[..len]
-            };
-            let crc = crc32_ieee(slice);
-            info!(
-                "==RAWCAP BEGIN epoch={=u16} len={=u16} crc={=u32:08x}==",
-                epoch,
-                len as u16,
-                crc,
-            );
-            // 32 raw bytes per line → ~64 hex chars formatted by defmt {=[u8]:x}.
-            let mut off = 0usize;
-            while off < len {
-                let end = (off + 32).min(len);
-                info!(
-                    "RAWCAP {=u16} {=u16} {=[u8]:02x}",
-                    epoch,
-                    off as u16,
-                    &slice[off..end],
-                );
-                off = end;
-            }
-            info!(
-                "==RAWCAP END epoch={=u16} len={=u16}==",
-                epoch,
-                len as u16,
-            );
-        }
+        emit_channel(&raw_capture::CH, "CHIP");
+        emit_channel(&raw_capture::DR, "DRONE");
         Timer::after(Duration::from_secs(10)).await;
     }
 }
@@ -550,6 +672,23 @@ async fn uart0_rx_task(mut rx: BufferedUartRx) {
     loop {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
+                // ---------------------------------------------------------------
+                // boot-capture (drone side, UART0 RX): captures every byte the
+                // drone sends, including the ~38-byte binary garbage prefix and
+                // the late `$CFGKEY` (~20 s post-power). Active in any mode —
+                // the drone-bus traffic is interesting in Emulation too.
+                // ---------------------------------------------------------------
+                #[cfg(feature = "boot-capture")]
+                {
+                    raw_capture_feed(
+                        &raw_capture::DR,
+                        "DRONE",
+                        raw_capture::FREEZE_AFTER_MS_DR,
+                        raw_capture::SENTINEL_DR,
+                        &buf[..n],
+                    );
+                }
+
                 // Boot capture from drone bus (config lines only, capped).
                 if BOOT_LOG_DRONE_TO_CHIP.load(Ordering::Relaxed) < BOOT_LOG_MAX {
                     for &b in &buf[..n] {
@@ -777,70 +916,19 @@ async fn uart1_rx_task(mut rx: BufferedUartRx) {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
                 // ---------------------------------------------------------------
-                // boot-capture: linear one-shot RAM buffer of the chip's first
-                // ~6.7 KB. See raw_capture mod near top of file. Skipped in
-                // Emulation (we'd capture our own output) and after freeze.
+                // boot-capture (chip side): linear one-shot RAM buffer of the
+                // chip's first ~6.7 KB. See raw_capture mod near top of file.
+                // Skipped in Emulation (we'd capture our own output).
                 // ---------------------------------------------------------------
                 #[cfg(feature = "boot-capture")]
                 if OperatingMode::load() != OperatingMode::Emulation {
-                    use raw_capture::{
-                        contains_subseq, BUF, CAP_LEN, DONE, EPOCH, FIRST_MS,
-                        FREEZE_AFTER_MS, LAST_MS, REARM_GAP_MS, SENTINEL, WRITE_IDX,
-                    };
-                    let now_ms = Instant::now().as_millis() as u32;
-                    let last = LAST_MS.swap(now_ms, Ordering::Relaxed);
-                    let mut done = DONE.load(Ordering::Acquire);
-                    // Re-arm: long silence after a previous freeze + new bytes
-                    // → assume the chip rebooted, start a fresh capture.
-                    if done && last != 0 && now_ms.wrapping_sub(last) > REARM_GAP_MS {
-                        WRITE_IDX.store(0, Ordering::Release);
-                        FIRST_MS.store(0, Ordering::Relaxed);
-                        DONE.store(false, Ordering::Release);
-                        EPOCH.fetch_add(1, Ordering::Relaxed);
-                        done = false;
-                    }
-                    if !done {
-                        let first = FIRST_MS.load(Ordering::Relaxed);
-                        let first = if first == 0 {
-                            FIRST_MS.store(now_ms, Ordering::Relaxed);
-                            now_ms
-                        } else {
-                            first
-                        };
-                        let idx = WRITE_IDX.load(Ordering::Relaxed) as usize;
-                        let room = CAP_LEN.saturating_sub(idx);
-                        let take = room.min(n);
-                        if take > 0 {
-                            // SAFETY: single-writer task, single-core build.
-                            unsafe {
-                                let buf_mut: &mut [u8; CAP_LEN] = &mut *BUF.0.get();
-                                buf_mut[idx..idx + take].copy_from_slice(&buf[..take]);
-                            }
-                            let new_idx = idx + take;
-                            WRITE_IDX.store(new_idx as u16, Ordering::Release);
-                            // Freeze conditions
-                            let elapsed = now_ms.wrapping_sub(first);
-                            let saw_sentinel = unsafe {
-                                let buf_ref: &[u8; CAP_LEN] = &*BUF.0.get();
-                                contains_subseq(&buf_ref[..new_idx], SENTINEL)
-                            };
-                            if new_idx >= CAP_LEN
-                                || elapsed >= FREEZE_AFTER_MS
-                                || saw_sentinel
-                            {
-                                DONE.store(true, Ordering::Release);
-                                info!(
-                                    "boot-capture frozen: epoch={=u16} len={=u16} elapsed_ms={=u32}",
-                                    EPOCH.load(Ordering::Relaxed),
-                                    new_idx as u16,
-                                    elapsed,
-                                );
-                            }
-                        } else {
-                            // Buffer full but DONE not yet set — set it now.
-                            DONE.store(true, Ordering::Release);
-                        }
-                    }
+                    raw_capture_feed(
+                        &raw_capture::CH,
+                        "CHIP",
+                        raw_capture::FREEZE_AFTER_MS_CH,
+                        raw_capture::SENTINEL_CH,
+                        &buf[..n],
+                    );
                 }
 
                 // Boot capture of config replies from the chip (capped; no-op
