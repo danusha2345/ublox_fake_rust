@@ -69,6 +69,10 @@ unicore = []
 # modes. Combine with `unicore` and use tools/decode_rtt_boot_capture.py
 # to reconstruct boot_dump.bin from probe-rs output.
 boot-capture = []
+# Diagnostic: log every TX to the drone (NMEA rebuild / verbatim forward /
+# RTCM flush / dropped frames) via defmt-rtt while SPOOF_DETECTED is true.
+# Used to chase coordinate leaks during spoof experiments. Production OFF.
+tx-trace = []
 
 [profile.dev]
 debug = 2

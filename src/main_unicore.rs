@@ -881,6 +881,25 @@ fn enqueue(bytes: &[u8]) {
     }
 }
 
+/// Trace a TX-to-drone event when `SPOOF_DETECTED` is true. Used to chase
+/// coordinate leaks during spoof experiments. Compile-time off in production.
+#[cfg(feature = "tx-trace")]
+fn tx_trace(tag: &'static str, bytes: &[u8]) {
+    if !SPOOF_DETECTED.load(Ordering::Acquire) {
+        return;
+    }
+    let n = bytes.len().min(48);
+    info!(
+        "[TX→DRONE/{}] len={=u16} first={=[u8]:02x}",
+        tag,
+        bytes.len() as u16,
+        &bytes[..n],
+    );
+}
+#[cfg(not(feature = "tx-trace"))]
+#[inline(always)]
+fn tx_trace(_tag: &'static str, _bytes: &[u8]) {}
+
 /// Append one byte to `buf`; flush to TX if full, then retry. Used by the
 /// RTCM/NMEA stream router to forward bytes without allocating.
 #[inline]
@@ -1034,6 +1053,7 @@ async fn passthrough_forward_task() {
                 // Drop incoming chip bytes while we are emitting our own.
             }
             OperatingMode::PassthroughRaw => {
+                tx_trace("raw-chunk", &chunk);
                 enqueue(&chunk);
             }
             OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
@@ -1051,6 +1071,7 @@ async fn passthrough_forward_task() {
                         // RTCM frames (e.g. 1013 system params) don't sit in
                         // pass_buf waiting for the next `$` or a 256-byte fill.
                         if rtcm_remaining == 0 && !pass_buf.is_empty() {
+                            tx_trace("rtcm-flush", &pass_buf);
                             enqueue(&pass_buf);
                             pass_buf.clear();
                         }
@@ -1096,6 +1117,7 @@ async fn passthrough_forward_task() {
                         continue;
                     }
                     if b == b'$' && !pass_buf.is_empty() {
+                        tx_trace("inter-sentence", &pass_buf);
                         enqueue(&pass_buf);
                         pass_buf.clear();
                     }
@@ -1517,11 +1539,14 @@ async fn process_nmea_line(
     //                            invariant under a constant LLH offset.
     if !(is_gga || is_rmc) {
         if spoofed && (is_gll || is_vtg) {
+            tx_trace("nmea-drop-spoof", line);
             return;
         }
         if apply_offset && is_gll {
+            tx_trace("nmea-drop-offset", line);
             return;
         }
+        tx_trace("nmea-passthrough", line);
         enqueue(line);
         return;
     }
@@ -1560,6 +1585,7 @@ async fn process_nmea_line(
     };
 
     let Some(coords) = coords else {
+        tx_trace("nmea-verbatim", line);
         enqueue(line);
         return;
     };
@@ -1575,6 +1601,7 @@ async fn process_nmea_line(
             build_spoofed_rmc(&existing, coords, &mut buf)
         };
         if n > 0 {
+            tx_trace(if is_gga { "spoof-rebuild-gga" } else { "spoof-rebuild-rmc" }, &buf[..n]);
             enqueue(&buf[..n]);
         }
         return;
@@ -1584,9 +1611,11 @@ async fn process_nmea_line(
     // buffer/parse failure.
     let mut work = [0u8; 320];
     if let Some(new_len) = rewrite_coords(line, coords, is_gga, &mut work) {
+        tx_trace("offset-rewrite", &work[..new_len]);
         enqueue(&work[..new_len]);
         return;
     }
+    tx_trace("nmea-fallback", line);
     enqueue(line);
 }
 

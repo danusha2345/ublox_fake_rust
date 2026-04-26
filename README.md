@@ -387,6 +387,38 @@ cd tests_host && cargo test boot_dump
 
 Production-сборка делается без флага: `make rp2350-unicore` / `make rp2354-unicore`. LTO выбрасывает буфер и таску, накладных нет.
 
+#### Диагностика утечек координат через `tx-trace`
+
+Cargo-feature `tx-trace` добавляет одну `info!()` строку перед **каждым** `enqueue()` к UART0 TX (к дрону) когда `SPOOF_DETECTED == true`. Используется для проверки что spoofed координаты не утекают к дрону через какой-то непокрытый путь (новые типы NMEA sentence, RTCM proprietary subs, и т.п.).
+
+```bash
+cargo build --release --features unicore,tx-trace --bin ublox_fake_uc \
+    --target thumbv8m.main-none-eabihf
+make flash
+```
+
+Теги категорий в RTT:
+
+| Тег | Источник | Содержит позицию? |
+|---|---|---|
+| `spoof-rebuild-gga` / `-rmc` | наша подмена под спуф (LAST_GOOD coords + invalid fix) | да, **LAST_GOOD = Phase-1** |
+| `nmea-passthrough` | non-GGA/RMC sentence forward (verbatim) | проверять — должно быть нет |
+| `nmea-drop-spoof` | drop GLL/VTG под спуф | n/a (drop) |
+| `nmea-drop-offset` | drop GLL под offset | n/a (drop) |
+| `rtcm-flush` | RTCM3 / ExtRTCM 4074 frame | proprietary, проверять |
+| `inter-sentence` | байты между sentence'ами (CRLF/мусор) | обычно нет |
+| `nmea-verbatim` / `offset-rewrite` / `nmea-fallback` | не-spoof пути | n/a |
+| `raw-chunk` | PassthroughRaw mode | да (если мы в Raw mode) |
+
+**Анализ** RTT-лога:
+1. `probe-rs attach … | tee /tmp/spoof_trace.log` — ловим RTT во время эксперимента.
+2. `grep '\[TX→DRONE/' /tmp/spoof_trace.log` — все TX события под спуфом.
+3. `grep '\[TX→DRONE/spoof-rebuild-gga\]' …` — проверяем что в нашем rebuild только LAST_GOOD (Phase-1).
+4. Поиск Phase-2 байт-сигнатур: ASCII (`,E,`, `,5956.`, и т.п.) и int32 LE/BE (`23 B5 8E 37` / `37 8E B5 23` для lat=599435895; `12 15 0F 03` / `03 0F 15 12` для lon=303316483).
+5. Если Phase-2 байты не найдены ни в одной категории — утечки **через нашу плату нет**, источник снаружи.
+
+Production-сборка без флага: feature LTO-deads весь trace код, никаких накладных.
+
 ### Переключение режимов
 
 - **Кнопка**: выбор режима по количеству коротких нажатий (таймаут 800мс между нажатиями):
