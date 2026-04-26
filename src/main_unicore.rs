@@ -112,12 +112,33 @@ static RAW_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 
 static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
 static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
 
+/// Hybrid Emulation mode state: act as Passthrough until the live chip
+/// emits its `$CFGKEY,,…` reply (handshake authorised), then take over the
+/// stream with our own NMEA. Stores the deadline (ms since boot) until which
+/// we keep emitting `fq=3`/3D fix; afterwards we switch to `fq=0`/no fix
+/// permanently. `0` = still in passthrough phase, no override yet.
+static EMULATION_VALID_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
+/// Length of the 3D-fix override window after `$CFGKEY` is seen, in ms.
+/// 1 s was too short — DJI Air 3S typically needs ~10 s of stable 3D fix
+/// to establish a home point. After this window we drop satellites.
+const EMULATION_VALID_WINDOW_MS: u32 = 10_000;
+/// Force the override anyway after this many ms in passthrough phase, even
+/// if `$CFGKEY,,` was never observed. Some drones skip CFGKEY when they
+/// have a cached chip authorisation from a prior session, leaving us stuck
+/// in passthrough forever otherwise.
+const EMULATION_FORCE_OVERRIDE_AFTER_MS: u32 = 25_000;
+/// `$CFGKEY,,` literal — substring trigger in the chip→drone byte stream.
+const CFGKEY_TRIGGER: &[u8] = b"$CFGKEY,,";
+/// Tracks when the firmware entered Emulation passthrough phase. Used by
+/// the timeout-based override fallback. 0 = not in passthrough phase.
+static EMULATION_PASSTHROUGH_START_MS: AtomicU32 = AtomicU32::new(0);
+
 /// Boot-handshake capture: collect the first N checksum-ok config NMEA lines
 /// (all non-streaming sentences — i.e. not GGA/RMC/GSA/GSV/GLL/VTG/ZDA/TXT/
 /// PNOISE) in each direction into a RAM buffer, then stop. `boot_log_dump_task`
 /// periodically prints the buffer so an `attach` after boot still shows the
 /// captured handshake.
-const BOOT_LOG_MAX: u8 = 15;
+const BOOT_LOG_MAX: u8 = 100;
 const BOOT_LOG_LINE_MAX: usize = 128;
 const BOOT_LOG_TOTAL: usize = 3 * BOOT_LOG_MAX as usize;
 
@@ -657,6 +678,12 @@ fn is_config_line(line: &[u8]) -> bool {
     if body.len() < 4 || body[0] != b'$' {
         return false;
     }
+    // Short-form `$GNTXT,01,01,00,…` preacks are part of the command/reply
+    // handshake — keep them visible in the boot log even though their
+    // talker+sentence prefix is `GxTXT` (which we otherwise drop as periodic).
+    if body.starts_with(b"$GNTXT,01,01,00,") {
+        return true;
+    }
     // Proprietary sentences ($P...) are interesting (PDTINFO, PSMT, …) except
     // for PNOISE which is a periodic telemetry stream.
     if body[1] == b'P' {
@@ -719,7 +746,12 @@ async fn uart0_rx_task(mut rx: BufferedUartRx) {
                     }
                 }
                 // Only respond to commands while we're acting as the chip.
+                // In hybrid Emulation, stay silent during the passthrough
+                // phase — the live chip is answering the drone for us.
                 if OperatingMode::load() != OperatingMode::Emulation {
+                    continue;
+                }
+                if EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) == 0 {
                     continue;
                 }
                 for &b in &buf[..n] {
@@ -947,6 +979,9 @@ async fn enqueue_chunked(bytes: &[u8]) {
 async fn uart1_rx_task(mut rx: BufferedUartRx) {
     let mut buf = [0u8; 256];
     let mut diag_asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
+    // Substring match progress for `$CFGKEY,,` in the chip→drone byte stream.
+    // Used by the hybrid-Emulation flow to detect end-of-handshake.
+    let mut cfgkey_match: u8 = 0;
     loop {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
@@ -984,8 +1019,49 @@ async fn uart1_rx_task(mut rx: BufferedUartRx) {
                         }
                     }
                 }
-                if OperatingMode::load() == OperatingMode::Emulation {
-                    continue; // drop while we are emulating
+                // Hybrid Emulation: while we are still in the passthrough
+                // phase (no CFGKEY override yet), watch the chip→drone byte
+                // stream for `$CFGKEY,,` and arm the override window when seen.
+                let mode_now = OperatingMode::load();
+                if mode_now == OperatingMode::Emulation
+                    && EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) == 0
+                {
+                    for &b in &buf[..n] {
+                        let want = CFGKEY_TRIGGER[cfgkey_match as usize];
+                        if b == want {
+                            cfgkey_match += 1;
+                            if cfgkey_match as usize == CFGKEY_TRIGGER.len() {
+                                let now_ms = Instant::now().as_millis() as u32;
+                                EMULATION_VALID_UNTIL_MS.store(
+                                    now_ms.wrapping_add(EMULATION_VALID_WINDOW_MS),
+                                    Ordering::Release,
+                                );
+                                OUTPUT_START_MILLIS.store(now_ms, Ordering::Release);
+                                SATELLITES_INVALID.store(false, Ordering::Release);
+                                info!(
+                                    "Hybrid Emulation: $CFGKEY seen, valid 3D fix override for {=u32} ms",
+                                    EMULATION_VALID_WINDOW_MS,
+                                );
+                                cfgkey_match = 0;
+                            }
+                        } else {
+                            cfgkey_match = if b == CFGKEY_TRIGGER[0] { 1 } else { 0 };
+                        }
+                    }
+                }
+
+                // Routing:
+                //   Passthrough/Raw/Offset modes        — always forward.
+                //   Emulation, passthrough phase        — forward (drone gets
+                //                                         real chip stream incl.
+                //                                         CFGKEY response).
+                //   Emulation, override phase           — drop chip bytes and
+                //                                         let `emulation_task`
+                //                                         drive the stream.
+                let drop_chip_bytes = mode_now == OperatingMode::Emulation
+                    && EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) != 0;
+                if drop_chip_bytes {
+                    continue;
                 }
                 let mut v = heapless::Vec::<u8, 256>::new();
                 let _ = v.extend_from_slice(&buf[..n]);
@@ -1066,7 +1142,16 @@ async fn passthrough_forward_task() {
 
         match mode {
             OperatingMode::Emulation => {
-                // Drop incoming chip bytes while we are emitting our own.
+                // Hybrid Emulation: forward chip bytes verbatim until the
+                // chip's `$CFGKEY,,…` reply (handshake authorised). After
+                // the trigger fires, `uart1_rx_task` drops chip bytes and
+                // `emulation_task` drives the stream.
+                if EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) == 0 {
+                    tx_trace("emu-passthrough", &chunk);
+                    enqueue(&chunk);
+                }
+                // else: chunk should already be empty since uart1_rx_task
+                // stopped feeding RAW_RX_CHANNEL after CFGKEY.
             }
             OperatingMode::PassthroughRaw => {
                 tx_trace("raw-chunk", &chunk);
@@ -1666,24 +1751,55 @@ async fn emulation_task() {
             centis = start_centis;
             counter = 0;
             SATELLITES_INVALID.store(false, Ordering::Release);
+            EMULATION_VALID_UNTIL_MS.store(0, Ordering::Release);
+            EMULATION_PASSTHROUGH_START_MS.store(0, Ordering::Release);
             continue;
         }
+        // Hybrid Emulation: stay silent until the chip's `$CFGKEY,,…` reply
+        // has been observed by `uart1_rx_task`. Until then `passthrough_forward_task`
+        // is forwarding chip→drone bytes verbatim.
+        let mut valid_until = EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire);
+        if valid_until == 0 {
+            // Track when passthrough phase started, to enable timeout-based
+            // fallback for drones that don't send `$CFGKEY` (cached auth).
+            let now_ms = Instant::now().as_millis() as u32;
+            let pass_start = EMULATION_PASSTHROUGH_START_MS.load(Ordering::Acquire);
+            if pass_start == 0 {
+                EMULATION_PASSTHROUGH_START_MS.store(now_ms, Ordering::Release);
+            } else if now_ms.wrapping_sub(pass_start) >= EMULATION_FORCE_OVERRIDE_AFTER_MS {
+                // Force the override anyway.
+                let new_until = now_ms.wrapping_add(EMULATION_VALID_WINDOW_MS);
+                EMULATION_VALID_UNTIL_MS.store(new_until, Ordering::Release);
+                OUTPUT_START_MILLIS.store(now_ms, Ordering::Release);
+                SATELLITES_INVALID.store(false, Ordering::Release);
+                info!(
+                    "Hybrid Emulation: timeout fallback fired ({=u32} ms in passthrough), forcing override",
+                    EMULATION_FORCE_OVERRIDE_AFTER_MS,
+                );
+                valid_until = new_until;
+            } else {
+                booted = false;
+                centis = start_centis;
+                counter = 0;
+                continue;
+            }
+        }
         if !booted {
-            enqueue_chunked(unicore::boot::BOOT_DUMP).await;
+            // Skip BOOT_DUMP — chip already streamed its own boot output to
+            // the drone during the passthrough phase. Just begin emitting NMEA.
             booted = true;
             counter = 0;
             centis = start_centis;
-            OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
             SATELLITES_INVALID.store(false, Ordering::Release);
         }
         counter = counter.wrapping_add(1);
         centis += 20;
 
-        // Keep mode-1 behavior aligned with the u-blox build: initially valid,
-        // then force invalid satellites after the configured output timeout.
-        let start_time = OUTPUT_START_MILLIS.load(Ordering::Acquire);
-        let elapsed_ms = (Instant::now().as_millis() as u32).wrapping_sub(start_time);
-        let satellites_invalid = elapsed_ms >= config::timers::SATELLITES_INVALID_AFTER_MS as u32;
+        // Hybrid Emulation: 3D fix valid only inside the EMULATION_VALID_WINDOW_MS
+        // window after `$CFGKEY`; afterwards the chip "loses" satellites
+        // permanently.
+        let now_ms = Instant::now().as_millis() as u32;
+        let satellites_invalid = (now_ms.wrapping_sub(valid_until) as i32) >= 0;
         SATELLITES_INVALID.store(satellites_invalid, Ordering::Release);
 
         let valid = !satellites_invalid;
@@ -1817,30 +1933,46 @@ async fn emulation_task() {
             enqueue(b"$PNOISE,65,85,13663,11506,9643,34974,10000,10000,10000,10000,0,0*37\r\n");
         }
 
-        // RTCM + ExtRTCM stream alongside NMEA (fix is immediate now).
-        {
-            if counter % 5 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1077); }
-            if counter % 3 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1097); }
-            if counter % 3 == 1 { enqueue(unicore::rtcm_samples::FRAME_MSG_1019); }
-            if counter % 8 == 0 { enqueue(unicore::rtcm_samples::FRAME_MSG_1046); }
-            if counter % 5 == 2 { enqueue(unicore::rtcm_samples::FRAME_MSG_1013); }
-            if counter % 5 == 3 { enqueue(unicore::rtcm_samples::CW_OUT_SAMPLE); }
+        // ---- RTCM/ExtRTCM stream — match live chip cadence -----------------
+        // Live UC6580I in no-fix steady-state emits per ~200 ms cycle:
+        //   D3 00 03 43 50 00 8D 44 BE          (RTCM 1077 short, no-obs)
+        //   ExtRTCM 4074 subs 0xFF, 0xFE, 0xF9, 0xE6  (status)
+        //   ExtRTCM 4074 sub 0xE9                     (occasional)
+        //   $GNRMC, $GNGGA, $GNTXT (long form), $PNOISE   ← already emitted
+        //   ExtRTCM 4074 subs 0x000, 0x001, 0x002      (short status)
+        // Drone observes these during the passthrough phase and depends on
+        // their continuation. Skipping them after the override switch causes
+        // the drone to disconnect.
 
-            if counter % 5 == 0 {
-                for &(sub, data) in &[
-                    (0x0FEu16, unicore::extrtcm::DATA_SUB_0FE),
-                    (0x0E6,    unicore::extrtcm::DATA_SUB_0E6),
-                    (0x0F9,    unicore::extrtcm::DATA_SUB_0F9),
-                    (0x0E9,    unicore::extrtcm::DATA_SUB_0E9),
-                    (0x0FF,    unicore::extrtcm::DATA_SUB_0FF),
-                ] {
-                    let n = unicore::extrtcm::build_sub(&mut buf, sub, data);
-                    if n > 0 { enqueue(&buf[..n]); }
-                }
-            }
+        // RTCM 1077 short — empty MSM7 placeholder (9 bytes, fixed CRC).
+        const RTCM_1077_SHORT: &[u8] = &[
+            0xD3, 0x00, 0x03, 0x43, 0x50, 0x00, 0x8D, 0x44, 0xBE,
+        ];
+        enqueue(RTCM_1077_SHORT);
 
-            if counter % 85 == 40  { enqueue(unicore::rtcm_samples::PPS_INFO_SAMPLE); }
-            if counter % 300 == 120 { enqueue(unicore::rtcm_samples::SVEPH_SAMPLE); }
+        // ExtRTCM 4074 status frames — large status block (every tick).
+        for &(sub, data) in &[
+            (0x0FFu16, unicore::extrtcm::DATA_SUB_0FF),
+            (0x0FE,    unicore::extrtcm::DATA_SUB_0FE),
+            (0x0F9,    unicore::extrtcm::DATA_SUB_0F9),
+            (0x0E6,    unicore::extrtcm::DATA_SUB_0E6),
+        ] {
+            let n = unicore::extrtcm::build_sub(&mut buf, sub, data);
+            if n > 0 { enqueue(&buf[..n]); }
+        }
+        // Sub 0xE9 only every ~5 ticks (jamming/spoof detection update).
+        if counter % 5 == 0 {
+            let n = unicore::extrtcm::build_sub(&mut buf, 0x0E9, unicore::extrtcm::DATA_SUB_0E9);
+            if n > 0 { enqueue(&buf[..n]); }
+        }
+        // Subs 0x000, 0x001, 0x002 every tick (short cyclic status).
+        for &(sub, data) in &[
+            (0x000u16, unicore::extrtcm::DATA_SUB_000),
+            (0x001,    unicore::extrtcm::DATA_SUB_001),
+            (0x002,    unicore::extrtcm::DATA_SUB_002),
+        ] {
+            let n = unicore::extrtcm::build_sub(&mut buf, sub, data);
+            if n > 0 { enqueue(&buf[..n]); }
         }
     }
 }
@@ -1980,7 +2112,7 @@ async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
 
     let mut click_count: u8 = 0;
     let mut last_click_time: Option<Instant> = None;
-    let mut was_high = btn.is_high();
+    let mut was_high = false;
 
     loop {
         Timer::after(Duration::from_millis(POLL_PERIOD_MS)).await;
