@@ -215,9 +215,22 @@ pub const PRODUCTINFO_REPLY: &[u8] =
 /// `$CFGNAV,200,200,0*07\r\n` — navigation rate reply (5 Hz, no DR).
 pub const CFGNAV_DEFAULT_REPLY: &[u8] = b"$CFGNAV,200,200,0*07\r\n";
 
+/// `$GNTXT,01,01,00,PDTINFO*1F\r\n` — pre-ACK emitted by the real chip
+/// *before* the `$PDTINFO` reply (verified live 2026-04-26).
+pub const PDTINFO_PREACK: &[u8] = b"$GNTXT,01,01,00,PDTINFO*1F\r\n";
+
 /// `$GNTXT,01,01,00,CFGSYS*4A\r\n` — pre-ACK emitted by the real chip
 /// *before* the `$CFGSYS` value on a GET request.
 pub const CFGSYS_PREACK: &[u8] = b"$GNTXT,01,01,00,CFGSYS*4A\r\n";
+
+/// Long-form periodic status `$GNTXT,01,01,01,…` (info-type, 24 fields).
+/// Emitted by the live chip alongside steady-state NMEA. The 13th field is
+/// the fix-progression indicator: `0` while no 3D fix, `3` once a 3D fix
+/// is established. Live captures `*6E` / `*6D` checksums respectively.
+pub const GNTXT_STATUS_NOFIX: &[u8] =
+    b"$GNTXT,01,01,01,0,000000,0000,0000,0000,0.000,0,0003F7EE01B8FB77,1,0,0,0,0000,0,0,0,148,148,00000000,00000000*6E\r\n";
+pub const GNTXT_STATUS_FIX3D: &[u8] =
+    b"$GNTXT,01,01,01,0,000000,0000,0000,0000,0.000,0,0003F7EE01B8FB77,1,3,0,0,0000,0,0,0,148,148,00000000,00000000*6D\r\n";
 
 /// `$GNTXT,01,01,00,CFGNAV*4A\r\n` — pre-ACK for `$CFGNAV` GET.
 pub const CFGNAV_PREACK: &[u8] = b"$GNTXT,01,01,00,CFGNAV*4A\r\n";
@@ -632,5 +645,21 @@ mod tests {
     fn parse_cfgmsm_and_cfgnmea() {
         assert_eq!(parse_command(b"$CFGMSM").unwrap(), Command::CfgMsm);
         assert_eq!(parse_command(b"$CFGNMEA").unwrap(), Command::CfgNmea);
+    }
+
+    #[test]
+    fn pdtinfo_preack_bitexact_live() {
+        assert_eq!(PDTINFO_PREACK, b"$GNTXT,01,01,00,PDTINFO*1F\r\n");
+        assert!(nmea::verify_sentence(PDTINFO_PREACK));
+    }
+
+    #[test]
+    fn gntxt_status_long_form_bitexact_live() {
+        // Live chip emits both `*6E` (no fix, field 13 = 0) and `*6D`
+        // (3D fix, field 13 = 3) variants. Captured 2026-04-26.
+        assert!(nmea::verify_sentence(GNTXT_STATUS_NOFIX));
+        assert!(nmea::verify_sentence(GNTXT_STATUS_FIX3D));
+        assert!(GNTXT_STATUS_NOFIX.ends_with(b"*6E\r\n"));
+        assert!(GNTXT_STATUS_FIX3D.ends_with(b"*6D\r\n"));
     }
 }

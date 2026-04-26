@@ -331,6 +331,17 @@ Spoof handling в Unicore:
 
 LED в Unicore на RP2350 отличается от u-blox цветов: Emulation зелёный/жёлтый, Passthrough cyan, PassthroughRaw magenta, PassthroughOffset жёлтый, spoof — быстрый красный blink. На RP2354 используется blink count 1..4.
 
+Unicore mode можно переключать без кнопки через отладочный RAM-mailbox:
+
+```bash
+tools/debug_set_unicore_mode.py --mode emulation      # enum 0, то же что 1 клик
+tools/debug_set_unicore_mode.py --mode passthrough    # enum 1, то же что 2 клика
+tools/debug_set_unicore_mode.py --mode raw            # enum 2, то же что 3 клика
+tools/debug_set_unicore_mode.py --mode offset         # enum 3, то же что 4 клика
+```
+
+Скрипт ищет адреса `DEBUG_MODE_REQUEST` и `MODE` в ELF через `nm`, пишет request через `probe-rs write`, затем читает `MODE` для подтверждения. Прошивка применяет запрос тем же safe path, что и кнопка: сбрасывает spoof/emulation state, выставляет `SPOOF_DETECTOR_RESET` и сохраняет выбранный режим во flash. Не меняйте `MODE` прямым `probe-rs write` как основной способ — это обходит side effects и сохранение.
+
 #### Обновление boot dump через `boot-capture`
 
 `src/unicore/boot_dump.bin` — байт-точная копия первых ~6.7 КБ потока с реального UC6580I (header + `$RECVCFG/$PECFG/$CHCFG/$PTINFOPKG` + UTC×5 + IONO×3 + `$SVEPH_*` × 20 + первый burst RTCM/ExtRTCM 4074). Эмулятор воспроизводит его в Emulation одним блоком при первом тике (`enqueue_chunked(BOOT_DUMP)`).
@@ -426,6 +437,8 @@ Production-сборка без флага: feature LTO-deads весь trace ко
   - **2 нажатия** → Passthrough
   - **3 нажатия** → PassthroughRaw
   - **4 нажатия** → PassthroughOffset
+- **Отладчик (только Unicore target)**: `tools/debug_set_unicore_mode.py --mode emulation|passthrough|raw|offset`.
+  Важно: debug mailbox принимает enum `0..3`, а не число кликов `1..4`.
 - **Индикация LED (RP2350 u-blox target — WS2812B цветной)**:
   - Зелёный/жёлтый — Emulation (жёлтый = спутники невалидны)
   - Синий — Passthrough

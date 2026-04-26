@@ -104,8 +104,11 @@ pub mod timers {
     pub const CONFIG_TO_NAV_MAVIC3PRO_MS: u64 = 780;
     /// Delay after CFG-RST before message output starts (0 = immediate)
     pub const UART_TX_INIT_DELAY_MS: u64 = 0;
-    /// Time after start when satellites become invalid (ms)
-    pub const SATELLITES_INVALID_AFTER_MS: u64 = 20_000;
+    /// Time after start when satellites become invalid (ms). 22 s gives the
+    /// drone enough time to complete the standard handshake (`$PDTINFO` →
+    /// `$CFGMSG`×4 → `$CFGSAVE` → `$CFGSYS`×2 → `$CFGKEY` at ~20 s) and
+    /// establish a home point under valid 3D fix before the chip "loses" it.
+    pub const SATELLITES_INVALID_AFTER_MS: u64 = 22_000;
 }
 
 /// Константы для логики кнопки переключения режимов

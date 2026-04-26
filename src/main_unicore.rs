@@ -89,7 +89,18 @@ impl OperatingMode {
     fn store(self) { MODE.store(self as u8, Ordering::Release); }
 }
 
+#[derive(Clone, Copy, defmt::Format)]
+enum ModeChangeSource {
+    Button,
+    Debug,
+}
+
+const DEBUG_MODE_REQUEST_IDLE: u8 = 0xFF;
+
+#[unsafe(no_mangle)]
 static MODE: AtomicU8 = AtomicU8::new(OperatingMode::Passthrough as u8);
+#[unsafe(no_mangle)]
+static DEBUG_MODE_REQUEST: AtomicU8 = AtomicU8::new(DEBUG_MODE_REQUEST_IDLE);
 
 // ---------------------------------------------------------------------------
 // Shared channels
@@ -584,6 +595,7 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(passthrough_forward_task());
     spawner.must_spawn(emulation_task());
     spawner.must_spawn(button_task(btn_flex, flash_mutex));
+    spawner.must_spawn(debug_mode_request_task(flash_mutex));
     spawner.must_spawn(boot_log_dump_task());
     #[cfg(feature = "boot-capture")]
     spawner.must_spawn(raw_boot_dump_task());
@@ -730,7 +742,8 @@ async fn handle_command(line: &[u8]) {
         build_cfgmsg_reply, default_cfgmsg_rate, is_known_cfgmsg, parse_command, reply_cfgkey,
         reply_cfgmsm, reply_cfgnav_default, reply_cfgnmea, reply_cfgprt_uart1, reply_cfgprt_uart2,
         reply_cfgsys_default, reply_fail, reply_gntxt_ack, reply_ok, reply_pdtinfo,
-        reply_productinfo, CFGMSM_PREACK, CFGNAV_PREACK, CFGSYS_PREACK, Command, ParseError,
+        reply_productinfo, CFGMSM_PREACK, CFGNAV_PREACK, CFGSYS_PREACK, PDTINFO_PREACK, Command,
+        ParseError,
     };
 
     // Full echo body (between `$` and trailing \r\n, INCLUDING *HH if present).
@@ -782,6 +795,9 @@ async fn handle_command(line: &[u8]) {
                 enqueue(&scratch[..n]);
                 return;
             }
+            // Live chip emits `$GNTXT,01,01,00,PDTINFO*1F` BEFORE the reply.
+            // Without this preack the drone may reject the chip identity.
+            enqueue(PDTINFO_PREACK);
             let n = reply_pdtinfo(&mut scratch); enqueue(&scratch[..n]);
             let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
         }
@@ -1671,7 +1687,11 @@ async fn emulation_task() {
         SATELLITES_INVALID.store(satellites_invalid, Ordering::Release);
 
         let valid = !satellites_invalid;
-        let fix_quality: u8 = if valid { 1 } else { 0 };
+        // Live UC6580I emits `fq=3` (3D fix) once it has full lock, not `fq=1`
+        // (autonomous 2D). DJI Air 3S requires `fq=3` to mark the chip as a
+        // trusted home-point source. After SATELLITES_INVALID_AFTER_MS the
+        // emulator drops to `fq=0` so the drone enters failsafe.
+        let fix_quality: u8 = if valid { 3 } else { 0 };
         let nsats: u8 = if valid { 16 } else { 1 };
 
         // Unpack simulated time
@@ -1782,6 +1802,16 @@ async fn emulation_task() {
             }
         }
 
+        // Long-form `$GNTXT,01,01,01,…` periodic status — emitted every tick
+        // by the live chip alongside RMC/GGA. Field 13 carries the fix
+        // indicator (3 = 3D fix, 0 = no fix). Drone uses the chip-ID embedded
+        // in field 11 + this status as a health/identity signal.
+        if valid {
+            enqueue(unicore::cmd::GNTXT_STATUS_FIX3D);
+        } else {
+            enqueue(unicore::cmd::GNTXT_STATUS_NOFIX);
+        }
+
         // PNOISE every 10 ticks (~0.5 Hz).
         if counter % 10 == 0 {
             enqueue(b"$PNOISE,65,85,13663,11506,9643,34974,10000,10000,10000,10000,0,0*37\r\n");
@@ -1887,6 +1917,58 @@ async fn simple_led_task(mut led: Output<'static>) {
 // persist to flash.
 // ---------------------------------------------------------------------------
 
+async fn apply_operating_mode(
+    new_mode: OperatingMode,
+    source: ModeChangeSource,
+    detail: u8,
+    flash: &'static FlashMutex,
+) {
+    let mut flash = flash.lock().await;
+    let current = OperatingMode::load();
+    if new_mode == current {
+        match source {
+            ModeChangeSource::Button => info!("Mode unchanged: {:?} (clicks={})", new_mode, detail),
+            ModeChangeSource::Debug => info!("Mode unchanged: {:?} (debug request={})", new_mode, detail),
+        }
+        return;
+    }
+
+    new_mode.store();
+    if new_mode == OperatingMode::Emulation {
+        OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
+        SATELLITES_INVALID.store(false, Ordering::Release);
+    }
+    SPOOF_DETECTED.store(false, Ordering::Release);
+    SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+    SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
+
+    let saved = flash_storage::save_mode(&mut flash, new_mode as u8).await;
+    match source {
+        ModeChangeSource::Button => info!("Mode: {:?} -> {:?} (clicks={})", current, new_mode, detail),
+        ModeChangeSource::Debug => info!("Mode: {:?} -> {:?} (debug request={})", current, new_mode, detail),
+    }
+    if !saved {
+        warn!("Failed to save mode to flash");
+    }
+}
+
+#[embassy_executor::task]
+async fn debug_mode_request_task(flash: &'static FlashMutex) {
+    loop {
+        let request = DEBUG_MODE_REQUEST.swap(DEBUG_MODE_REQUEST_IDLE, Ordering::AcqRel);
+        if request != DEBUG_MODE_REQUEST_IDLE {
+            if request <= OperatingMode::PassthroughOffset as u8 {
+                let new_mode = OperatingMode::from_u8(request);
+                info!("debug mode request: {} -> {:?}", request, new_mode);
+                apply_operating_mode(new_mode, ModeChangeSource::Debug, request, flash).await;
+            } else {
+                warn!("invalid debug mode request: {}", request);
+            }
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
 #[embassy_executor::task]
 async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
     use config::button::*;
@@ -1914,20 +1996,7 @@ async fn button_task(mut btn: Flex<'static>, flash: &'static FlashMutex) {
                         4 => OperatingMode::PassthroughOffset,
                         _ => OperatingMode::PassthroughOffset,
                     };
-                    let current = OperatingMode::load();
-                    if new_mode != current {
-                        new_mode.store();
-                        if new_mode == OperatingMode::Emulation {
-                            OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
-                            SATELLITES_INVALID.store(false, Ordering::Release);
-                        }
-                        SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
-                        let mut flash = flash.lock().await;
-                        flash_storage::save_mode(&mut flash, new_mode as u8).await;
-                        info!("Mode: {:?} -> {:?} (clicks={})", current, new_mode, click_count);
-                    } else {
-                        info!("Mode unchanged: {:?} (clicks={})", new_mode, click_count);
-                    }
+                    apply_operating_mode(new_mode, ModeChangeSource::Button, click_count, flash).await;
                     click_count = 0;
                     last_click_time = None;
                 }
