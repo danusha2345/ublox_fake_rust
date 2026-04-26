@@ -973,6 +973,15 @@ async fn process_nmea_line(
         }
     }
 
+    // Snapshot of `last_gga_sod` BEFORE the primary GGA branch updates it. Both
+    // the primary's midnight-rollover guard and secondary trigger #2's own
+    // rollover guard must compare the *current* GGA's second-of-day against
+    // the *previous* GGA's, not against itself — without this snapshot the
+    // primary would overwrite the cell first and secondary #2 would always see
+    // `prev == sod`, defeating the rollover skip and synthesising a bogus
+    // 24 h backward jump on every in-flight fix-loss with empty time field.
+    let prev_gga_sod = time_cache.last_gga_sod;
+
     // --- Detector + pos_buffer: GGA (u-blox parity) --------------------------
     // u-blox calls `detector.analyze()` on every NAV-PVT regardless of fix_type;
     // the detector itself short-circuits on NoFix samples. Match that here: fire
@@ -1006,7 +1015,7 @@ async fn process_nmea_line(
                 let stale_date =
                     time_cache.date.is_none()
                     || now_ms.wrapping_sub(time_cache.date_ms) > NMEA_DATE_FRESHNESS_MS;
-                let rolled_over = time_cache.last_gga_sod
+                let rolled_over = prev_gga_sod
                     .map_or(false, |prev| prev > sod && prev - sod > 12 * 3600);
                 time_cache.last_gga_sod = Some(sod);
 
@@ -1120,8 +1129,11 @@ async fn process_nmea_line(
                             + fix.time.second as u32;
                     let stale = time_cache.date.is_none()
                         || now_ms.wrapping_sub(time_cache.date_ms) > NMEA_DATE_FRESHNESS_MS;
-                    let rolled_over = time_cache
-                        .last_gga_sod
+                    // Use the pre-update snapshot: the primary GGA branch
+                    // has already overwritten `time_cache.last_gga_sod` to
+                    // the current sod, so reading it here would always give
+                    // `prev == sod` and break the rollover skip.
+                    let rolled_over = prev_gga_sod
                         .map_or(false, |prev| prev > sod && prev - sod > 12 * 3600);
                     if stale || rolled_over { None } else { time_cache.date }
                 } else {

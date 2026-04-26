@@ -415,6 +415,24 @@ impl SpoofDetector {
                     warn!("TELEPORT after gap: {}m from last_good (gap={}ms)", dist_from_good as i32, dt_ms);
                     gap_spoof = true;
                 }
+
+                // Check 1b: Implausible average ground speed across the gap.
+                // Catches sub-teleport jumps (B within 2 km of last_good) that
+                // imply a speed no real drone can sustain — closes the leak
+                // window when a smart spoofer keeps B near last_good and the
+                // GNSS-time-based checks don't fire (gnss_time None on a
+                // GGA-first frame with stale RMC date cache, or time-preserved
+                // spoof frames that don't trip check_gnss_time).
+                let dt_s = dt_ms as f32 / 1000.0;
+                if dt_s > 0.0 && dist_from_good / dt_s > thresholds::MAX_SPEED_MS {
+                    warn!(
+                        "SPEED after gap: {}m/s ({}m / {}s)",
+                        (dist_from_good / dt_s) as i32,
+                        dist_from_good as i32,
+                        dt_s as i32
+                    );
+                    gap_spoof = true;
+                }
             }
 
             // Check 2: Clock drift after gap (time-based detection even during gaps)
