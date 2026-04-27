@@ -457,6 +457,42 @@ fn force_3d_rejects_bad_checksum_only() {
 }
 
 #[test]
+fn rewrite_gntxt_status_flips_field_13_and_recomputes_checksum() {
+    // Live `$GNTXT,01,01,01,…` from UC6580I: bit-exact constants in cmd.rs
+    let nofix = b"$GNTXT,01,01,01,0,000000,0000,0000,0000,0.000,0,0003F7EE01B8FB77,1,0,0,0,0000,0,0,0,148,148,00000000,00000000*6E\r\n";
+    let fix3d = b"$GNTXT,01,01,01,0,000000,0000,0000,0000,0.000,0,0003F7EE01B8FB77,1,3,0,0,0000,0,0,0,148,148,00000000,00000000*6D\r\n";
+
+    let mut out = [0u8; 256];
+
+    // 0 → 3
+    let n = rewrite_gntxt_status(nofix, b'3', &mut out).expect("nofix → fix3d");
+    assert!(verify_sentence(&out[..n]));
+    assert_eq!(&out[..n], &fix3d[..]);
+
+    // 3 → 0 (round-trip)
+    let n = rewrite_gntxt_status(fix3d, b'0', &mut out).expect("fix3d → nofix");
+    assert!(verify_sentence(&out[..n]));
+    assert_eq!(&out[..n], &nofix[..]);
+
+    // Bad checksum is rejected
+    let mut bad = nofix.to_vec();
+    let blen = bad.len();
+    bad[blen - 5] = b'0';
+    bad[blen - 4] = b'0';
+    assert!(rewrite_gntxt_status(&bad, b'3', &mut out).is_none());
+
+    // Preack form `,00,…` (not status) is rejected
+    let preack = b"$GNTXT,01,01,00,PDTINFO*1F\r\n";
+    assert!(rewrite_gntxt_status(preack, b'3', &mut out).is_none());
+
+    // Wrong sentence kind rejected
+    assert!(rewrite_gntxt_status(b"$GNGGA,,,,,,0,00,99.99,,,,,,*56", b'3', &mut out).is_none());
+
+    // fix_indicator out of '0'..='5' rejected
+    assert!(rewrite_gntxt_status(nofix, b'9', &mut out).is_none());
+}
+
+#[test]
 fn force_no_fix_zeroes_satellites_keeps_target_coords() {
     let target = (
         config::offset_target::LAT_1E7,

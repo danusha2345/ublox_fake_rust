@@ -229,6 +229,8 @@ async fn nav_debug_summary_task() {
         let gsa_bad = nav_debug::GSA_REJECT.load(Ordering::Relaxed);
         let gll_ok = nav_debug::GLL_REWRITE.load(Ordering::Relaxed);
         let gll_bad = nav_debug::GLL_REJECT_CHECKSUM.load(Ordering::Relaxed);
+        let gntxt_ok = nav_debug::GNTXT_STATUS_REWRITE.load(Ordering::Relaxed);
+        let gntxt_bad = nav_debug::GNTXT_STATUS_REJECT.load(Ordering::Relaxed);
         let gsv = nav_debug::GSV_THROUGH.load(Ordering::Relaxed);
         let vtg = nav_debug::VTG_THROUGH.load(Ordering::Relaxed);
         let zda = nav_debug::ZDA_THROUGH.load(Ordering::Relaxed);
@@ -242,15 +244,16 @@ async fn nav_debug_summary_task() {
         let d_fresh = nav_debug::DATE_CACHE_FRESH.load(Ordering::Relaxed);
 
         let total = gga_ok + gga_bad + rmc_ok + rmc_bad + gsa_ok + gsa_bad
-            + gll_ok + gll_bad + gsv + vtg + zda + txt + prop + other;
+            + gll_ok + gll_bad + gntxt_ok + gntxt_bad
+            + gsv + vtg + zda + txt + prop + other;
         let delta = total.wrapping_sub(prev_total);
         prev_total = total;
 
         info!(
-            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
+            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} GNTXT={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
             OperatingMode::load(),
             delta,
-            gga_ok, gga_bad, rmc_ok, rmc_bad, gsa_ok, gsa_bad, gll_ok, gll_bad,
+            gga_ok, gga_bad, rmc_ok, rmc_bad, gsa_ok, gsa_bad, gll_ok, gll_bad, gntxt_ok, gntxt_bad,
             gsv, vtg, zda, txt, prop, other,
             chip_fq, chip_nsats, chip_rmc,
             t_fresh, d_fresh,
@@ -826,6 +829,8 @@ mod nav_debug {
     pub static GSA_REJECT: AtomicU32 = AtomicU32::new(0);
     pub static GLL_REWRITE: AtomicU32 = AtomicU32::new(0);
     pub static GLL_REJECT_CHECKSUM: AtomicU32 = AtomicU32::new(0);
+    pub static GNTXT_STATUS_REWRITE: AtomicU32 = AtomicU32::new(0);
+    pub static GNTXT_STATUS_REJECT: AtomicU32 = AtomicU32::new(0);
     pub static GSV_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static VTG_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static ZDA_THROUGH: AtomicU32 = AtomicU32::new(0);
@@ -1242,6 +1247,12 @@ async fn process_nmea_line(
     let is_rmc = line.len() >= 6 && &line[3..6] == b"RMC";
     let is_gsa = line.len() >= 6 && &line[3..6] == b"GSA";
     let is_gll = line.len() >= 6 && &line[3..6] == b"GLL";
+    // Long-form periodic status from UC6580I: `$xxTXT,01,01,01,…` (24 fields,
+    // vendor-extended). Field 13 is the fix-progression indicator. Distinct
+    // from the short `,00,…` preack which we leave alone.
+    let is_gntxt_status = line.len() >= 16
+        && &line[3..6] == b"TXT"
+        && line[6..].starts_with(b",01,01,01,");
 
     // Cache any parseable time/date from the chip's frame so the Forced3dFix
     // rewrite can fall back to a recent timestamp when the chip's own GGA/RMC
@@ -1359,6 +1370,41 @@ async fn process_nmea_line(
                 nav_dbg!(
                     "[nav-debug] {=str} rewrite REJECT (checksum/unknown) → verbatim len={=u16}",
                     kind, line.len() as u16
+                );
+            }
+            return;
+        }
+
+        // `$xxTXT,01,01,01,…` periodic status: rewrite field 13 (fix indicator)
+        // to track the FIX3D / NOFIX phase of our forced output. Drone weights
+        // this indicator alongside GGA fq when deciding whether the chip's
+        // claim of fix is trustworthy. Without this rewrite the chip's `0`
+        // (no-fix) leaks through and contradicts our `fq=3` GGA.
+        if is_gntxt_status {
+            let mut work = [0u8; 256];
+            let want = if valid_window { b'3' } else { b'0' };
+            if let Some(n) = nmea::rewrite_gntxt_status(line, want, &mut work) {
+                tx_trace(
+                    if valid_window { "gntxt-fix3d" } else { "gntxt-nofix" },
+                    &work[..n],
+                );
+                enqueue(&work[..n]);
+                #[cfg(feature = "nav-debug")]
+                nav_debug::bump(&nav_debug::GNTXT_STATUS_REWRITE);
+                nav_dbg!(
+                    "[nav-debug] GNTXT {=str} ok len={=u16} field13={=u8}",
+                    if valid_window { "FIX3D" } else { "NOFIX" },
+                    n as u16,
+                    want,
+                );
+            } else {
+                tx_trace("gntxt-fallback", line);
+                enqueue(line);
+                #[cfg(feature = "nav-debug")]
+                nav_debug::bump(&nav_debug::GNTXT_STATUS_REJECT);
+                nav_dbg!(
+                    "[nav-debug] GNTXT rewrite REJECT (checksum/struct) → verbatim len={=u16}",
+                    line.len() as u16
                 );
             }
             return;

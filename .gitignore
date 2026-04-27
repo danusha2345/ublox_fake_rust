@@ -18,3 +18,7 @@ Thumbs.db
 
 # Scratch / off-repo experiments (per global CLAUDE.md)
 .scratch/
+
+# Logic-analyser captures (>100MB, exceed GitHub limit)
+logs_analiser/DSLogic*.csv
+logs_analiser/DSLogic_air3s.csv

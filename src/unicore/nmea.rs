@@ -1185,6 +1185,63 @@ fn parse_fixed_mm(s: &[u8]) -> Option<i32> {
     Some(if neg { -mm } else { mm })
 }
 
+/// Rewrite the fix-progression indicator (field 13) of a long-form
+/// `$xxTXT,01,01,01,…` periodic status sentence (UC6580I).
+///
+/// Live chip emits the line every 200 ms with field 13 = `0` while no fix
+/// and `3` once 3D fix is established. Air 3S appears to weight this
+/// indicator in its fix-validity heuristic over our forced GGA/RMC. Use
+/// this rewrite in Mode 0 (Forced3dFix) to keep field 13 in sync with our
+/// claimed fix state.
+///
+/// Validates: NMEA checksum, talker+sentence ending in `TXT`, fields 1–3
+/// equal to `01,01,01` (info-content, not the `,00,` preack), at least 14
+/// total fields. `fix_indicator` must be ASCII `'0'`–`'5'`.
+///
+/// On success returns the new sentence length (including the rewritten `*HH`
+/// + `\r\n` terminator); on failure returns `None` and `out` is undefined.
+pub fn rewrite_gntxt_status(
+    line: &[u8],
+    fix_indicator: u8,
+    out: &mut [u8],
+) -> Option<usize> {
+    if !verify_sentence(line) {
+        return None;
+    }
+    if line.len() < 16 || line[0] != b'$' || &line[3..6] != b"TXT" {
+        return None;
+    }
+    if !(b'0'..=b'5').contains(&fix_indicator) {
+        return None;
+    }
+    let fi = split_fields(line)?;
+    if fi.count < 14 {
+        return None;
+    }
+    let f1 = field(line, &fi, 1)?;
+    let f2 = field(line, &fi, 2)?;
+    let f3 = field(line, &fi, 3)?;
+    if f1 != b"01" || f2 != b"01" || f3 != b"01" {
+        return None;
+    }
+
+    let f13_start = fi.field_starts[13] as usize;
+    let f13_end = fi.field_ends[13] as usize;
+    let body_end = fi.body_end;
+
+    // New body = prefix(0..f13_start) + 1-byte indicator + suffix(f13_end..body_end).
+    let new_body = f13_start + 1 + (body_end - f13_end);
+    if new_body + 5 > out.len() {
+        return None;
+    }
+    out[..f13_start].copy_from_slice(&line[..f13_start]);
+    out[f13_start] = fix_indicator;
+    out[f13_start + 1..new_body]
+        .copy_from_slice(&line[f13_end..body_end]);
+
+    Some(finalize_sentence(out, new_body))
+}
+
 // ---------------------------------------------------------------------------
 // In-place position rewrite (for PassthroughOffset)
 // ---------------------------------------------------------------------------
