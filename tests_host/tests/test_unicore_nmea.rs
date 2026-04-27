@@ -457,6 +457,115 @@ fn force_3d_rejects_bad_checksum_only() {
 }
 
 #[test]
+fn force_3d_gsa_fills_empty_prn_list_when_valid() {
+    // Live UC6580I no-fix GSA: A,1,,,,,,,,,,,,,99.99,99.99,99.99,1
+    let src = b"$GNGSA,A,1,,,,,,,,,,,,,99.99,99.99,99.99,1*33\r\n";
+    let target = (
+        config::offset_target::LAT_1E7,
+        config::offset_target::LON_1E7,
+        config::offset_target::ALT_MM,
+    );
+    let fb_time = NmeaTime::default();
+    let fb_date = NmeaDate { day: 1, month: 1, year: 2025 };
+
+    let mut out = [0u8; 256];
+    let n = force_3d_fix_sentence(src, target, fb_time, fb_date, &mut out)
+        .expect("force gsa on empty");
+    assert!(verify_sentence(&out[..n]));
+    let s = core::str::from_utf8(&out[..n]).unwrap();
+    let body = s.trim_end().trim_start_matches('$').split('*').next().unwrap();
+    let fields: Vec<_> = body.split(',').collect();
+    // GSA layout: 0=tag, 1=op_mode, 2=fix_type, 3..=14=12 sats, 15=PDOP, 16=HDOP, 17=VDOP, 18=systemID
+    assert_eq!(fields[0], "GNGSA");
+    assert_eq!(fields[2], "3");
+    // sat slots 3..=14 must all be non-empty (chip's empty list got filled)
+    for i in 3..=14 {
+        assert!(!fields[i].is_empty(), "sat slot {} should be filled, got empty", i);
+    }
+    // Sequential PRNs 1..=12 (talker GN → GPS-range base = 1)
+    for (off, prn) in (1..=12u16).enumerate() {
+        assert_eq!(fields[3 + off], prn.to_string());
+    }
+}
+
+#[test]
+fn force_no_fix_gsa_leaves_sats_empty() {
+    let src = b"$GNGSA,A,3,01,02,03,04,05,06,07,08,09,10,11,12,0.99,0.99,0.99,1*02\r\n";
+    let target = (
+        config::offset_target::LAT_1E7,
+        config::offset_target::LON_1E7,
+        config::offset_target::ALT_MM,
+    );
+    let fb_time = NmeaTime::default();
+    let fb_date = NmeaDate { day: 1, month: 1, year: 2025 };
+
+    let mut out = [0u8; 256];
+    let n = force_no_fix_sentence(src, target, fb_time, fb_date, &mut out)
+        .expect("force_no_fix gsa");
+    assert!(verify_sentence(&out[..n]));
+    let s = core::str::from_utf8(&out[..n]).unwrap();
+    let body = s.trim_end().trim_start_matches('$').split('*').next().unwrap();
+    let fields: Vec<_> = body.split(',').collect();
+    assert_eq!(fields[2], "1");
+    // sats[0..12] all empty under invalid
+    for i in 3..=14 {
+        assert!(fields[i].is_empty(), "sat slot {} should be empty under no-fix, got {}", i, fields[i]);
+    }
+}
+
+#[test]
+fn synthesize_gsv_emits_4_sats_with_realistic_cnr() {
+    // Chip's empty GSV: Galileo 0 sats visible, signal_id=7
+    let src = b"$GAGSV,1,1,00,7*73\r\n";
+    let mut out = [0u8; 256];
+    let n = synthesize_gsv(src, &mut out).expect("synth gsv");
+    assert!(verify_sentence(&out[..n]));
+    let s = core::str::from_utf8(&out[..n]).unwrap();
+    let body = s.trim_end().trim_start_matches('$').split('*').next().unwrap();
+    let fields: Vec<_> = body.split(',').collect();
+    // Layout: 0=tag, 1=msg_total, 2=msg_num, 3=nsats_view, then groups of 4
+    // (prn,el,az,cno) up to 4 sats, then optional signal_id at the end.
+    assert_eq!(fields[0], "GAGSV");
+    assert_eq!(fields[1], "1");
+    assert_eq!(fields[2], "1");
+    assert_eq!(fields[3], "04");
+    // 4 sats × 4 fields = 16 fields starting at index 4
+    for sat_idx in 0..4 {
+        let prn_field = &fields[4 + sat_idx * 4];
+        let cno_field = &fields[4 + sat_idx * 4 + 3];
+        assert!(!prn_field.is_empty());
+        let cno: u8 = cno_field.parse().expect("cno parse");
+        assert!((40..=50).contains(&cno), "CNR {} out of realistic range", cno);
+    }
+    // signal_id preserved (last field before *)
+    let last = fields.last().unwrap();
+    assert_eq!(*last, "7");
+}
+
+#[test]
+fn synthesize_gsv_per_talker_uses_correct_prn_range() {
+    let mut out = [0u8; 256];
+    // Real chip-emitted empty-GSV checksums (lifted from boot capture).
+    // GLONASS chip emits "$GLGSV,1,1,00,1*7A" (signal_id=1).
+    let cases: &[(&[u8], u16, &str)] = &[
+        (b"$GPGSV,1,1,00,1*64\r\n", 1, "GP"),
+        (b"$GBGSV,1,1,00,1*76\r\n", 1, "GB"),
+        (b"$GAGSV,1,1,00,7*73\r\n", 1, "GA"),
+        (b"$GLGSV,1,1,00,1*78\r\n", 65, "GL"),
+        (b"$GQGSV,1,1,00,1*65\r\n", 193, "GQ"),
+    ];
+    for (src, base_prn, talker) in cases {
+        let n = synthesize_gsv(src, &mut out)
+            .unwrap_or_else(|| panic!("synthesize {} failed", talker));
+        let s = core::str::from_utf8(&out[..n]).unwrap();
+        let body = s.trim_end().trim_start_matches('$').split('*').next().unwrap();
+        let fields: Vec<_> = body.split(',').collect();
+        let prn0: u16 = fields[4].parse().expect("prn parse");
+        assert_eq!(prn0, *base_prn, "talker {} expected base PRN {}", talker, base_prn);
+    }
+}
+
+#[test]
 fn rewrite_gntxt_status_flips_field_13_and_recomputes_checksum() {
     // Live `$GNTXT,01,01,01,…` from UC6580I: bit-exact constants in cmd.rs
     let nofix = b"$GNTXT,01,01,01,0,000000,0000,0000,0000,0.000,0,0003F7EE01B8FB77,1,0,0,0,0000,0,0,0,148,148,00000000,00000000*6E\r\n";

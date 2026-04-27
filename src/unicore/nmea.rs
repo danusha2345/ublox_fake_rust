@@ -833,6 +833,17 @@ fn force_gsa(line: &[u8], talker: Talker, valid: bool, out: &mut [u8]) -> Option
                 .and_then(|v| u16::try_from(v).ok())
                 .unwrap_or(0);
         }
+        // Chip in cold-boot / no-signal returns an empty PRN list. Emitting
+        // `fix_type=3` with zero active satellites is internally inconsistent
+        // and likely fails drone-side coherence checks. Fill the slots with a
+        // talker-appropriate placeholder PRN range so the slots parse as a
+        // plausible "12 sats engaged in fix" picture.
+        if sats.iter().all(|&s| s == 0) {
+            let base = gsa_prn_base(talker);
+            for (i, slot) in sats.iter_mut().enumerate() {
+                *slot = base + i as u16;
+            }
+        }
     }
     // Under invalid: leave sats[] all-zero — empty PRN slots, consistent with
     // the live UC6580I no-fix output.
@@ -1183,6 +1194,67 @@ fn parse_fixed_mm(s: &[u8]) -> Option<i32> {
     }
     let mm = int_part.checked_mul(1000)?.checked_add(frac_mm)? as i32;
     Some(if neg { -mm } else { mm })
+}
+
+/// First PRN to assign for GSA's active-satellite slots when filling a
+/// chip-empty list under `valid=true`. Picks a talker-appropriate range so
+/// the resulting list is plausible (drone-side range checks can spot a GPS
+/// $GxGSA that lists Galileo PRNs etc.).
+fn gsa_prn_base(talker: Talker) -> u16 {
+    match talker {
+        Talker::Gp => 1,    // GPS PRN 1..32
+        Talker::Gb => 1,    // BeiDou 1..63
+        Talker::Ga => 1,    // Galileo 1..36
+        Talker::Gl => 65,   // GLONASS 65..96 (NMEA convention: real PRN+64)
+        Talker::Gq => 193,  // QZSS 193..202
+        Talker::Gi => 1,    // NavIC 1..14
+        Talker::Gn => 1,    // Combined → use GPS range
+    }
+}
+
+/// Synthesize a single-message `$xxGSV` showing 4 visible satellites with
+/// realistic CNR (45–48 dB-Hz), elevations 30°/40°/50°/60° and azimuths
+/// spread across the sky (045°/135°/225°/315°). PRN range derived from the
+/// source line's talker so each constellation's GSV stays plausible.
+///
+/// Used in Mode 0 Forced3dFix (valid window) to replace the chip's empty
+/// `$xxGSV,1,1,00,*XX` (which contradicts our `fq=3 + 16 sats` GGA/RMC).
+///
+/// Preserves the original line's NMEA 4.11 `signal_id` field if present
+/// (last comma-separated field before `*`). Returns `None` on bad checksum
+/// or unsupported sentence kind.
+pub fn synthesize_gsv(line: &[u8], out: &mut [u8]) -> Option<usize> {
+    if !verify_sentence(line) {
+        return None;
+    }
+    if line.len() < 6 || line[0] != b'$' || &line[3..6] != b"GSV" {
+        return None;
+    }
+    let talker = Talker::from_bytes(&line[1..3]).unwrap_or(Talker::Gn);
+
+    // Detect optional NMEA 4.11 signal_id — the last field before `*`. Chip
+    // emits e.g. `$GAGSV,1,1,00,7*1A` with signal_id=7 (E1).
+    let signal_id = split_fields(line)
+        .and_then(|fi| {
+            if fi.count >= 5 {
+                field(line, &fi, fi.count - 1)
+            } else {
+                None
+            }
+        })
+        .and_then(parse_u8)
+        .unwrap_or(0);
+
+    let base = gsa_prn_base(talker);
+    let sats = [
+        GsvSat { prn: base,     elevation_deg: 60, azimuth_deg: 45,  cno_dbhz: 48 },
+        GsvSat { prn: base + 1, elevation_deg: 50, azimuth_deg: 135, cno_dbhz: 47 },
+        GsvSat { prn: base + 2, elevation_deg: 40, azimuth_deg: 225, cno_dbhz: 46 },
+        GsvSat { prn: base + 3, elevation_deg: 30, azimuth_deg: 315, cno_dbhz: 45 },
+    ];
+
+    let n = build_gsv(out, talker, 1, 1, 4, &sats, signal_id);
+    if n > 0 { Some(n) } else { None }
 }
 
 /// Rewrite the fix-progression indicator (field 13) of a long-form

@@ -1,50 +1,58 @@
-# UC6580I emulation modes — drone acceptance status (2026-04-26 evening)
+## Mode 0 (Emulation, 1-click) — current state 2026-04-27
 
-## Drone↔chip mapping (important context)
+**Strategy:** Mode 4 (PassthroughOffset) + forced 3D fix + 22 s window + GNTXT field 13 rewrite. Old hybrid CFGKEY-trigger + emulation_task is **gone**. Live chip stream stays intact except coord-bearing NMEA, which we substitute.
 
-- **DJI Air 3S** uses **u-blox M10** (target `ublox_fake`, `src/main.rs`).
-- **DJI Neo** uses **Unicore UC6580I** (target `ublox_fake_uc`, `src/main_unicore.rs`).
+### What's substituted
 
-This memory + everything in `docs/UC6580I.md` is about **Neo + Unicore**.
-Air 3S spoof tests use the u-blox build and a different code path entirely.
-
-## Live-tested with DJI Neo
-
-| Mode | Strategy | Drone accepts |
+| Sentence/frame | Action | Function |
 |---|---|---|
-| 1 — Emulation | plate generates entire stream itself (hybrid: passthrough until $CFGKEY/timeout, then override with own NMEA + replayed RTCM/ExtRTCM) | ❌ rejects right at the passthrough→override switch |
-| 2 — Passthrough | chip→plate→drone 1:1, no modification | ✅ |
-| 3 — PassthroughRaw | byte-for-byte forward, no NMEA reassembly | ✅ presumed (not tested separately) |
-| 4 — PassthroughOffset | chip stream forwarded, only `$GxGGA`/`$GxRMC` get coords rewritten to `config::offset_target` | ✅ **verified** |
+| `$xxGGA / RMC / GSA / GLL` | rewrite to `config::offset_target` + `fq=3, 16 sats, hdop=0.99, status=A, mode=A, fix_type=3` (FIX3D) or `fq=0, 1 sat, V, N, fix_type=1` (NOFIX) | `unicore::nmea::force_3d_fix_sentence` / `force_no_fix_sentence` |
+| `$xxTXT,01,01,01,…` (24-field UC6580I status) | rewrite field 13 (fix indicator) → `'3'` (FIX3D) or `'0'` (NOFIX) | `unicore::nmea::rewrite_gntxt_status` |
+| All RTCM3 (1005/1006/1019/1046/1077/1087/1097/1117/1127) | **verbatim** | RTCM router in `passthrough_forward_task` |
+| ExtRTCM 4074 sub-IDs (proprietary raw obs) | **verbatim** | ditto |
+| `$GxGSV / VTG / ZDA / TXT (preack ,00,) / $PNOISE / $P*` | verbatim | passthrough branch |
+| `$<binary>` proprietary frames | verbatim | passthrough |
 
-## Why Mode 4 works and Mode 1 doesn't
+### 22 s window timing
 
-Mode 4 sends drone **modified coordinates** (different from what chip physically sees) and drone still accepts. This works because:
-- All other streams (RTCM, ExtRTCM 4074, GSA, GSV, TXT, PNOISE) flow from chip **as-is** — drone doesn't lose a byte of expected chip output.
-- Only `$GxGGA` and `$GxRMC` are rewritten via `process_nmea_line` / `rewrite_coords` (`src/main_unicore.rs`) — coords get replaced with `config::offset_target`.
-- Minimally-invasive substitution — drone recognises the chip by the totality of its outputs; rewriting only coordinate NMEA is tolerable.
+- `FORCED3D_PHASE_START_MS: AtomicU32`. Armed at cold-boot if persisted mode = Emulation, AND on mode-change INTO Emulation. Lazy init on first frame if cold-boot left it 0.
+- 0..22 s → `force_3d_fix_sentence` + GNTXT field13='3' (green LED).
+- ≥22 s → `force_no_fix_sentence` + GNTXT field13='0', `SATELLITES_INVALID=true` (yellow LED). Coords stay target.
+- Window length: `config::timers::SATELLITES_INVALID_AFTER_MS = 22_000`.
 
-Mode 1 (full stream replacement) is a dead-end. Even when we replay byte-exact RTCM/ExtRTCM 4074 frames, drone detects "different entity" and disconnects on the first post-handshake tick.
+### Time/date fallback (for empty chip fields)
 
-## Recommendation for spoofing experiments
+`force_*` accept `fallback_time` (uses `NmeaTimeCache.last_time`, 60 s TTL, else `NmeaTime::default()`) and `fallback_date` (uses `NmeaTimeCache.date`, 1500 ms TTL, else `01.01.2025`). Only bad checksum or unknown sentence kind returns None — empty time/date no longer leak chip's `fq=0` to drone via verbatim fallback.
 
-To establish the home point at chosen coordinates on **Neo**, use **Mode 4 (PassthroughOffset)** with target set via `src/config.rs::offset_target` (currently Seney, Michigan default). Refactoring Mode 1 to match Mode 4 semantics + post-N-seconds fix-loss is a separate task in TODO.
+### `nav-debug` Cargo feature (off by default)
 
-For Air 3S (u-blox target) the picture is different — see u-blox-side memories.
+Per-frame info! at every Forced3dFix decision + 5 s summary task with atomic counters: GGA/RMC/GSA/GLL/GNTXT rewrite/reject; GSV/VTG/ZDA/TXT/$P*/other passthrough; chip's last fq/nsats/RMC-status; cache freshness. Build: `make flash-unicore-nav-debug`.
 
-## Code state at this point (commit `1f6501c` + uncommitted Mode 1 hybrid logic)
+### Live results (DJI **Neo** + UC6580I, 2026-04-27)
 
-`src/main_unicore.rs` Mode 1 currently has:
-- `EMULATION_VALID_UNTIL_MS: AtomicU32` — passthrough/override phase tracker (0 = passthrough)
-- `EMULATION_VALID_WINDOW_MS = 10_000` ms — duration of `fq=3` valid fix in override
-- `EMULATION_FORCE_OVERRIDE_AFTER_MS = 25_000` ms — fallback when drone doesn't send `$CFGKEY`
-- `EMULATION_PASSTHROUGH_START_MS: AtomicU32` — for the timeout fallback
-- `CFGKEY_TRIGGER = b"$CFGKEY,,"` — substring trigger in chip→drone byte stream
-- In override phase: short RTCM 1077 (9 B) + ExtRTCM 4074 subs 0xFF/0xFE/0xF9/0xE6/0xE9/0x000/0x001/0x002 emitted every tick at 5 Hz, plus our generated `$GxGGA/RMC/GSA/GSV/TXT/PNOISE`.
+Run #1 (no GNTXT rewrite): drone did not lock 3D fix. Run #2 (with GNTXT field 13 rewrite to '3'): drone STILL did not lock 3D fix. In both runs chip was cold-boot no-signal (`fq=0 nsats=0` throughout). 11.5 s of FIX3D rewrites observed before window closed.
 
-This logic is committed-pending — Mode 1 still doesn't work despite all this. Decision: leave Mode 1 hybrid logic in place but do NOT use it; production use is Mode 4 instead.
+**Conclusion:** Neo most likely uses RTCM/ExtRTCM 4074 raw observations as primary fix source. Our GGA/RMC/GSA/GLL/GNTXT rewrite is strictly NMEA-side; raw obs flow verbatim with empty chip payload. Drone sees "no real sats observed" → ignores our claimed fq=3 / field13=3.
 
-## Documentation pointers
+### Recommendation
 
-- `docs/UC6580I.md §4.4` — full investigation log, hypothesis chain, Mode 1 hybrid implementation details.
-- This memory captures the verdict for quick lookup.
+For working spoof experiments — **Mode 4 (PassthroughOffset)** with target in `src/config.rs::offset_target`. Mode 0 is experimental.
+
+### Next experiments (TODO)
+
+- ✅ A. GNTXT field 13 rewrite — done, no effect.
+- B. Drop ExtRTCM 4074 (proprietary) — keep standard RTCM. Most likely candidate.
+- C. Drop full observation family (1077/1087/1097/1117/1127). Stronger.
+- D. Synthesise ExtRTCM 4074 with fake obs — heaviest, requires format reverse-engineering.
+- E. Rewrite `$<binary>` proprietary frames (~44/5s in `nav-debug` `other` counter) — format unknown.
+
+### Key files
+
+- `src/main_unicore.rs` — `process_nmea_line`, `passthrough_forward_task`, `nav_debug_summary_task`, `FORCED3D_PHASE_START_MS`, `is_gntxt_status` branch.
+- `src/unicore/nmea.rs` — `force_3d_fix_sentence`, `force_no_fix_sentence`, `force_fix_inner`, `rewrite_gntxt_status`, `force_gga/rmc/gsa/gll`, `GllFields`, `build_gll`.
+- `Cargo.toml` — `nav-debug = []` feature.
+- `Makefile` — target `flash-unicore-nav-debug`.
+- `docs/UC6580I.md` §4.4 + §4.4-bis.
+- Auto memory `project_mode0_forced3dfix_redesign.md`.
+- Live logs: `.scratch/drone_attach_190805.log`, `.scratch/drone_attach_gntxt_192804.log`.
+- HEAD: branch `feature/unicore-chip`, commit `d2ff707`.

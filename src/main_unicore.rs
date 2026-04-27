@@ -231,6 +231,8 @@ async fn nav_debug_summary_task() {
         let gll_bad = nav_debug::GLL_REJECT_CHECKSUM.load(Ordering::Relaxed);
         let gntxt_ok = nav_debug::GNTXT_STATUS_REWRITE.load(Ordering::Relaxed);
         let gntxt_bad = nav_debug::GNTXT_STATUS_REJECT.load(Ordering::Relaxed);
+        let gsv_synth = nav_debug::GSV_SYNTH.load(Ordering::Relaxed);
+        let gsv_bad = nav_debug::GSV_REJECT.load(Ordering::Relaxed);
         let gsv = nav_debug::GSV_THROUGH.load(Ordering::Relaxed);
         let vtg = nav_debug::VTG_THROUGH.load(Ordering::Relaxed);
         let zda = nav_debug::ZDA_THROUGH.load(Ordering::Relaxed);
@@ -245,15 +247,15 @@ async fn nav_debug_summary_task() {
 
         let total = gga_ok + gga_bad + rmc_ok + rmc_bad + gsa_ok + gsa_bad
             + gll_ok + gll_bad + gntxt_ok + gntxt_bad
-            + gsv + vtg + zda + txt + prop + other;
+            + gsv_synth + gsv_bad + gsv + vtg + zda + txt + prop + other;
         let delta = total.wrapping_sub(prev_total);
         prev_total = total;
 
         info!(
-            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} GNTXT={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
+            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} GNTXT={=u32}/{=u32} GSV_synth={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
             OperatingMode::load(),
             delta,
-            gga_ok, gga_bad, rmc_ok, rmc_bad, gsa_ok, gsa_bad, gll_ok, gll_bad, gntxt_ok, gntxt_bad,
+            gga_ok, gga_bad, rmc_ok, rmc_bad, gsa_ok, gsa_bad, gll_ok, gll_bad, gntxt_ok, gntxt_bad, gsv_synth, gsv_bad,
             gsv, vtg, zda, txt, prop, other,
             chip_fq, chip_nsats, chip_rmc,
             t_fresh, d_fresh,
@@ -831,6 +833,8 @@ mod nav_debug {
     pub static GLL_REJECT_CHECKSUM: AtomicU32 = AtomicU32::new(0);
     pub static GNTXT_STATUS_REWRITE: AtomicU32 = AtomicU32::new(0);
     pub static GNTXT_STATUS_REJECT: AtomicU32 = AtomicU32::new(0);
+    pub static GSV_SYNTH: AtomicU32 = AtomicU32::new(0);
+    pub static GSV_REJECT: AtomicU32 = AtomicU32::new(0);
     pub static GSV_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static VTG_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static ZDA_THROUGH: AtomicU32 = AtomicU32::new(0);
@@ -1253,6 +1257,7 @@ async fn process_nmea_line(
     let is_gntxt_status = line.len() >= 16
         && &line[3..6] == b"TXT"
         && line[6..].starts_with(b",01,01,01,");
+    let is_gsv = line.len() >= 6 && &line[3..6] == b"GSV";
 
     // Cache any parseable time/date from the chip's frame so the Forced3dFix
     // rewrite can fall back to a recent timestamp when the chip's own GGA/RMC
@@ -1370,6 +1375,48 @@ async fn process_nmea_line(
                 nav_dbg!(
                     "[nav-debug] {=str} rewrite REJECT (checksum/unknown) → verbatim len={=u16}",
                     kind, line.len() as u16
+                );
+            }
+            return;
+        }
+
+        // `$xxGSV` synthesis: chip in cold-boot reports 0 visible satellites,
+        // contradicting our forced `fq=3 + nsats=16` GGA/RMC. During the
+        // valid window replace each chip GSV with a 1-of-1 sentence showing 4
+        // visible sats per constellation at realistic CNR (45–48 dB-Hz).
+        // Outside the valid window pass through verbatim — chip's "no sats"
+        // is consistent with our NOFIX rewrite.
+        if is_gsv {
+            if valid_window {
+                let mut work = [0u8; 256];
+                if let Some(n) = nmea::synthesize_gsv(line, &mut work) {
+                    tx_trace("gsv-synth", &work[..n]);
+                    enqueue(&work[..n]);
+                    #[cfg(feature = "nav-debug")]
+                    nav_debug::bump(&nav_debug::GSV_SYNTH);
+                    nav_dbg!(
+                        "[nav-debug] GSV SYNTH ok len={=u16} talker={=[u8]:a}",
+                        n as u16,
+                        &line[1..3],
+                    );
+                } else {
+                    tx_trace("gsv-fallback", line);
+                    enqueue(line);
+                    #[cfg(feature = "nav-debug")]
+                    nav_debug::bump(&nav_debug::GSV_REJECT);
+                    nav_dbg!(
+                        "[nav-debug] GSV synth REJECT (checksum/struct) → verbatim len={=u16}",
+                        line.len() as u16,
+                    );
+                }
+            } else {
+                tx_trace("gsv-passthrough", line);
+                enqueue(line);
+                #[cfg(feature = "nav-debug")]
+                nav_debug::bump(&nav_debug::GSV_THROUGH);
+                nav_dbg!(
+                    "[nav-debug] GSV NOFIX-window passthrough len={=u16}",
+                    line.len() as u16,
                 );
             }
             return;
