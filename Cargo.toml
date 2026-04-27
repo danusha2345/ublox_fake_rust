@@ -73,6 +73,12 @@ boot-capture = []
 # RTCM flush / dropped frames) via defmt-rtt while SPOOF_DETECTED is true.
 # Used to chase coordinate leaks during spoof experiments. Production OFF.
 tx-trace = []
+# Diagnostic for Mode 0 (Emulation / Forced3dFix): log per-sentence decisions
+# (rewrite OK with talker+coords / fallback with reason / drop / verbatim) and
+# emit a 5-second summary with counters (rewrite vs fallback per type, dropped
+# GLL/VTG/GSV, total bytes to drone). Used to diagnose why the drone doesn't
+# enter 3D-fix despite our coordinate rewrite. Production OFF.
+nav-debug = []
 
 [profile.dev]
 debug = 2

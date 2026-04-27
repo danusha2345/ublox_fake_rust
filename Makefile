@@ -64,6 +64,12 @@ flash-unicore:
 	cargo build --release --features "rp2350 unicore" --bin ublox_fake_uc --target thumbv8m.main-none-eabihf
 	probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/ublox_fake_uc
 
+# Same as flash-unicore but with `nav-debug` enabled — emits per-frame and
+# 5-second-summary defmt logs over RTT for Mode 0 (Forced3dFix) diagnosis.
+flash-unicore-nav-debug:
+	cargo build --release --features "rp2350 unicore nav-debug" --bin ublox_fake_uc --target thumbv8m.main-none-eabihf
+	probe-rs run --chip RP2350 target/thumbv8m.main-none-eabihf/release/ublox_fake_uc
+
 # Flash RP2354 + UC6580I emulation via probe-rs
 flash-unicore-rp2354:
 	cargo build --release --no-default-features --features "rp2354 unicore" --bin ublox_fake_uc --target thumbv8m.main-none-eabihf

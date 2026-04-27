@@ -335,6 +335,18 @@ pub enum GsaOpMode {
     Manual,
 }
 
+/// Fields for `$GxGLL` (Geographic position, latitude/longitude).
+#[derive(Clone, Copy, Debug)]
+pub struct GllFields {
+    pub lat_1e7: i32,
+    pub lon_1e7: i32,
+    pub time: NmeaTime,
+    /// `true` = data valid (emits 'A'), `false` = invalid ('V').
+    pub valid: bool,
+    /// NMEA mode indicator: 'A' = autonomous, 'D' = differential, 'N' = none.
+    pub mode: u8,
+}
+
 /// Fields for `$GxGSA` (GNSS DOP and active satellites).
 #[derive(Clone, Copy, Debug)]
 pub struct GsaFields {
@@ -385,6 +397,19 @@ impl Talker {
             Talker::Gb => b"GB",
             Talker::Gq => b"GQ",
             Talker::Gi => b"GI",
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            b"GN" => Some(Talker::Gn),
+            b"GP" => Some(Talker::Gp),
+            b"GL" => Some(Talker::Gl),
+            b"GA" => Some(Talker::Ga),
+            b"GB" => Some(Talker::Gb),
+            b"GQ" => Some(Talker::Gq),
+            b"GI" => Some(Talker::Gi),
+            _ => None,
         }
     }
 }
@@ -580,6 +605,248 @@ pub fn build_gsa(buf: &mut [u8], talker: Talker, f: &GsaFields) -> usize {
     p = write_u32(buf, p, f.system_id as u32);
     if p == 0 { return 0; }
     finalize_sentence(buf, p)
+}
+
+/// Build `$<talker>GLL,...*cs\r\n` into `buf`. Returns total bytes written, or 0 on overflow.
+pub fn build_gll(buf: &mut [u8], talker: Talker, f: &GllFields) -> usize {
+    let mut p = 0;
+    p = write_byte(buf, p, b'$');
+    if p == 0 { return 0; }
+    p = write_bytes(buf, p, talker.as_bytes());
+    if p == 0 { return 0; }
+    p = write_bytes(buf, p, b"GLL,");
+    if p == 0 { return 0; }
+    // lat,N/S
+    let mut hemi = 0u8;
+    p = write_lat(buf, p, f.lat_1e7, &mut hemi);
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, b',');
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, hemi);
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, b',');
+    if p == 0 { return 0; }
+    // lon,E/W
+    p = write_lon(buf, p, f.lon_1e7, &mut hemi);
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, b',');
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, hemi);
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, b',');
+    if p == 0 { return 0; }
+    // hhmmss.ss
+    p = write_u32_pad(buf, p, f.time.hour as u32, 2);
+    if p == 0 { return 0; }
+    p = write_u32_pad(buf, p, f.time.minute as u32, 2);
+    if p == 0 { return 0; }
+    p = write_u32_pad(buf, p, f.time.second as u32, 2);
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, b'.');
+    if p == 0 { return 0; }
+    p = write_u32_pad(buf, p, f.time.centis as u32, 2);
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, b',');
+    if p == 0 { return 0; }
+    // status
+    p = write_byte(buf, p, if f.valid { b'A' } else { b'V' });
+    if p == 0 { return 0; }
+    p = write_byte(buf, p, b',');
+    if p == 0 { return 0; }
+    // mode
+    p = write_byte(buf, p, f.mode);
+    if p == 0 { return 0; }
+    finalize_sentence(buf, p)
+}
+
+/// Rebuild a live `$GxGGA`, `$GxRMC`, `$GxGSA`, or `$GxGLL` sentence as a forced
+/// valid 3D fix at `target`.
+///
+/// Coordinate substitution is "best effort, immediate": if the chip's own time
+/// or date field is empty/unparseable (typical during cold boot before lock),
+/// `fallback_time` / `fallback_date` are used so the rewrite still produces a
+/// valid sentence with target coords + `fq=3` / status `A`. Only checksum
+/// failure or unsupported sentence kind returns `None`.
+pub fn force_3d_fix_sentence(
+    line: &[u8],
+    target: (i32, i32, i32),
+    fallback_time: NmeaTime,
+    fallback_date: NmeaDate,
+    out: &mut [u8],
+) -> Option<usize> {
+    force_fix_inner(line, target, true, fallback_time, fallback_date, out)
+}
+
+/// Same as [`force_3d_fix_sentence`] but emits a forced **invalid** fix:
+/// `fq=0`, `nsats=1`, status `V`, mode `N`, `fix_type=1`. Coordinates are still
+/// rewritten to `target` so the drone keeps seeing the emulated home position
+/// and doesn't fall back to chip's real lat/lon. Used in Mode 0 after the
+/// `SATELLITES_INVALID_AFTER_MS` window — the drone has had time to commit a
+/// home point and we now flip to "satellites lost".
+pub fn force_no_fix_sentence(
+    line: &[u8],
+    target: (i32, i32, i32),
+    fallback_time: NmeaTime,
+    fallback_date: NmeaDate,
+    out: &mut [u8],
+) -> Option<usize> {
+    force_fix_inner(line, target, false, fallback_time, fallback_date, out)
+}
+
+fn force_fix_inner(
+    line: &[u8],
+    target: (i32, i32, i32),
+    valid: bool,
+    fallback_time: NmeaTime,
+    fallback_date: NmeaDate,
+    out: &mut [u8],
+) -> Option<usize> {
+    if line.len() < 6 || line[0] != b'$' || !verify_sentence(line) {
+        return None;
+    }
+    let talker = Talker::from_bytes(&line[1..3]).unwrap_or(Talker::Gn);
+    match &line[3..6] {
+        b"GGA" => force_gga(line, talker, target, valid, fallback_time, out),
+        b"RMC" => force_rmc(line, talker, target, valid, fallback_time, fallback_date, out),
+        b"GSA" => force_gsa(line, talker, valid, out),
+        b"GLL" => force_gll(line, talker, target, valid, fallback_time, out),
+        _ => None,
+    }
+}
+
+fn field<'a>(line: &'a [u8], fi: &FieldIndex, idx: usize) -> Option<&'a [u8]> {
+    if idx >= fi.count || idx >= fi.field_starts.len() {
+        return None;
+    }
+    Some(&line[fi.field_starts[idx] as usize..fi.field_ends[idx] as usize])
+}
+
+fn force_gga(
+    line: &[u8],
+    talker: Talker,
+    target: (i32, i32, i32),
+    valid: bool,
+    fallback_time: NmeaTime,
+    out: &mut [u8],
+) -> Option<usize> {
+    let existing = parse_gga(line)?;
+    if !existing.checksum_ok {
+        return None;
+    }
+    // Best-effort time: chip's own value if it parsed (existing.time != default
+    // *or* the sentence's time field actually decoded); otherwise the caller's
+    // cached/synthetic fallback. Empty time field decodes to NmeaTime::default().
+    let fi = split_fields(line);
+    let parsed_time = fi
+        .and_then(|fi| field(line, &fi, 1))
+        .and_then(parse_time);
+    let g = GgaFields {
+        time: parsed_time.unwrap_or(fallback_time),
+        lat_1e7: target.0,
+        lon_1e7: target.1,
+        fix_quality: if valid { 3 } else { 0 },
+        nsats: if valid { 16 } else { 1 },
+        hdop_x100: if valid { 99 } else { 9_999 },
+        alt_mm: target.2,
+        geoid_sep_mm: -30_000,
+    };
+    let n = build_gga(out, talker, &g);
+    if n > 0 { Some(n) } else { None }
+}
+
+fn force_rmc(
+    line: &[u8],
+    talker: Talker,
+    target: (i32, i32, i32),
+    valid: bool,
+    fallback_time: NmeaTime,
+    fallback_date: NmeaDate,
+    out: &mut [u8],
+) -> Option<usize> {
+    let existing = parse_rmc(line)?;
+    if !existing.checksum_ok {
+        return None;
+    }
+    let fi = split_fields(line);
+    let parsed_time = fi
+        .as_ref()
+        .and_then(|fi| field(line, fi, 1))
+        .and_then(parse_time);
+    let parsed_date = fi
+        .as_ref()
+        .and_then(|fi| field(line, fi, 9))
+        .and_then(parse_date)
+        .filter(|d| d.year > 0);
+    let r = RmcFields {
+        time: parsed_time.unwrap_or(fallback_time),
+        valid,
+        lat_1e7: target.0,
+        lon_1e7: target.1,
+        sog_knots_x1000: 0,
+        cog_deg_x100: 0,
+        date: parsed_date.unwrap_or(fallback_date),
+        mode: if valid { b'A' } else { b'N' },
+    };
+    let n = build_rmc(out, talker, &r);
+    if n > 0 { Some(n) } else { None }
+}
+
+fn force_gll(
+    line: &[u8],
+    talker: Talker,
+    target: (i32, i32, i32),
+    valid: bool,
+    fallback_time: NmeaTime,
+    out: &mut [u8],
+) -> Option<usize> {
+    if !verify_sentence(line) {
+        return None;
+    }
+    // GLL field layout: 0=tag, 1=lat, 2=N/S, 3=lon, 4=E/W, 5=time, 6=status, 7=mode
+    let fi = split_fields(line);
+    let parsed_time = fi
+        .and_then(|fi| field(line, &fi, 5))
+        .and_then(parse_time);
+    let g = GllFields {
+        lat_1e7: target.0,
+        lon_1e7: target.1,
+        time: parsed_time.unwrap_or(fallback_time),
+        valid,
+        mode: if valid { b'A' } else { b'N' },
+    };
+    let n = build_gll(out, talker, &g);
+    if n > 0 { Some(n) } else { None }
+}
+
+fn force_gsa(line: &[u8], talker: Talker, valid: bool, out: &mut [u8]) -> Option<usize> {
+    let fi = split_fields(line)?;
+    let op_mode = match field(line, &fi, 1)? {
+        b"M" => GsaOpMode::Manual,
+        _ => GsaOpMode::Automatic,
+    };
+    let system_id = parse_u8(field(line, &fi, 18)?).unwrap_or(0);
+    let mut sats = [0u16; 12];
+    if valid {
+        // Preserve chip's reported PRN list when forcing valid 3D fix.
+        for i in 0..12 {
+            sats[i] = parse_u32(field(line, &fi, 3 + i).unwrap_or(b""))
+                .and_then(|v| u16::try_from(v).ok())
+                .unwrap_or(0);
+        }
+    }
+    // Under invalid: leave sats[] all-zero — empty PRN slots, consistent with
+    // the live UC6580I no-fix output.
+    let g = GsaFields {
+        op_mode,
+        fix_type: if valid { 3 } else { 1 },
+        sats,
+        pdop_x100: if valid { 99 } else { 9_999 },
+        hdop_x100: if valid { 99 } else { 9_999 },
+        vdop_x100: if valid { 99 } else { 9_999 },
+        system_id,
+    };
+    let n = build_gsa(out, talker, &g);
+    if n > 0 { Some(n) } else { None }
 }
 
 /// Build a single `$<talker>GSV` sentence from up to 4 satellites.

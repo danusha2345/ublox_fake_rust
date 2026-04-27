@@ -1,7 +1,8 @@
 //! UC6580I emulator entry point (compile with `--features unicore --bin ublox_fake_uc`).
 //!
 //! Supports the same four operating modes as the u-blox build:
-//!   0 Emulation          — fake UC6580I stream: boot-dump + NMEA + ExtRTCM 4074.
+//!   0 Emulation          — experiment: live UC6580I stream with targeted
+//!                          forced-3D rewrites for GGA/RMC/GSA only.
 //!   1 Passthrough        — forward UART1 (real UC6580I) → UART0 (drone); reassembles
 //!                          `$GxGGA`/`$GxRMC` to run the shared spoof detector and,
 //!                          when spoofing is flagged, rebuilds GGA/RMC as invalid
@@ -30,7 +31,7 @@ mod version {
     include!(concat!(env!("OUT_DIR"), "/version.rs"));
 }
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -102,6 +103,15 @@ static MODE: AtomicU8 = AtomicU8::new(OperatingMode::Passthrough as u8);
 #[unsafe(no_mangle)]
 static DEBUG_MODE_REQUEST: AtomicU8 = AtomicU8::new(DEBUG_MODE_REQUEST_IDLE);
 
+/// Wallclock (ms since boot) when the device entered Mode 0 / Forced3dFix.
+/// 0 = uninitialised. Reset on every mode-change INTO Emulation. After
+/// `config::timers::SATELLITES_INVALID_AFTER_MS` the rewriter switches from
+/// forced 3D fix (fq=3, 16 sats) to forced no-fix (fq=0, 1 sat) — coordinates
+/// stay at `config::offset_target` so the drone keeps the home point but
+/// loses live tracking, mirroring the u-blox build's "satellites lost" event.
+static FORCED3D_PHASE_START_MS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 // ---------------------------------------------------------------------------
 // Shared channels
 // ---------------------------------------------------------------------------
@@ -109,29 +119,7 @@ static DEBUG_MODE_REQUEST: AtomicU8 = AtomicU8::new(DEBUG_MODE_REQUEST_IDLE);
 static TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 1280>, 32> = Channel::new();
 static RAW_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 256>, 64> = Channel::new();
 
-static OUTPUT_START_MILLIS: AtomicU32 = AtomicU32::new(0);
 static SATELLITES_INVALID: AtomicBool = AtomicBool::new(false);
-
-/// Hybrid Emulation mode state: act as Passthrough until the live chip
-/// emits its `$CFGKEY,,…` reply (handshake authorised), then take over the
-/// stream with our own NMEA. Stores the deadline (ms since boot) until which
-/// we keep emitting `fq=3`/3D fix; afterwards we switch to `fq=0`/no fix
-/// permanently. `0` = still in passthrough phase, no override yet.
-static EMULATION_VALID_UNTIL_MS: AtomicU32 = AtomicU32::new(0);
-/// Length of the 3D-fix override window after `$CFGKEY` is seen, in ms.
-/// 1 s was too short — DJI Air 3S typically needs ~10 s of stable 3D fix
-/// to establish a home point. After this window we drop satellites.
-const EMULATION_VALID_WINDOW_MS: u32 = 10_000;
-/// Force the override anyway after this many ms in passthrough phase, even
-/// if `$CFGKEY,,` was never observed. Some drones skip CFGKEY when they
-/// have a cached chip authorisation from a prior session, leaving us stuck
-/// in passthrough forever otherwise.
-const EMULATION_FORCE_OVERRIDE_AFTER_MS: u32 = 25_000;
-/// `$CFGKEY,,` literal — substring trigger in the chip→drone byte stream.
-const CFGKEY_TRIGGER: &[u8] = b"$CFGKEY,,";
-/// Tracks when the firmware entered Emulation passthrough phase. Used by
-/// the timeout-based override fallback. 0 = not in passthrough phase.
-static EMULATION_PASSTHROUGH_START_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Boot-handshake capture: collect the first N checksum-ok config NMEA lines
 /// (all non-streaming sentences — i.e. not GGA/RMC/GSA/GSV/GLL/VTG/ZDA/TXT/
@@ -219,6 +207,56 @@ async fn boot_log_dump_task() {
             info!("=== END BOOT LOG ===");
         });
         Timer::after(Duration::from_secs(15)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// nav-debug periodic summary (every 5 s when `nav-debug` is enabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nav-debug")]
+#[embassy_executor::task]
+async fn nav_debug_summary_task() {
+    use core::sync::atomic::Ordering;
+    Timer::after(Duration::from_secs(3)).await;
+    let mut prev_total: u32 = 0;
+    loop {
+        let gga_ok = nav_debug::GGA_REWRITE.load(Ordering::Relaxed);
+        let gga_bad = nav_debug::GGA_REJECT_CHECKSUM.load(Ordering::Relaxed);
+        let rmc_ok = nav_debug::RMC_REWRITE.load(Ordering::Relaxed);
+        let rmc_bad = nav_debug::RMC_REJECT_CHECKSUM.load(Ordering::Relaxed);
+        let gsa_ok = nav_debug::GSA_REWRITE.load(Ordering::Relaxed);
+        let gsa_bad = nav_debug::GSA_REJECT.load(Ordering::Relaxed);
+        let gll_ok = nav_debug::GLL_REWRITE.load(Ordering::Relaxed);
+        let gll_bad = nav_debug::GLL_REJECT_CHECKSUM.load(Ordering::Relaxed);
+        let gsv = nav_debug::GSV_THROUGH.load(Ordering::Relaxed);
+        let vtg = nav_debug::VTG_THROUGH.load(Ordering::Relaxed);
+        let zda = nav_debug::ZDA_THROUGH.load(Ordering::Relaxed);
+        let txt = nav_debug::TXT_THROUGH.load(Ordering::Relaxed);
+        let prop = nav_debug::PROP_THROUGH.load(Ordering::Relaxed);
+        let other = nav_debug::OTHER_THROUGH.load(Ordering::Relaxed);
+        let chip_fq = nav_debug::LAST_CHIP_FQ.load(Ordering::Relaxed);
+        let chip_rmc = nav_debug::LAST_CHIP_RMC_VALID.load(Ordering::Relaxed);
+        let chip_nsats = nav_debug::LAST_CHIP_NSATS.load(Ordering::Relaxed);
+        let t_fresh = nav_debug::TIME_CACHE_FRESH.load(Ordering::Relaxed);
+        let d_fresh = nav_debug::DATE_CACHE_FRESH.load(Ordering::Relaxed);
+
+        let total = gga_ok + gga_bad + rmc_ok + rmc_bad + gsa_ok + gsa_bad
+            + gll_ok + gll_bad + gsv + vtg + zda + txt + prop + other;
+        let delta = total.wrapping_sub(prev_total);
+        prev_total = total;
+
+        info!(
+            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
+            OperatingMode::load(),
+            delta,
+            gga_ok, gga_bad, rmc_ok, rmc_bad, gsa_ok, gsa_bad, gll_ok, gll_bad,
+            gsv, vtg, zda, txt, prop, other,
+            chip_fq, chip_nsats, chip_rmc,
+            t_fresh, d_fresh,
+        );
+
+        Timer::after(Duration::from_secs(5)).await;
     }
 }
 
@@ -504,6 +542,13 @@ static SPOOF_CELL: Mutex<CriticalSectionRawMutex, Option<spoof_detector::SpoofDe
 
 use pos_history::{DynamicOffset, PositionBuffer};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NmeaOutputPolicy {
+    Plain,
+    Offset,
+    Forced3dFix,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -614,12 +659,13 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(uart0_rx_task(uart0_rx));
     spawner.must_spawn(uart1_rx_task(uart1_rx));
     spawner.must_spawn(passthrough_forward_task());
-    spawner.must_spawn(emulation_task());
     spawner.must_spawn(button_task(btn_flex, flash_mutex));
     spawner.must_spawn(debug_mode_request_task(flash_mutex));
     spawner.must_spawn(boot_log_dump_task());
     #[cfg(feature = "boot-capture")]
     spawner.must_spawn(raw_boot_dump_task());
+    #[cfg(feature = "nav-debug")]
+    spawner.must_spawn(nav_debug_summary_task());
 
     info!("All tasks spawned — mode = {:?}", OperatingMode::load());
 
@@ -700,13 +746,12 @@ fn is_config_line(line: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// UART0 RX — parse ASCII commands (active in Emulation mode), dispatch replies.
+// UART0 RX — capture drone command traffic; the live UC6580I sends replies.
 // ---------------------------------------------------------------------------
 
 #[embassy_executor::task]
 async fn uart0_rx_task(mut rx: BufferedUartRx) {
     let mut buf = [0u8; 128];
-    let mut asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
     let mut diag_asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
     loop {
         match rx.read(&mut buf).await {
@@ -745,20 +790,8 @@ async fn uart0_rx_task(mut rx: BufferedUartRx) {
                         }
                     }
                 }
-                // Only respond to commands while we're acting as the chip.
-                // In hybrid Emulation, stay silent during the passthrough
-                // phase — the live chip is answering the drone for us.
-                if OperatingMode::load() != OperatingMode::Emulation {
-                    continue;
-                }
-                if EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) == 0 {
-                    continue;
-                }
-                for &b in &buf[..n] {
-                    if let Some(line) = asm.feed(b) {
-                        handle_command(line).await;
-                    }
-                }
+                // Mode 1 now keeps the live chip on the command bus. Do not
+                // synthesize replies here; the UC6580I answers the drone.
             }
             Ok(_) => {}
             Err(e) => {
@@ -769,164 +802,62 @@ async fn uart0_rx_task(mut rx: BufferedUartRx) {
     }
 }
 
-async fn handle_command(line: &[u8]) {
-    use unicore::cmd::{
-        build_cfgmsg_reply, default_cfgmsg_rate, is_known_cfgmsg, parse_command, reply_cfgkey,
-        reply_cfgmsm, reply_cfgnav_default, reply_cfgnmea, reply_cfgprt_uart1, reply_cfgprt_uart2,
-        reply_cfgsys_default, reply_fail, reply_gntxt_ack, reply_ok, reply_pdtinfo,
-        reply_productinfo, CFGMSM_PREACK, CFGNAV_PREACK, CFGSYS_PREACK, PDTINFO_PREACK, Command,
-        ParseError,
-    };
-
-    // Full echo body (between `$` and trailing \r\n, INCLUDING *HH if present).
-    let mut end = line.len();
-    while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
-        end -= 1;
-    }
-    let start = if !line.is_empty() && line[0] == b'$' { 1 } else { 0 };
-    let echo_full = &line[start..end];
-    // Echo stripped of *HH, used as the $GNTXT body for valid replies.
-    let star = echo_full.iter().rposition(|&b| b == b'*').unwrap_or(echo_full.len());
-    let echo_clean = &echo_full[..star];
-
-    let mut scratch = [0u8; 256];
-
-    let cmd = match parse_command(line) {
-        Ok(c) => c,
-        Err(ParseError::BadChecksum) => {
-            // Live chip echoes the full (invalid) body in $GNTXT, then replies $FAIL,1.
-            let n = reply_gntxt_ack(&mut scratch, echo_full);
-            if n > 0 { enqueue(&scratch[..n]); }
-            let n = reply_fail(&mut scratch, 1);
-            enqueue(&scratch[..n]);
-            return;
-        }
-        Err(ParseError::Malformed) => {
-            // Known CMD, bad args → same echo + $FAIL,0.
-            let n = reply_gntxt_ack(&mut scratch, echo_clean);
-            if n > 0 { enqueue(&scratch[..n]); }
-            let n = reply_fail(&mut scratch, 0);
-            enqueue(&scratch[..n]);
-            return;
-        }
-        Err(ParseError::NoDollarPrefix) => {
-            return; // silently ignore stray bytes
-        }
-    };
-
-    match cmd {
-        Command::Unknown(_) => {
-            // Live chip silently ignores commands it does not recognise.
-        }
-        Command::PdtInfo => {
-            // Strict: extra args → $GNTXT + $FAIL,0 (confirmed on live chip).
-            if echo_clean.contains(&b',') {
-                let n = reply_gntxt_ack(&mut scratch, echo_clean);
-                if n > 0 { enqueue(&scratch[..n]); }
-                let n = reply_fail(&mut scratch, 0);
-                enqueue(&scratch[..n]);
-                return;
-            }
-            // Live chip emits `$GNTXT,01,01,00,PDTINFO*1F` BEFORE the reply.
-            // Without this preack the drone may reject the chip identity.
-            enqueue(PDTINFO_PREACK);
-            let n = reply_pdtinfo(&mut scratch); enqueue(&scratch[..n]);
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-        Command::ProductInfo => {
-            if echo_clean.contains(&b',') {
-                let n = reply_gntxt_ack(&mut scratch, echo_clean);
-                if n > 0 { enqueue(&scratch[..n]); }
-                let n = reply_fail(&mut scratch, 0);
-                enqueue(&scratch[..n]);
-                return;
-            }
-            let n = reply_productinfo(&mut scratch); enqueue(&scratch[..n]);
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-        Command::CfgSys(None) => {
-            enqueue(CFGSYS_PREACK);
-            let n = reply_cfgsys_default(&mut scratch); enqueue(&scratch[..n]);
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-        Command::CfgNav { meas_rate: 0, nav_rate: 0, dr_nav_rate: 0 } => {
-            enqueue(CFGNAV_PREACK);
-            let n = reply_cfgnav_default(&mut scratch); enqueue(&scratch[..n]);
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-        Command::CfgKey => {
-            // No $GNTXT pre-ACK for $CFGKEY on the live chip.
-            let n = reply_cfgkey(&mut scratch); enqueue(&scratch[..n]);
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-        Command::CfgMsg { class, id, rate: None } => {
-            // GET: $GNTXT echo + (either $CFGMSG,c,i,rate*cs + $OK, or $FAIL,0 for unknown).
-            let n = reply_gntxt_ack(&mut scratch, echo_clean);
-            if n > 0 { enqueue(&scratch[..n]); }
-            match default_cfgmsg_rate(class, id) {
-                Some(r) => {
-                    let n = build_cfgmsg_reply(&mut scratch, class, id, r);
-                    if n > 0 { enqueue(&scratch[..n]); }
-                    let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-                }
-                None => {
-                    let n = reply_fail(&mut scratch, 0); enqueue(&scratch[..n]);
-                }
-            }
-        }
-        Command::CfgMsg { class, id, rate: Some(_) } => {
-            // SET: echo + ($OK if known pair, $FAIL,0 if not)
-            let n = reply_gntxt_ack(&mut scratch, echo_clean);
-            if n > 0 { enqueue(&scratch[..n]); }
-            if is_known_cfgmsg(class, id) {
-                let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-            } else {
-                let n = reply_fail(&mut scratch, 0); enqueue(&scratch[..n]);
-            }
-        }
-        Command::CfgMsm => {
-            enqueue(CFGMSM_PREACK);
-            let n = reply_cfgmsm(&mut scratch); enqueue(&scratch[..n]);
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-        Command::CfgNmea => {
-            // No $GNTXT pre-ACK for $CFGNMEA (verified live).
-            let n = reply_cfgnmea(&mut scratch); enqueue(&scratch[..n]);
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-        Command::CfgPrt(port) => {
-            let n = reply_gntxt_ack(&mut scratch, echo_clean);
-            if n > 0 { enqueue(&scratch[..n]); }
-            // Port 1 (UART1) default; port 2 (UART2) also valid; others $FAIL,0.
-            match port {
-                None | Some(1) => {
-                    let n = reply_cfgprt_uart1(&mut scratch); enqueue(&scratch[..n]);
-                    let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-                }
-                Some(2) => {
-                    let n = reply_cfgprt_uart2(&mut scratch); enqueue(&scratch[..n]);
-                    let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-                }
-                _ => {
-                    let n = reply_fail(&mut scratch, 0); enqueue(&scratch[..n]);
-                }
-            }
-        }
-        // Remaining SET-ish commands (CFGSAVE, CFGCLR, CFGSYS with mask, etc.)
-        // — echo in $GNTXT then $OK.
-        _ => {
-            let n = reply_gntxt_ack(&mut scratch, echo_clean);
-            if n > 0 { enqueue(&scratch[..n]); }
-            let n = reply_ok(&mut scratch); enqueue(&scratch[..n]);
-        }
-    }
-}
-
 fn enqueue(bytes: &[u8]) {
     let mut v = heapless::Vec::<u8, 1280>::new();
     if v.extend_from_slice(bytes).is_ok() && TX_CHANNEL.try_send(v).is_err() {
         warn!("TX_CHANNEL full, dropped {} bytes", bytes.len());
     }
+}
+
+// ---------------------------------------------------------------------------
+// nav-debug — Mode 0 (Forced3dFix) instrumentation. Counters + per-frame log.
+// All zero-cost when the feature is off.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nav-debug")]
+mod nav_debug {
+    use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+
+    pub static GGA_REWRITE: AtomicU32 = AtomicU32::new(0);
+    pub static GGA_REJECT_CHECKSUM: AtomicU32 = AtomicU32::new(0);
+    pub static RMC_REWRITE: AtomicU32 = AtomicU32::new(0);
+    pub static RMC_REJECT_CHECKSUM: AtomicU32 = AtomicU32::new(0);
+    pub static GSA_REWRITE: AtomicU32 = AtomicU32::new(0);
+    pub static GSA_REJECT: AtomicU32 = AtomicU32::new(0);
+    pub static GLL_REWRITE: AtomicU32 = AtomicU32::new(0);
+    pub static GLL_REJECT_CHECKSUM: AtomicU32 = AtomicU32::new(0);
+    pub static GSV_THROUGH: AtomicU32 = AtomicU32::new(0);
+    pub static VTG_THROUGH: AtomicU32 = AtomicU32::new(0);
+    pub static ZDA_THROUGH: AtomicU32 = AtomicU32::new(0);
+    pub static TXT_THROUGH: AtomicU32 = AtomicU32::new(0);
+    /// `$P*` proprietary sentences forwarded verbatim.
+    pub static PROP_THROUGH: AtomicU32 = AtomicU32::new(0);
+    /// Anything else NMEA-shaped that we forwarded.
+    pub static OTHER_THROUGH: AtomicU32 = AtomicU32::new(0);
+    /// Latest fix_quality observed on a checksum-ok chip GGA (255 = unknown).
+    pub static LAST_CHIP_FQ: AtomicU8 = AtomicU8::new(255);
+    /// Latest RMC status: 1=A, 0=V, 255=unknown.
+    pub static LAST_CHIP_RMC_VALID: AtomicU8 = AtomicU8::new(255);
+    /// Latest nsats observed on a checksum-ok chip GGA.
+    pub static LAST_CHIP_NSATS: AtomicU8 = AtomicU8::new(0);
+    /// 1 = `time_cache.last_time` populated and fresh; 0 = falling back to default.
+    pub static TIME_CACHE_FRESH: AtomicU8 = AtomicU8::new(0);
+    /// 1 = `time_cache.date` populated and fresh; 0 = default fallback.
+    pub static DATE_CACHE_FRESH: AtomicU8 = AtomicU8::new(0);
+
+    #[inline]
+    pub fn bump(c: &AtomicU32) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "nav-debug")]
+macro_rules! nav_dbg {
+    ($($t:tt)*) => { defmt::info!($($t)*); };
+}
+#[cfg(not(feature = "nav-debug"))]
+macro_rules! nav_dbg {
+    ($($t:tt)*) => {};
 }
 
 /// Trace a TX-to-drone event when `SPOOF_DETECTED` is true. Used to chase
@@ -959,18 +890,6 @@ fn buffered_forward(buf: &mut heapless::Vec<u8, 256>, byte: u8) {
     }
 }
 
-async fn enqueue_chunked(bytes: &[u8]) {
-    let mut off = 0;
-    while off < bytes.len() {
-        let end = (off + 1280).min(bytes.len());
-        let mut v = heapless::Vec::<u8, 1280>::new();
-        if v.extend_from_slice(&bytes[off..end]).is_ok() {
-            TX_CHANNEL.send(v).await;
-        }
-        off = end;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // UART1 RX — always read; route to passthrough buffer.
 // ---------------------------------------------------------------------------
@@ -979,27 +898,22 @@ async fn enqueue_chunked(bytes: &[u8]) {
 async fn uart1_rx_task(mut rx: BufferedUartRx) {
     let mut buf = [0u8; 256];
     let mut diag_asm: unicore::nmea::LineAssembler<256> = unicore::nmea::LineAssembler::new();
-    // Substring match progress for `$CFGKEY,,` in the chip→drone byte stream.
-    // Used by the hybrid-Emulation flow to detect end-of-handshake.
-    let mut cfgkey_match: u8 = 0;
     loop {
         match rx.read(&mut buf).await {
             Ok(n) if n > 0 => {
                 // ---------------------------------------------------------------
                 // boot-capture (chip side): linear one-shot RAM buffer of the
                 // chip's first ~6.7 KB. See raw_capture mod near top of file.
-                // Skipped in Emulation (we'd capture our own output).
+                // Active in every mode; Mode 1 now forwards the live chip too.
                 // ---------------------------------------------------------------
                 #[cfg(feature = "boot-capture")]
-                if OperatingMode::load() != OperatingMode::Emulation {
-                    raw_capture_feed(
-                        &raw_capture::CH,
-                        "CHIP",
-                        raw_capture::FREEZE_AFTER_MS_CH,
-                        raw_capture::SENTINEL_CH,
-                        &buf[..n],
-                    );
-                }
+                raw_capture_feed(
+                    &raw_capture::CH,
+                    "CHIP",
+                    raw_capture::FREEZE_AFTER_MS_CH,
+                    raw_capture::SENTINEL_CH,
+                    &buf[..n],
+                );
 
                 // Boot capture of config replies from the chip (capped; no-op
                 // once we've gathered BOOT_LOG_MAX).
@@ -1019,50 +933,9 @@ async fn uart1_rx_task(mut rx: BufferedUartRx) {
                         }
                     }
                 }
-                // Hybrid Emulation: while we are still in the passthrough
-                // phase (no CFGKEY override yet), watch the chip→drone byte
-                // stream for `$CFGKEY,,` and arm the override window when seen.
-                let mode_now = OperatingMode::load();
-                if mode_now == OperatingMode::Emulation
-                    && EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) == 0
-                {
-                    for &b in &buf[..n] {
-                        let want = CFGKEY_TRIGGER[cfgkey_match as usize];
-                        if b == want {
-                            cfgkey_match += 1;
-                            if cfgkey_match as usize == CFGKEY_TRIGGER.len() {
-                                let now_ms = Instant::now().as_millis() as u32;
-                                EMULATION_VALID_UNTIL_MS.store(
-                                    now_ms.wrapping_add(EMULATION_VALID_WINDOW_MS),
-                                    Ordering::Release,
-                                );
-                                OUTPUT_START_MILLIS.store(now_ms, Ordering::Release);
-                                SATELLITES_INVALID.store(false, Ordering::Release);
-                                info!(
-                                    "Hybrid Emulation: $CFGKEY seen, valid 3D fix override for {=u32} ms",
-                                    EMULATION_VALID_WINDOW_MS,
-                                );
-                                cfgkey_match = 0;
-                            }
-                        } else {
-                            cfgkey_match = if b == CFGKEY_TRIGGER[0] { 1 } else { 0 };
-                        }
-                    }
-                }
-
-                // Routing:
-                //   Passthrough/Raw/Offset modes        — always forward.
-                //   Emulation, passthrough phase        — forward (drone gets
-                //                                         real chip stream incl.
-                //                                         CFGKEY response).
-                //   Emulation, override phase           — drop chip bytes and
-                //                                         let `emulation_task`
-                //                                         drive the stream.
-                let drop_chip_bytes = mode_now == OperatingMode::Emulation
-                    && EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) != 0;
-                if drop_chip_bytes {
-                    continue;
-                }
+                // Always forward chip bytes into the stream router. Mode 1
+                // rewrites selected NMEA sentences downstream but never cuts
+                // the live UC6580I stream after `$CFGKEY`.
                 let mut v = heapless::Vec::<u8, 256>::new();
                 let _ = v.extend_from_slice(&buf[..n]);
                 if RAW_RX_CHANNEL.try_send(v).is_err() {
@@ -1110,6 +983,17 @@ async fn passthrough_forward_task() {
     // and system-clock-drift checks in the shared detector.
     let mut time_cache = NmeaTimeCache::default();
 
+    // Cold-boot: if persisted mode is Emulation, arm the FORCED3D window now
+    // so the 22 s timer starts at the very first chip frame (not the first
+    // Mode-0 mode-change event, which never fires when persisted).
+    if last_mode == OperatingMode::Emulation {
+        FORCED3D_PHASE_START_MS.store(
+            embassy_time::Instant::now().as_millis() as u32,
+            Ordering::Release,
+        );
+        SATELLITES_INVALID.store(false, Ordering::Release);
+    }
+
     loop {
         let chunk = RAW_RX_CHANNEL.receive().await;
         let mode = OperatingMode::load();
@@ -1117,6 +1001,16 @@ async fn passthrough_forward_task() {
         // Mode change → cause a full reset on the next detector tick.
         if mode != last_mode {
             SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
+            // (Re)arm the FORCED3D window when we ENTER Emulation so the
+            // 22 s "satellites lost" timer always counts from the moment the
+            // drone could see fq=3 from us.
+            if mode == OperatingMode::Emulation {
+                FORCED3D_PHASE_START_MS.store(
+                    embassy_time::Instant::now().as_millis() as u32,
+                    Ordering::Release,
+                );
+                SATELLITES_INVALID.store(false, Ordering::Release);
+            }
             last_mode = mode;
         }
 
@@ -1141,27 +1035,19 @@ async fn passthrough_forward_task() {
         }
 
         match mode {
-            OperatingMode::Emulation => {
-                // Hybrid Emulation: forward chip bytes verbatim until the
-                // chip's `$CFGKEY,,…` reply (handshake authorised). After
-                // the trigger fires, `uart1_rx_task` drops chip bytes and
-                // `emulation_task` drives the stream.
-                if EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire) == 0 {
-                    tx_trace("emu-passthrough", &chunk);
-                    enqueue(&chunk);
-                }
-                // else: chunk should already be empty since uart1_rx_task
-                // stopped feeding RAW_RX_CHANNEL after CFGKEY.
-            }
             OperatingMode::PassthroughRaw => {
                 tx_trace("raw-chunk", &chunk);
                 enqueue(&chunk);
             }
-            OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
+            OperatingMode::Emulation | OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
                 if pos_buffer.is_none() {
                     pos_buffer = Some(PositionBuffer::new());
                 }
-                let apply_offset = mode == OperatingMode::PassthroughOffset;
+                let nmea_policy = match mode {
+                    OperatingMode::Emulation => NmeaOutputPolicy::Forced3dFix,
+                    OperatingMode::PassthroughOffset => NmeaOutputPolicy::Offset,
+                    _ => NmeaOutputPolicy::Plain,
+                };
 
                 for &b in chunk.iter() {
                     // --- Inside an RTCM frame: forward payload/CRC verbatim. --
@@ -1228,7 +1114,7 @@ async fn passthrough_forward_task() {
                         in_sentence = false;
                         process_nmea_line(
                             line,
-                            apply_offset,
+                            nmea_policy,
                             pos_buffer.as_mut().unwrap(),
                             &mut dynamic_offset,
                             &mut time_cache,
@@ -1321,9 +1207,19 @@ struct NmeaTimeCache {
     /// secondary to catch backward time shifts on NoFix/V-status frames where
     /// the detector's `check_gnss_time` is gated behind `has_3d_fix`.
     last_frame_gnss_unix: Option<i64>,
+    /// Most recent parseable time (HH:MM:SS.cc) seen on any chip GGA/RMC.
+    /// Used by Forced3dFix to fill the time field on chip frames whose own
+    /// time is empty (typical pre-fix), so the rewrite still emits a valid
+    /// sentence with target coords + fq=3 instead of falling back verbatim.
+    last_time: Option<unicore::nmea::NmeaTime>,
+    last_time_ms: u32,
 }
 
 const NMEA_DATE_FRESHNESS_MS: u32 = 1500;
+/// `last_time` accepted as fallback for up to 60 s — covers extended fix-loss
+/// windows. After that, fall back to a fixed default rather than emit a stale
+/// timestamp that could trigger drone-side time-jump logic.
+const NMEA_TIME_FRESHNESS_MS: u32 = 60_000;
 
 /// Largest tolerated backward jump between consecutive GNSS timestamps. The
 /// u-blox detector uses the same 1 s threshold (`thresholds::MAX_TIME_JUMP_BACK_S`
@@ -1334,7 +1230,7 @@ const TIME_JUMP_BACK_S: i64 = 1;
 
 async fn process_nmea_line(
     line: &[u8],
-    apply_offset: bool,
+    policy: NmeaOutputPolicy,
     pos_buffer: &mut PositionBuffer,
     dynamic_offset: &mut Option<DynamicOffset>,
     time_cache: &mut NmeaTimeCache,
@@ -1344,6 +1240,157 @@ async fn process_nmea_line(
     let now_ms = embassy_time::Instant::now().as_millis() as u32;
     let is_gga = line.len() >= 6 && &line[3..6] == b"GGA";
     let is_rmc = line.len() >= 6 && &line[3..6] == b"RMC";
+    let is_gsa = line.len() >= 6 && &line[3..6] == b"GSA";
+    let is_gll = line.len() >= 6 && &line[3..6] == b"GLL";
+
+    // Cache any parseable time/date from the chip's frame so the Forced3dFix
+    // rewrite can fall back to a recent timestamp when the chip's own GGA/RMC
+    // arrives with empty time field (cold-boot / fix-loss). Plain/Offset paths
+    // also benefit (more accurate GnssTime feed for the detector).
+    if is_gga || is_rmc {
+        if let Some(fix) = if is_gga { nmea::parse_gga(line) } else { nmea::parse_rmc(line) } {
+            if fix.checksum_ok && fix.time != nmea::NmeaTime::default() {
+                time_cache.last_time = Some(fix.time);
+                time_cache.last_time_ms = now_ms;
+            }
+            #[cfg(feature = "nav-debug")]
+            {
+                if is_gga && fix.checksum_ok {
+                    nav_debug::LAST_CHIP_FQ.store(fix.fix_quality, Ordering::Relaxed);
+                    nav_debug::LAST_CHIP_NSATS.store(fix.nsats, Ordering::Relaxed);
+                }
+                if is_rmc && fix.checksum_ok {
+                    nav_debug::LAST_CHIP_RMC_VALID
+                        .store(if fix.fix_quality > 0 { 1 } else { 0 }, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    if policy == NmeaOutputPolicy::Forced3dFix {
+        let target = (
+            config::offset_target::LAT_1E7,
+            config::offset_target::LON_1E7,
+            config::offset_target::ALT_MM,
+        );
+
+        // Fallback time: cached chip time if fresh, else 00:00:00.
+        let fallback_time = match time_cache.last_time {
+            Some(t) if now_ms.wrapping_sub(time_cache.last_time_ms) <= NMEA_TIME_FRESHNESS_MS => t,
+            _ => nmea::NmeaTime::default(),
+        };
+        // Fallback date: cached RMC date if fresh, else a fixed plausible date
+        // (1 Jan 2025) — drone needs a non-zero date for RMC to validate.
+        let fallback_date = match time_cache.date {
+            Some(d) if now_ms.wrapping_sub(time_cache.date_ms) <= NMEA_DATE_FRESHNESS_MS => d,
+            _ => nmea::NmeaDate { day: 1, month: 1, year: 2025 },
+        };
+        #[cfg(feature = "nav-debug")]
+        {
+            nav_debug::TIME_CACHE_FRESH.store(
+                if fallback_time == nmea::NmeaTime::default() && time_cache.last_time.is_none() { 0 } else { 1 },
+                Ordering::Relaxed,
+            );
+            nav_debug::DATE_CACHE_FRESH.store(
+                if time_cache.date.is_some()
+                    && now_ms.wrapping_sub(time_cache.date_ms) <= NMEA_DATE_FRESHNESS_MS { 1 } else { 0 },
+                Ordering::Relaxed,
+            );
+        }
+
+        // 22 s window of forced 3D fix, then "satellites lost" — gives the
+        // drone time to commit a home point under fq=3, then we drop the fix
+        // so it stops fast-forwarding GPS-driven flight modes. Coordinates
+        // stay at target.
+        let phase_start = FORCED3D_PHASE_START_MS.load(Ordering::Acquire);
+        let phase_start = if phase_start == 0 {
+            FORCED3D_PHASE_START_MS.store(now_ms, Ordering::Release);
+            now_ms
+        } else {
+            phase_start
+        };
+        let elapsed = now_ms.wrapping_sub(phase_start);
+        let valid_window = (elapsed as u64) < config::timers::SATELLITES_INVALID_AFTER_MS;
+        SATELLITES_INVALID.store(!valid_window, Ordering::Release);
+
+        if is_gga || is_rmc || is_gsa || is_gll {
+            let mut work = [0u8; 320];
+            let kind = if is_gga { "GGA" }
+                else if is_rmc { "RMC" }
+                else if is_gsa { "GSA" }
+                else { "GLL" };
+            let result = if valid_window {
+                nmea::force_3d_fix_sentence(line, target, fallback_time, fallback_date, &mut work)
+            } else {
+                nmea::force_no_fix_sentence(line, target, fallback_time, fallback_date, &mut work)
+            };
+            if let Some(n) = result {
+                tx_trace(if valid_window { "force3d-rewrite" } else { "force-nofix-rewrite" }, &work[..n]);
+                enqueue(&work[..n]);
+                #[cfg(feature = "nav-debug")]
+                {
+                    let c = if is_gga { &nav_debug::GGA_REWRITE }
+                        else if is_rmc { &nav_debug::RMC_REWRITE }
+                        else if is_gsa { &nav_debug::GSA_REWRITE }
+                        else { &nav_debug::GLL_REWRITE };
+                    nav_debug::bump(c);
+                }
+                nav_dbg!(
+                    "[nav-debug] {=str} {=str} ok len={=u16} t={=u8}:{=u8}:{=u8} cache_t={=u8} elapsed={=u32}ms",
+                    kind,
+                    if valid_window { "FIX3D" } else { "NOFIX" },
+                    n as u16,
+                    fallback_time.hour, fallback_time.minute, fallback_time.second,
+                    if time_cache.last_time.is_some() { 1u8 } else { 0u8 },
+                    elapsed,
+                );
+            } else {
+                // Only checksum failure or unknown sentence kind reach here now.
+                tx_trace("force3d-fallback", line);
+                enqueue(line);
+                #[cfg(feature = "nav-debug")]
+                {
+                    let c = if is_gga { &nav_debug::GGA_REJECT_CHECKSUM }
+                        else if is_rmc { &nav_debug::RMC_REJECT_CHECKSUM }
+                        else if is_gsa { &nav_debug::GSA_REJECT }
+                        else { &nav_debug::GLL_REJECT_CHECKSUM };
+                    nav_debug::bump(c);
+                }
+                nav_dbg!(
+                    "[nav-debug] {=str} rewrite REJECT (checksum/unknown) → verbatim len={=u16}",
+                    kind, line.len() as u16
+                );
+            }
+            return;
+        }
+
+        // Non-coord NMEA — forwarded verbatim. Tag for stats.
+        #[cfg(feature = "nav-debug")]
+        {
+            let stype = if line.len() >= 6 { &line[3..6] } else { b"---" };
+            let prop = line.len() >= 2 && line[1] == b'P';
+            let c = match stype {
+                b"GSV" => &nav_debug::GSV_THROUGH,
+                b"VTG" => &nav_debug::VTG_THROUGH,
+                b"ZDA" => &nav_debug::ZDA_THROUGH,
+                b"TXT" => &nav_debug::TXT_THROUGH,
+                _ if prop => &nav_debug::PROP_THROUGH,
+                _ => &nav_debug::OTHER_THROUGH,
+            };
+            nav_debug::bump(c);
+            // First 8 bytes give a clear hint about message family.
+            let head_len = line.len().min(8);
+            nav_dbg!(
+                "[nav-debug] passthrough head={=[u8]:a} len={=u16}",
+                &line[..head_len], line.len() as u16
+            );
+        }
+        tx_trace("nmea-passthrough", line);
+        enqueue(line);
+        return;
+    }
+
+    let apply_offset = policy == NmeaOutputPolicy::Offset;
 
     // Parse once; reuse for detector, offset-rewrite and spoof-rebuild.
     let parsed: Option<nmea::NmeaFix> = if is_gga { nmea::parse_gga(line) }
@@ -1721,263 +1768,6 @@ async fn process_nmea_line(
 }
 
 // ---------------------------------------------------------------------------
-// Emulation task: boot-dump + 5 Hz NMEA + 1 Hz ExtRTCM bundle. Only runs when
-// MODE == Emulation; other modes return without touching TX_CHANNEL.
-// ---------------------------------------------------------------------------
-
-#[embassy_executor::task]
-async fn emulation_task() {
-    use unicore::nmea::{
-        build_gga, build_gsa, build_gsv, build_rmc, GgaFields, GsaFields, GsaOpMode,
-        GsvSat, NmeaDate, NmeaTime, RmcFields, Talker,
-    };
-
-    let mut tick = Ticker::every(Duration::from_millis(200));
-    let mut counter: u32 = 0;
-    let mut buf = [0u8; 256];
-    let mut booted = false;
-
-    // Simulated UTC time, reset at each (re)start of Emulation mode.
-    // Increment by 200 ms per tick. Start at 03:01:55.00 UTC 2025-06-05
-    // (matches the `$GNZDA` values we observed from the live chip probe).
-    let start_centis: u64 = (3 * 3_600 + 1 * 60 + 55) * 100; // 10 865 500
-    let mut centis: u64 = start_centis;
-    let date = NmeaDate { day: 5, month: 6, year: 2025 };
-
-    loop {
-        tick.next().await;
-        if OperatingMode::load() != OperatingMode::Emulation {
-            booted = false;
-            centis = start_centis;
-            counter = 0;
-            SATELLITES_INVALID.store(false, Ordering::Release);
-            EMULATION_VALID_UNTIL_MS.store(0, Ordering::Release);
-            EMULATION_PASSTHROUGH_START_MS.store(0, Ordering::Release);
-            continue;
-        }
-        // Hybrid Emulation: stay silent until the chip's `$CFGKEY,,…` reply
-        // has been observed by `uart1_rx_task`. Until then `passthrough_forward_task`
-        // is forwarding chip→drone bytes verbatim.
-        let mut valid_until = EMULATION_VALID_UNTIL_MS.load(Ordering::Acquire);
-        if valid_until == 0 {
-            // Track when passthrough phase started, to enable timeout-based
-            // fallback for drones that don't send `$CFGKEY` (cached auth).
-            let now_ms = Instant::now().as_millis() as u32;
-            let pass_start = EMULATION_PASSTHROUGH_START_MS.load(Ordering::Acquire);
-            if pass_start == 0 {
-                EMULATION_PASSTHROUGH_START_MS.store(now_ms, Ordering::Release);
-            } else if now_ms.wrapping_sub(pass_start) >= EMULATION_FORCE_OVERRIDE_AFTER_MS {
-                // Force the override anyway.
-                let new_until = now_ms.wrapping_add(EMULATION_VALID_WINDOW_MS);
-                EMULATION_VALID_UNTIL_MS.store(new_until, Ordering::Release);
-                OUTPUT_START_MILLIS.store(now_ms, Ordering::Release);
-                SATELLITES_INVALID.store(false, Ordering::Release);
-                info!(
-                    "Hybrid Emulation: timeout fallback fired ({=u32} ms in passthrough), forcing override",
-                    EMULATION_FORCE_OVERRIDE_AFTER_MS,
-                );
-                valid_until = new_until;
-            } else {
-                booted = false;
-                centis = start_centis;
-                counter = 0;
-                continue;
-            }
-        }
-        if !booted {
-            // Skip BOOT_DUMP — chip already streamed its own boot output to
-            // the drone during the passthrough phase. Just begin emitting NMEA.
-            booted = true;
-            counter = 0;
-            centis = start_centis;
-            SATELLITES_INVALID.store(false, Ordering::Release);
-        }
-        counter = counter.wrapping_add(1);
-        centis += 20;
-
-        // Hybrid Emulation: 3D fix valid only inside the EMULATION_VALID_WINDOW_MS
-        // window after `$CFGKEY`; afterwards the chip "loses" satellites
-        // permanently.
-        let now_ms = Instant::now().as_millis() as u32;
-        let satellites_invalid = (now_ms.wrapping_sub(valid_until) as i32) >= 0;
-        SATELLITES_INVALID.store(satellites_invalid, Ordering::Release);
-
-        let valid = !satellites_invalid;
-        // Live UC6580I emits `fq=3` (3D fix) once it has full lock, not `fq=1`
-        // (autonomous 2D). DJI Air 3S requires `fq=3` to mark the chip as a
-        // trusted home-point source. After SATELLITES_INVALID_AFTER_MS the
-        // emulator drops to `fq=0` so the drone enters failsafe.
-        let fix_quality: u8 = if valid { 3 } else { 0 };
-        let nsats: u8 = if valid { 16 } else { 1 };
-
-        // Unpack simulated time
-        let total_s = centis / 100;
-        let cs = (centis % 100) as u8;
-        let hour = ((total_s / 3600) % 24) as u8;
-        let minute = ((total_s / 60) % 60) as u8;
-        let second = (total_s % 60) as u8;
-        let time = NmeaTime { hour, minute, second, centis: cs };
-
-        let lat = if valid { config::default_position::LAT_1E7 } else { 0 };
-        let lon = if valid { config::default_position::LON_1E7 } else { 0 };
-        let alt = if valid { config::default_position::ALT_MM } else { 0 };
-
-        // GGA every tick (rate=1).
-        let gga = GgaFields {
-            time,
-            lat_1e7: lat,
-            lon_1e7: lon,
-            fix_quality,
-            nsats,
-            hdop_x100: if valid { 99 } else { 9999 },
-            alt_mm: alt,
-            geoid_sep_mm: -30_000,
-        };
-        let n = build_gga(&mut buf, Talker::Gn, &gga);
-        if n > 0 { enqueue(&buf[..n]); }
-
-        // RMC every tick (rate=1).
-        let rmc = RmcFields {
-            time,
-            valid,
-            lat_1e7: lat,
-            lon_1e7: lon,
-            sog_knots_x1000: 0,
-            cog_deg_x100: 0,
-            date,
-            mode: if valid { b'A' } else { b'N' },
-        };
-        let n = build_rmc(&mut buf, Talker::Gn, &rmc);
-        if n > 0 { enqueue(&buf[..n]); }
-
-        // GSA every 5th tick (rate=5): 5 sentences, one per constellation.
-        // PRN split below totals 16 satellites (matches GGA nsats=16).
-        if counter % 5 == 0 {
-            let sys_prns: &[(u8, &[u16])] = &[
-                (1, &[5, 13, 15, 20]),      // GPS — 4
-                (2, &[65, 70, 75]),          // GLONASS — 3
-                (3, &[2, 11, 18]),           // Galileo — 3
-                (4, &[6, 14, 20, 27]),       // BeiDou — 4
-                (5, &[193, 194]),            // QZSS — 2
-            ];
-            for (sys_id, prn_list) in sys_prns {
-                let mut sats: [u16; 12] = [0; 12];
-                if valid {
-                    for (i, &prn) in prn_list.iter().enumerate().take(12) {
-                        sats[i] = prn;
-                    }
-                }
-                let gsa = GsaFields {
-                    op_mode: GsaOpMode::Automatic,
-                    fix_type: if valid { 3 } else { 1 },
-                    sats,
-                    pdop_x100: if valid { 99 } else { 9999 },
-                    hdop_x100: if valid { 99 } else { 9999 },
-                    vdop_x100: if valid { 99 } else { 9999 },
-                    system_id: *sys_id,
-                };
-                let n = build_gsa(&mut buf, Talker::Gn, &gsa);
-                if n > 0 { enqueue(&buf[..n]); }
-            }
-        }
-
-        // GSV every 5th tick (rate=5): per-talker pages advertising the same
-        // 16 SVs split across constellations. View count matches GGA nsats.
-        if counter % 5 == 0 {
-            if valid {
-                // (talker, signal_id, satellites for this talker's view)
-                let pages: &[(Talker, u8, &[(u16, u8, u16, u8)])] = &[
-                    (Talker::Gp, 1, &[(5, 45, 90, 45), (13, 60, 180, 47), (15, 30, 270, 42), (20, 80, 0, 50)]),
-                    (Talker::Gb, 1, &[(6, 35, 60, 43), (14, 50, 150, 45), (20, 70, 210, 44), (27, 25, 300, 41)]),
-                    (Talker::Ga, 7, &[(2, 40, 45, 46), (11, 55, 135, 48), (18, 28, 225, 41)]),
-                    (Talker::Gl, 1, &[(65, 42, 110, 44), (70, 68, 200, 46), (75, 22, 330, 40)]),
-                    (Talker::Gq, 1, &[(193, 55, 180, 47), (194, 40, 240, 43)]),
-                ];
-                for (talker, sig, sats) in pages {
-                    let mut arr: [GsvSat; 4] = [GsvSat::default(); 4];
-                    for (i, s) in sats.iter().enumerate().take(4) {
-                        arr[i] = GsvSat {
-                            prn: s.0,
-                            elevation_deg: s.1,
-                            azimuth_deg: s.2,
-                            cno_dbhz: s.3,
-                        };
-                    }
-                    let n = build_gsv(&mut buf, *talker, 1, 1, nsats, &arr[..sats.len().min(4)], *sig);
-                    if n > 0 { enqueue(&buf[..n]); }
-                }
-            } else {
-                let invalid_sat = [GsvSat {
-                    prn: 1,
-                    elevation_deg: 0,
-                    azimuth_deg: 0,
-                    cno_dbhz: 0,
-                }];
-                let n = build_gsv(&mut buf, Talker::Gp, 1, 1, nsats, &invalid_sat, 1);
-                if n > 0 { enqueue(&buf[..n]); }
-            }
-        }
-
-        // Long-form `$GNTXT,01,01,01,…` periodic status — emitted every tick
-        // by the live chip alongside RMC/GGA. Field 13 carries the fix
-        // indicator (3 = 3D fix, 0 = no fix). Drone uses the chip-ID embedded
-        // in field 11 + this status as a health/identity signal.
-        if valid {
-            enqueue(unicore::cmd::GNTXT_STATUS_FIX3D);
-        } else {
-            enqueue(unicore::cmd::GNTXT_STATUS_NOFIX);
-        }
-
-        // PNOISE every 10 ticks (~0.5 Hz).
-        if counter % 10 == 0 {
-            enqueue(b"$PNOISE,65,85,13663,11506,9643,34974,10000,10000,10000,10000,0,0*37\r\n");
-        }
-
-        // ---- RTCM/ExtRTCM stream — match live chip cadence -----------------
-        // Live UC6580I in no-fix steady-state emits per ~200 ms cycle:
-        //   D3 00 03 43 50 00 8D 44 BE          (RTCM 1077 short, no-obs)
-        //   ExtRTCM 4074 subs 0xFF, 0xFE, 0xF9, 0xE6  (status)
-        //   ExtRTCM 4074 sub 0xE9                     (occasional)
-        //   $GNRMC, $GNGGA, $GNTXT (long form), $PNOISE   ← already emitted
-        //   ExtRTCM 4074 subs 0x000, 0x001, 0x002      (short status)
-        // Drone observes these during the passthrough phase and depends on
-        // their continuation. Skipping them after the override switch causes
-        // the drone to disconnect.
-
-        // RTCM 1077 short — empty MSM7 placeholder (9 bytes, fixed CRC).
-        const RTCM_1077_SHORT: &[u8] = &[
-            0xD3, 0x00, 0x03, 0x43, 0x50, 0x00, 0x8D, 0x44, 0xBE,
-        ];
-        enqueue(RTCM_1077_SHORT);
-
-        // ExtRTCM 4074 status frames — large status block (every tick).
-        for &(sub, data) in &[
-            (0x0FFu16, unicore::extrtcm::DATA_SUB_0FF),
-            (0x0FE,    unicore::extrtcm::DATA_SUB_0FE),
-            (0x0F9,    unicore::extrtcm::DATA_SUB_0F9),
-            (0x0E6,    unicore::extrtcm::DATA_SUB_0E6),
-        ] {
-            let n = unicore::extrtcm::build_sub(&mut buf, sub, data);
-            if n > 0 { enqueue(&buf[..n]); }
-        }
-        // Sub 0xE9 only every ~5 ticks (jamming/spoof detection update).
-        if counter % 5 == 0 {
-            let n = unicore::extrtcm::build_sub(&mut buf, 0x0E9, unicore::extrtcm::DATA_SUB_0E9);
-            if n > 0 { enqueue(&buf[..n]); }
-        }
-        // Subs 0x000, 0x001, 0x002 every tick (short cyclic status).
-        for &(sub, data) in &[
-            (0x000u16, unicore::extrtcm::DATA_SUB_000),
-            (0x001,    unicore::extrtcm::DATA_SUB_001),
-            (0x002,    unicore::extrtcm::DATA_SUB_002),
-        ] {
-            let n = unicore::extrtcm::build_sub(&mut buf, sub, data);
-            if n > 0 { enqueue(&buf[..n]); }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // LED task — WS2812 on RP2350, one colour per operating mode.
 // ---------------------------------------------------------------------------
 
@@ -2066,10 +1856,7 @@ async fn apply_operating_mode(
     }
 
     new_mode.store();
-    if new_mode == OperatingMode::Emulation {
-        OUTPUT_START_MILLIS.store(Instant::now().as_millis() as u32, Ordering::Release);
-        SATELLITES_INVALID.store(false, Ordering::Release);
-    }
+    SATELLITES_INVALID.store(false, Ordering::Release);
     SPOOF_DETECTED.store(false, Ordering::Release);
     SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
     SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
