@@ -45,12 +45,12 @@ Inter-core: `Signal`/`Channel` (embassy-sync). Mode state: `AtomicU8`.
 - `src/led.rs` — WS2812 (PIO)
 
 ### Operating Modes
-| Mode | ID | LED | Description |
-|------|----|-----|-------------|
-| Emulation | 0 | green/yellow | Fake GNSS + SEC-SIGN; yellow after invalid-satellite timeout |
-| Passthrough | 1 | blue | Forward real GNSS, spoof detection |
-| PassthroughRaw | 2 | purple | Transparent forwarding |
-| PassthroughOffset | 3 | white | Passthrough + coordinate offset |
+| Mode | ID | Click | LED | Description |
+|------|----|---|-----|-------------|
+| Emulation | 0 | 1 | green/yellow | Fake GNSS + SEC-SIGN (u-blox) / Forced3dFix passthrough+coord override (Unicore); see Mode 0 gotchas |
+| **Passthrough** (default) | **1** | **2** | blue | Forward real GNSS + spoof detection. **Unicore: drops ALL RTCM under spoof, NMEA Plain rebuild incl. GLL.** |
+| PassthroughRaw | 2 | 3 | purple | Byte-for-byte forwarding, no parsing |
+| PassthroughOffset | 3 | 4 | white | Passthrough + coordinate offset (NMEA GGA/RMC rewrite) |
 
 Mode persisted to flash. Button: 1-4 clicks. Timeout: 800ms.
 
@@ -67,6 +67,7 @@ Mode persisted to flash. Button: 1-4 clicks. Timeout: 800ms.
 - **Spoof marker**: `spoof_detector::SPOOF_NSATS_MARKER` (=2) is planted in UBX NAV-PVT/SOL/SAT/SVINFO under spoof; Unicore spoofed GGA reports invalid fix with 1 visible satellite
 - **Diagnostic mode**: `DIAG_MSG_DETAIL = true` in main.rs
 - **Unicore UART signal integrity**: `src/main_unicore.rs` must mirror the proven u-blox hardware UART settings: GPIO0 UART0 TX pad = 12mA drive + pull-down + fast slew, and UART1 RX FIFO threshold = 1/4. If raw passthrough also outputs garbage at 921600, check these settings before protocol logic.
+- **Unicore Mode 1 (Passthrough, 2-click, now `#[default]`) — RTCM drop-under-spoof + GLL rebuild** (2026-04-27): when `SPOOF_DETECTED == true`, the byte-level RTCM router in `passthrough_forward_task` (`rtcm_drop_for_spoof: bool`) silently drops every RTCM frame regardless of msg_id (1077/1087/1097/1117/1127, 4074 with all sub-IDs incl. 0x0FC chip-auth). NMEA continues via Plain policy: GGA/RMC rebuilt at LAST_GOOD with `fq=0`/`status=V`, **GLL also rebuilt** (new `build_spoofed_gll`, was drop), VTG verbatim. Decision re-evaluated at every new RTCM frame — when spoof clears, RTCM resumes verbatim. Live test 2026-04-27 (DJI Neo + UC6580I): chip got real fix at fq=1/19sats, detector flagged spoof at 67.5s via `GNSS TIME anomaly + SYSTEM CLOCK DRIFT`, all RTCM cut from drone (4856 frames over ~80s window). Counter `nav_debug::RTCM_DROPPED_SPOOF` (separate from `RTCM_4074_DROPPED`/`RTCM_KEPT`). See memory `project_unicore_mode1_rtcm_drop_under_spoof.md`.
 - **Unicore Mode 0 = passthrough + immediate coord substitution + 22 s window** (2026-04-27 redesign, replaces old hybrid CFGKEY-trigger logic). `passthrough_forward_task` `Forced3dFix` branch dispatches GGA/RMC/GSA/**GLL** through `unicore::nmea::force_3d_fix_sentence`/`force_no_fix_sentence` into `config::offset_target`. First `SATELLITES_INVALID_AFTER_MS=22_000` ms (timer = `FORCED3D_PHASE_START_MS`, armed on cold-boot if persisted Mode 0 OR on mode-change INTO Mode 0) emit `fq=3, 16 sats, status=A, mode=A, fix_type=3` (green LED). After window: `fq=0, 1 sat, V, N, fix_type=1` — coords stay target, `SATELLITES_INVALID=true` (yellow LED). `force_*` accept fallback time/date and **never reject on empty time/date** — use `NmeaTimeCache.last_time` (60 s TTL) or `NmeaTime::default()` + `01.01.2025`; only checksum failure / unknown sentence kind returns `None`. **Empirical 2026-04-27** (DJI Neo + UC6580I): even with `$GNTXT,01,01,01,…` field 13 also rewritten to `'3'` (run #2), drone doesn't lock 3D fix. Most likely it weights RTCM/ExtRTCM 4074 raw observations as primary source, which we still pass verbatim with chip's empty/no-signal payload. See memory `project_mode0_forced3dfix_redesign.md`.
 - **Unicore Mode 0 GNTXT status rewrite** (`src/unicore/nmea.rs::rewrite_gntxt_status`, `process_nmea_line` `is_gntxt_status` branch): in Forced3dFix policy, `$xxTXT,01,01,01,…` periodic status (24-field UC6580I-extended TXT) has its field 13 (fix progression indicator) replaced with `'3'` during the 22 s FIX3D window and `'0'` after. Validates checksum + first 3 fields = `01,01,01` (skips `,00,…` preack). Counter `nav_debug::GNTXT_STATUS_REWRITE`. Did not flip drone behaviour — see memory above.
 - **Unicore Mode 0 GSA fill + GSV synthesise** (`src/unicore/nmea.rs::force_gsa`, `synthesize_gsv`): under valid window, GSA's empty PRN list (chip in cold-boot) is filled with `[base..base+12]` per talker (`GP/GB/GA/GN`=1, `GL`=65, `GQ`=193, `GI`=1); each `$xxGSV,1,1,00,…` is replaced with a 1-of-1 GSV showing 4 sats CNR 45-48 dB-Hz, elevations 30°/40°/50°/60°, azimuths 45°/135°/225°/315°. Did not flip drone behaviour either — confirms NMEA-side coherence is not the bottleneck for Neo.

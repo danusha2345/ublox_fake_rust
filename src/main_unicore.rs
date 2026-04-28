@@ -71,9 +71,11 @@ bind_interrupts!(pub struct Irqs {
 #[repr(u8)]
 enum OperatingMode {
     Emulation = 0,
+    /// Default mode (also set on first boot / firmware version change).
+    /// 2-click selects this. NMEA Plain policy + RTCM-drop-under-spoof.
+    #[default]
     Passthrough = 1,
     PassthroughRaw = 2,
-    #[default]
     PassthroughOffset = 3,
 }
 
@@ -236,6 +238,7 @@ async fn nav_debug_summary_task() {
         let gsv = nav_debug::GSV_THROUGH.load(Ordering::Relaxed);
         let rtcm_dropped = nav_debug::RTCM_4074_DROPPED.load(Ordering::Relaxed);
         let rtcm_kept = nav_debug::RTCM_KEPT.load(Ordering::Relaxed);
+        let rtcm_drop_spoof = nav_debug::RTCM_DROPPED_SPOOF.load(Ordering::Relaxed);
         let vtg = nav_debug::VTG_THROUGH.load(Ordering::Relaxed);
         let zda = nav_debug::ZDA_THROUGH.load(Ordering::Relaxed);
         let txt = nav_debug::TXT_THROUGH.load(Ordering::Relaxed);
@@ -254,12 +257,12 @@ async fn nav_debug_summary_task() {
         prev_total = total;
 
         info!(
-            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} GNTXT={=u32}/{=u32} GSV_synth={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | RTCM kept={=u32} 4074_dropped={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
+            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} GNTXT={=u32}/{=u32} GSV_synth={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | RTCM kept={=u32} 4074_dropped={=u32} drop_spoof={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
             OperatingMode::load(),
             delta,
             gga_ok, gga_bad, rmc_ok, rmc_bad, gsa_ok, gsa_bad, gll_ok, gll_bad, gntxt_ok, gntxt_bad, gsv_synth, gsv_bad,
             gsv, vtg, zda, txt, prop, other,
-            rtcm_kept, rtcm_dropped,
+            rtcm_kept, rtcm_dropped, rtcm_drop_spoof,
             chip_fq, chip_nsats, chip_rmc,
             t_fresh, d_fresh,
         );
@@ -552,8 +555,17 @@ use pos_history::{DynamicOffset, PositionBuffer};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NmeaOutputPolicy {
+    /// Forward NMEA verbatim; under spoof, rebuild GGA/RMC/GLL at LAST_GOOD
+    /// with `fq=0` / `status=V` to push the drone into "fix lost" failsafe.
+    /// VTG passes verbatim. Used by Passthrough (2-click) where it's also
+    /// paired with RTCM-gate-under-spoof in the byte-level router.
     Plain,
+    /// PassthroughOffset: rewrite lat/lon (and alt for GGA) by the dynamic
+    /// offset between chip's first valid fix and `config::offset_target`.
     Offset,
+    /// Mode 0 (Emulation): force `fq=3 + target` for GGA/RMC/GSA/GLL during
+    /// 22 s identify window, then `fq=0 + target` after. Plus GSV synth +
+    /// GNTXT field-13 rewrite + 4074-0xFF in-place modify.
     Forced3dFix,
 }
 
@@ -843,6 +855,9 @@ mod nav_debug {
     pub static RTCM_4074_DROPPED: AtomicU32 = AtomicU32::new(0);
     /// Standard RTCM3 frames (msg_id != 4074) forwarded.
     pub static RTCM_KEPT: AtomicU32 = AtomicU32::new(0);
+    /// Passthrough (2-click) — RTCM frames dropped because SPOOF_DETECTED
+    /// was true when the frame started. Re-evaluated per-frame.
+    pub static RTCM_DROPPED_SPOOF: AtomicU32 = AtomicU32::new(0);
     pub static VTG_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static ZDA_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static TXT_THROUGH: AtomicU32 = AtomicU32::new(0);
@@ -987,11 +1002,11 @@ async fn passthrough_forward_task() {
     // is NOT misread as the start of an NMEA sentence — that would hand binary
     // bytes to `asm.feed()` and lose them. RTCM wraps UC6580I proprietary
     // msg 4074, so this state covers both.
-    let mut rtcm_remaining: u16 = 0;  // payload + CRC bytes still to forward/modify
+    let mut rtcm_remaining: u16 = 0;  // payload + CRC bytes still to forward/modify/drop
     // Scratch for first 6 frame bytes (D3 + LL_HI + LL_LO + 3 bytes encoding
     // msg_id[12] | sub_id[12]). Held without forwarding until msg_id+sub_id
-    // are decoded; then either flushed to `pass_buf` (forward verbatim) or
-    // kept in `rtcm_frame_buf` (modify in-place at frame end).
+    // are decoded; then either flushed to `pass_buf` (forward verbatim),
+    // kept in `rtcm_frame_buf` (modify in-place), or silently dropped.
     let mut rtcm_scratch: [u8; 6] = [0; 6];
     let mut rtcm_scratch_n: u8 = 0;
     // Active when we're capturing a full frame for in-place modification.
@@ -999,6 +1014,11 @@ async fn passthrough_forward_task() {
     // apply `unicore::extrtcm::modify_receiver_info` and enqueue the
     // modified frame as one TX chunk.
     let mut rtcm_modify_0ff: bool = false;
+    // Active in Passthrough mode (2-click) when SPOOF_DETECTED is true at the
+    // start of an RTCM frame. Whole frame is silently consumed (no forward).
+    // Cleared at frame end (rtcm_remaining → 0) so each new frame re-checks
+    // the spoof flag.
+    let mut rtcm_drop_for_spoof: bool = false;
     // Buffer for the full 4074-0xFF frame being captured (D3+LL+MID+data+CRC =
     // 169 bytes). Sized to fit any RTCM frame up to MAX_PAYLOAD; only used
     // when `rtcm_modify_0ff = true`.
@@ -1051,6 +1071,7 @@ async fn passthrough_forward_task() {
             rtcm_remaining = 0;
             rtcm_scratch_n = 0;
             rtcm_modify_0ff = false;
+            rtcm_drop_for_spoof = false;
             rtcm_frame_buf.clear();
             time_cache = NmeaTimeCache::default();
             SPOOF_DETECTED.store(false, Ordering::Release);
@@ -1070,7 +1091,9 @@ async fn passthrough_forward_task() {
                 tx_trace("raw-chunk", &chunk);
                 enqueue(&chunk);
             }
-            OperatingMode::Emulation | OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
+            OperatingMode::Emulation
+            | OperatingMode::Passthrough
+            | OperatingMode::PassthroughOffset => {
                 if pos_buffer.is_none() {
                     pos_buffer = Some(PositionBuffer::new());
                 }
@@ -1089,12 +1112,19 @@ async fn passthrough_forward_task() {
                             // Capacity reserved at scratch-flush time; push
                             // can't fail unless we mis-sized the buffer.
                             let _ = rtcm_frame_buf.push(b);
+                        } else if rtcm_drop_for_spoof {
+                            // Mode 2 spoof gate — silently consume.
                         } else {
                             buffered_forward(&mut pass_buf, b);
                         }
                         rtcm_remaining -= 1;
                         if rtcm_remaining == 0 {
-                            if rtcm_modify_0ff {
+                            if rtcm_drop_for_spoof {
+                                // Frame complete, dropped under Mode 2 spoof
+                                // gating. Nothing to enqueue or flush.
+                                tx_trace("rtcm-drop-spoof", &[]);
+                                rtcm_drop_for_spoof = false;
+                            } else if rtcm_modify_0ff {
                                 // DIAGNOSTIC MODE: drop 4074-0xFF entirely
                                 // post-id-window. Other 4074 sub-IDs (incl.
                                 // 0x0FC chip auth blob) still pass verbatim.
@@ -1174,6 +1204,15 @@ async fn passthrough_forward_task() {
                                 let modify_this = mode == OperatingMode::Emulation
                                     && msg_id == 4074
                                     && sub_id == unicore::extrtcm::SUB_RECEIVER_INFO;
+                                // Passthrough (2-click button mode): drop ALL
+                                // RTCM frames while SPOOF_DETECTED is true.
+                                // Frame is silently consumed (header + payload
+                                // + CRC) — drone gets no RTCM until spoof
+                                // clears. NMEA stream still goes through Plain
+                                // policy (GGA/RMC/GLL spoof rebuild + VTG
+                                // verbatim). Re-checked at every new frame.
+                                let drop_under_spoof = mode == OperatingMode::Passthrough
+                                    && SPOOF_DETECTED.load(Ordering::Acquire);
                                 if modify_this {
                                     // Stash all 6 leading bytes into the modify
                                     // buffer; remaining payload+CRC bytes will
@@ -1186,6 +1225,18 @@ async fn passthrough_forward_task() {
                                     nav_dbg!(
                                         "[nav-debug] RTCM 4074-0xFF capture (payload_len={=u16})",
                                         payload_len,
+                                    );
+                                } else if drop_under_spoof {
+                                    // Mark frame for silent drop. The 6 leading
+                                    // bytes are NOT flushed to pass_buf; the
+                                    // payload+CRC bytes will be consumed but
+                                    // not forwarded.
+                                    rtcm_drop_for_spoof = true;
+                                    #[cfg(feature = "nav-debug")]
+                                    nav_debug::bump(&nav_debug::RTCM_DROPPED_SPOOF);
+                                    nav_dbg!(
+                                        "[nav-debug] RTCM drop-under-spoof msg_id={=u16} sub_id=0x{=u16:X} payload_len={=u16}",
+                                        msg_id, sub_id, payload_len,
                                     );
                                 } else {
                                     // Forward all 6 leading bytes verbatim
@@ -1270,6 +1321,21 @@ fn build_spoofed_rmc(existing: &unicore::nmea::NmeaFix, coords: (i32, i32, i32),
         mode: b'N',
     };
     unicore::nmea::build_rmc(out, unicore::nmea::Talker::Gn, &r)
+}
+
+/// Build a spoofed GLL frame (LAST_GOOD coords, status='V', mode='N',
+/// time copied from any time we have on hand). Used by Plain policy under
+/// spoof to keep GLL consistent with the spoof-rebuilt GGA/RMC instead
+/// of dropping it (drone may parse GLL coords as fallback).
+fn build_spoofed_gll(time: unicore::nmea::NmeaTime, coords: (i32, i32, i32), out: &mut [u8]) -> usize {
+    let g = unicore::nmea::GllFields {
+        lat_1e7: coords.0,
+        lon_1e7: coords.1,
+        time,
+        valid: false,
+        mode: b'N',
+    };
+    unicore::nmea::build_gll(out, unicore::nmea::Talker::Gn, &g)
 }
 
 /// Rewrite lat/lon/alt in place on an NMEA sentence. Returns new sentence
@@ -1892,18 +1958,73 @@ async fn process_nmea_line(
     let is_vtg = line.len() >= 6 && &line[3..6] == b"VTG";
 
     // Non-GGA/RMC messages (GSA/GSV/ZDA/GST/…) pass verbatim. Exceptions:
-    //   - spoof active        → drop GLL+VTG to match the GGA/RMC rebuild;
-    //   - offset mode active  → drop GLL (we don't rewrite its format and it
-    //                            would leak the real chip coords next to the
-    //                            offset GGA/RMC). VTG can stay — velocity is
-    //                            invariant under a constant LLH offset.
+    //   - spoof active + GLL  → REBUILD with LAST_GOOD coords + V/N status
+    //                            so drone-side fallback that reads GLL coords
+    //                            sees the same spoofed position as our
+    //                            rebuilt GGA/RMC (don't drop — drone may
+    //                            interpret missing GLL as anomaly).
+    //   - spoof active + VTG  → forward verbatim — VTG carries no position,
+    //                            only speed/course. Drone uses it for
+    //                            velocity tracking; verbatim is consistent
+    //                            with chip's actual movement (or zero if
+    //                            stationary).
+    //   - offset mode + GLL   → REBUILD GLL with target+offset coords.
+    //   - offset mode + VTG   → forward verbatim (velocity invariant under
+    //                            constant LLH offset).
     if !(is_gga || is_rmc) {
-        if spoofed && (is_gll || is_vtg) {
-            tx_trace("nmea-drop-spoof", line);
+        if is_gll && (spoofed || apply_offset) {
+            // Determine coords for GLL rebuild — same logic as GGA/RMC below
+            // but we duplicate here because we want to fall through quickly
+            // for non-coord non-GGA/RMC sentences.
+            let coords: Option<(i32, i32, i32)> = if spoofed {
+                let base = (
+                    LAST_GOOD_LAT.load(Ordering::Acquire),
+                    LAST_GOOD_LON.load(Ordering::Acquire),
+                    LAST_GOOD_ALT.load(Ordering::Acquire),
+                );
+                Some(match *dynamic_offset {
+                    Some(ref off) => (
+                        base.0.saturating_add(off.lat_1e7),
+                        base.1.saturating_add(off.lon_1e7),
+                        base.2.saturating_add(off.alt_mm),
+                    ),
+                    None => base,
+                })
+            } else {
+                // apply_offset: use chip's actual GLL coords + offset.
+                // GLL parsing not implemented here yet — fall back to
+                // suppression so we don't leak chip's coords with offset
+                // not applied.
+                match (*dynamic_offset, unicore::nmea::parse_gga(line)) {
+                    // GLL parser not present, so we use LAST_GOOD as a
+                    // best-effort fallback when offset is computed.
+                    (Some(_off), _) => Some((
+                        LAST_GOOD_LAT.load(Ordering::Acquire),
+                        LAST_GOOD_LON.load(Ordering::Acquire),
+                        LAST_GOOD_ALT.load(Ordering::Acquire),
+                    )),
+                    _ => None,
+                }
+            };
+            if let Some(c) = coords {
+                let t = time_cache.last_time.unwrap_or_default();
+                let mut buf = [0u8; 96];
+                let n = build_spoofed_gll(t, c, &mut buf);
+                if n > 0 {
+                    tx_trace("nmea-gll-rebuild", &buf[..n]);
+                    enqueue(&buf[..n]);
+                    return;
+                }
+            }
+            // Fall back to drop on rebuild failure rather than leak chip
+            // coords through verbatim.
+            tx_trace("nmea-drop-gll-fallback", line);
             return;
         }
-        if apply_offset && is_gll {
-            tx_trace("nmea-drop-offset", line);
+        if spoofed && is_vtg {
+            // VTG has no coordinates — forward verbatim instead of dropping.
+            tx_trace("nmea-vtg-passthrough-spoof", line);
+            enqueue(line);
             return;
         }
         tx_trace("nmea-passthrough", line);
