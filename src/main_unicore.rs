@@ -234,6 +234,8 @@ async fn nav_debug_summary_task() {
         let gsv_synth = nav_debug::GSV_SYNTH.load(Ordering::Relaxed);
         let gsv_bad = nav_debug::GSV_REJECT.load(Ordering::Relaxed);
         let gsv = nav_debug::GSV_THROUGH.load(Ordering::Relaxed);
+        let rtcm_dropped = nav_debug::RTCM_4074_DROPPED.load(Ordering::Relaxed);
+        let rtcm_kept = nav_debug::RTCM_KEPT.load(Ordering::Relaxed);
         let vtg = nav_debug::VTG_THROUGH.load(Ordering::Relaxed);
         let zda = nav_debug::ZDA_THROUGH.load(Ordering::Relaxed);
         let txt = nav_debug::TXT_THROUGH.load(Ordering::Relaxed);
@@ -252,11 +254,12 @@ async fn nav_debug_summary_task() {
         prev_total = total;
 
         info!(
-            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} GNTXT={=u32}/{=u32} GSV_synth={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
+            "[nav-debug] mode={:?} Δ5s_lines={=u32} | rewrite GGA={=u32}/{=u32} RMC={=u32}/{=u32} GSA={=u32}/{=u32} GLL={=u32}/{=u32} GNTXT={=u32}/{=u32} GSV_synth={=u32}/{=u32} | passthrough GSV={=u32} VTG={=u32} ZDA={=u32} TXT={=u32} P*={=u32} other={=u32} | RTCM kept={=u32} 4074_dropped={=u32} | chip fq={=u8} nsats={=u8} rmc={=u8} | cache t={=u8} d={=u8}",
             OperatingMode::load(),
             delta,
             gga_ok, gga_bad, rmc_ok, rmc_bad, gsa_ok, gsa_bad, gll_ok, gll_bad, gntxt_ok, gntxt_bad, gsv_synth, gsv_bad,
             gsv, vtg, zda, txt, prop, other,
+            rtcm_kept, rtcm_dropped,
             chip_fq, chip_nsats, chip_rmc,
             t_fresh, d_fresh,
         );
@@ -836,6 +839,10 @@ mod nav_debug {
     pub static GSV_SYNTH: AtomicU32 = AtomicU32::new(0);
     pub static GSV_REJECT: AtomicU32 = AtomicU32::new(0);
     pub static GSV_THROUGH: AtomicU32 = AtomicU32::new(0);
+    /// Frames matching `msg_id == 4074` (ExtRTCM proprietary) dropped in Mode 0.
+    pub static RTCM_4074_DROPPED: AtomicU32 = AtomicU32::new(0);
+    /// Standard RTCM3 frames (msg_id != 4074) forwarded.
+    pub static RTCM_KEPT: AtomicU32 = AtomicU32::new(0);
     pub static VTG_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static ZDA_THROUGH: AtomicU32 = AtomicU32::new(0);
     pub static TXT_THROUGH: AtomicU32 = AtomicU32::new(0);
@@ -980,9 +987,22 @@ async fn passthrough_forward_task() {
     // is NOT misread as the start of an NMEA sentence — that would hand binary
     // bytes to `asm.feed()` and lose them. RTCM wraps UC6580I proprietary
     // msg 4074, so this state covers both.
-    let mut rtcm_hdr_have: u8 = 0;    // bytes of the 3-byte header already consumed
-    let mut rtcm_hdr1: u8 = 0;        // header byte 1 (high bits of length)
-    let mut rtcm_remaining: u16 = 0;  // payload + CRC bytes still to forward
+    let mut rtcm_remaining: u16 = 0;  // payload + CRC bytes still to forward/modify
+    // Scratch for first 6 frame bytes (D3 + LL_HI + LL_LO + 3 bytes encoding
+    // msg_id[12] | sub_id[12]). Held without forwarding until msg_id+sub_id
+    // are decoded; then either flushed to `pass_buf` (forward verbatim) or
+    // kept in `rtcm_frame_buf` (modify in-place at frame end).
+    let mut rtcm_scratch: [u8; 6] = [0; 6];
+    let mut rtcm_scratch_n: u8 = 0;
+    // Active when we're capturing a full frame for in-place modification.
+    // Bytes go to `rtcm_frame_buf` instead of `pass_buf`; at frame end we
+    // apply `unicore::extrtcm::modify_receiver_info` and enqueue the
+    // modified frame as one TX chunk.
+    let mut rtcm_modify_0ff: bool = false;
+    // Buffer for the full 4074-0xFF frame being captured (D3+LL+MID+data+CRC =
+    // 169 bytes). Sized to fit any RTCM frame up to MAX_PAYLOAD; only used
+    // when `rtcm_modify_0ff = true`.
+    let mut rtcm_frame_buf: heapless::Vec<u8, 256> = heapless::Vec::new();
 
     // Lazy — created on first entry into Passthrough/PassthroughOffset.
     let mut pos_buffer: Option<PositionBuffer> = None;
@@ -1028,8 +1048,10 @@ async fn passthrough_forward_task() {
             asm = nmea::LineAssembler::new();
             pass_buf.clear();
             in_sentence = false;
-            rtcm_hdr_have = 0;
             rtcm_remaining = 0;
+            rtcm_scratch_n = 0;
+            rtcm_modify_0ff = false;
+            rtcm_frame_buf.clear();
             time_cache = NmeaTimeCache::default();
             SPOOF_DETECTED.store(false, Ordering::Release);
             SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
@@ -1059,51 +1081,137 @@ async fn passthrough_forward_task() {
                 };
 
                 for &b in chunk.iter() {
-                    // --- Inside an RTCM frame: forward payload/CRC verbatim. --
+                    // --- Inside an RTCM frame: forward bytes verbatim through
+                    //     pass_buf (default) OR accumulate into rtcm_frame_buf
+                    //     when we've decided to modify this frame in-place. --
                     if rtcm_remaining > 0 {
-                        buffered_forward(&mut pass_buf, b);
+                        if rtcm_modify_0ff {
+                            // Capacity reserved at scratch-flush time; push
+                            // can't fail unless we mis-sized the buffer.
+                            let _ = rtcm_frame_buf.push(b);
+                        } else {
+                            buffered_forward(&mut pass_buf, b);
+                        }
                         rtcm_remaining -= 1;
-                        // Frame boundary = TX boundary: flush immediately so small
-                        // RTCM frames (e.g. 1013 system params) don't sit in
-                        // pass_buf waiting for the next `$` or a 256-byte fill.
-                        if rtcm_remaining == 0 && !pass_buf.is_empty() {
-                            tx_trace("rtcm-flush", &pass_buf);
-                            enqueue(&pass_buf);
-                            pass_buf.clear();
+                        if rtcm_remaining == 0 {
+                            if rtcm_modify_0ff {
+                                // DIAGNOSTIC MODE: drop 4074-0xFF entirely
+                                // post-id-window. Other 4074 sub-IDs (incl.
+                                // 0x0FC chip auth blob) still pass verbatim.
+                                // Tests whether 0x0FC contains an HMAC over
+                                // 0x0FF stream:
+                                //   - If drone accepts module → 0x0FC is
+                                //     independent (no HMAC binding to 0x0FF).
+                                //   - If drone rejects → 0x0FC binds to 0x0FF.
+                                let now_ms = embassy_time::Instant::now().as_millis() as u32;
+                                let phase_start = FORCED3D_PHASE_START_MS.load(Ordering::Acquire);
+                                let elapsed = if phase_start == 0 { 0 } else { now_ms.wrapping_sub(phase_start) };
+                                let post_id_window = (elapsed as u64)
+                                    >= config::timers::SATELLITES_INVALID_AFTER_MS;
+                                if post_id_window {
+                                    // DROP entire 0x0FF frame.
+                                    tx_trace("rtcm-4074ff-dropped", &[]);
+                                    #[cfg(feature = "nav-debug")]
+                                    nav_debug::bump(&nav_debug::RTCM_4074_DROPPED);
+                                    nav_dbg!(
+                                        "[nav-debug] RTCM 4074-0xFF DROPPED (post-id, elapsed={=u32}ms)",
+                                        elapsed,
+                                    );
+                                } else {
+                                    // Within identify window — forward verbatim.
+                                    tx_trace("rtcm-4074ff-id-window", &rtcm_frame_buf);
+                                    enqueue(&rtcm_frame_buf);
+                                    #[cfg(feature = "nav-debug")]
+                                    nav_debug::bump(&nav_debug::RTCM_KEPT);
+                                    nav_dbg!(
+                                        "[nav-debug] RTCM 4074-0xFF id-window verbatim (elapsed={=u32}ms)",
+                                        elapsed,
+                                    );
+                                }
+                                rtcm_frame_buf.clear();
+                                rtcm_modify_0ff = false;
+                            } else {
+                                // Pass-through path: flush pass_buf at frame boundary.
+                                if !pass_buf.is_empty() {
+                                    tx_trace("rtcm-flush", &pass_buf);
+                                    enqueue(&pass_buf);
+                                    pass_buf.clear();
+                                }
+                                #[cfg(feature = "nav-debug")]
+                                nav_debug::bump(&nav_debug::RTCM_KEPT);
+                            }
                         }
                         continue;
                     }
 
-                    // --- Reading the 3-byte RTCM header (D3 + 2 length bytes) --
-                    if rtcm_hdr_have == 1 {
-                        // Byte index 1 of the header: top 6 bits MUST be zero
-                        // (RTCM3 reserved). If not, the `0xD3` was noise/desync,
-                        // not a real preamble. Abort RTCM state and re-route
-                        // this byte through the NMEA logic below so that a `$`
-                        // appearing here still starts a sentence correctly.
-                        if b & 0xFC != 0 {
-                            rtcm_hdr_have = 0;
+                    // --- Collecting frame leading 6 bytes:
+                    //   [0]=D3, [1]=LL_HI, [2]=LL_LO,
+                    //   [3..6] = msg_id[12] | sub_id[12] bit-packed:
+                    //     [3] = msg_id[11:4]
+                    //     [4] = (msg_id[3:0] << 4) | sub_id[11:8]
+                    //     [5] = sub_id[7:0]
+                    //
+                    // Decision (forward-verbatim vs modify-0xFF) at index 5.
+                    if rtcm_scratch_n > 0 && rtcm_scratch_n < 6 {
+                        if rtcm_scratch_n == 1 && b & 0xFC != 0 {
+                            // Top 6 bits of byte 1 must be zero. If not, the
+                            // `0xD3` was noise — flush the stashed D3 as a
+                            // regular byte and re-route current byte through
+                            // normal NMEA logic.
+                            buffered_forward(&mut pass_buf, rtcm_scratch[0]);
+                            rtcm_scratch_n = 0;
                             // fall through without consuming `b`
                         } else {
-                            buffered_forward(&mut pass_buf, b);
-                            rtcm_hdr1 = b;
-                            rtcm_hdr_have = 2;
+                            rtcm_scratch[rtcm_scratch_n as usize] = b;
+                            rtcm_scratch_n += 1;
+                            if rtcm_scratch_n == 6 {
+                                let payload_len = (((rtcm_scratch[1] as u16) & 0x03) << 8)
+                                    | (rtcm_scratch[2] as u16);
+                                let msg_id: u16 = ((rtcm_scratch[3] as u16) << 4)
+                                    | ((rtcm_scratch[4] as u16) >> 4);
+                                let sub_id: u16 = (((rtcm_scratch[4] as u16) & 0x0F) << 8)
+                                    | (rtcm_scratch[5] as u16);
+                                let modify_this = mode == OperatingMode::Emulation
+                                    && msg_id == 4074
+                                    && sub_id == unicore::extrtcm::SUB_RECEIVER_INFO;
+                                if modify_this {
+                                    // Stash all 6 leading bytes into the modify
+                                    // buffer; remaining payload+CRC bytes will
+                                    // accumulate into it via `rtcm_modify_0ff`.
+                                    rtcm_frame_buf.clear();
+                                    for &sb in rtcm_scratch.iter() {
+                                        let _ = rtcm_frame_buf.push(sb);
+                                    }
+                                    rtcm_modify_0ff = true;
+                                    nav_dbg!(
+                                        "[nav-debug] RTCM 4074-0xFF capture (payload_len={=u16})",
+                                        payload_len,
+                                    );
+                                } else {
+                                    // Forward all 6 leading bytes verbatim
+                                    // through pass_buf.
+                                    for &sb in rtcm_scratch.iter() {
+                                        buffered_forward(&mut pass_buf, sb);
+                                    }
+                                    nav_dbg!(
+                                        "[nav-debug] RTCM keep msg_id={=u16} sub_id=0x{=u16:X} payload_len={=u16}",
+                                        msg_id, sub_id, payload_len,
+                                    );
+                                }
+                                // Remaining bytes after the 6 leading: data
+                                // = payload_len - 3 (msg_id+sub_id consumed)
+                                // plus 3-byte CRC.
+                                rtcm_remaining = payload_len.saturating_sub(3) + 3;
+                                rtcm_scratch_n = 0;
+                            }
                             continue;
                         }
-                    } else if rtcm_hdr_have == 2 {
-                        buffered_forward(&mut pass_buf, b);
-                        // Payload length = low 10 bits of bytes [1..2] big-endian.
-                        let payload_len = (((rtcm_hdr1 as u16) & 0x03) << 8) | (b as u16);
-                        // Remaining = payload + 3-byte CRC24 (header already forwarded).
-                        rtcm_remaining = payload_len + 3;
-                        rtcm_hdr_have = 0;
-                        continue;
                     }
 
                     // --- RTCM3 preamble only outside of an active NMEA sentence --
-                    if !in_sentence && b == 0xD3 {
-                        buffered_forward(&mut pass_buf, b);
-                        rtcm_hdr_have = 1;
+                    if !in_sentence && b == 0xD3 && rtcm_scratch_n == 0 {
+                        rtcm_scratch[0] = b;
+                        rtcm_scratch_n = 1;
                         continue;
                     }
 
@@ -1314,10 +1422,13 @@ async fn process_nmea_line(
             );
         }
 
-        // 22 s window of forced 3D fix, then "satellites lost" — gives the
-        // drone time to commit a home point under fq=3, then we drop the fix
-        // so it stops fast-forwarding GPS-driven flight modes. Coordinates
-        // stay at target.
+        // Identify-then-spoof window. First SATELLITES_INVALID_AFTER_MS
+        // forwards chip's authentic stream verbatim so the drone can
+        // fingerprint the module from real chip output (boot dump matches
+        // expected pattern). After the window we flip to forced-valid
+        // rewrites: GGA/RMC/GSA/GLL/GNTXT/GSV all advertise fq=3 + target
+        // coords. The same flip drives the 4074-0xFF in-place modify in
+        // the RTCM router (passthrough_forward_task).
         let phase_start = FORCED3D_PHASE_START_MS.load(Ordering::Acquire);
         let phase_start = if phase_start == 0 {
             FORCED3D_PHASE_START_MS.store(now_ms, Ordering::Release);
@@ -1326,8 +1437,34 @@ async fn process_nmea_line(
             phase_start
         };
         let elapsed = now_ms.wrapping_sub(phase_start);
-        let valid_window = (elapsed as u64) < config::timers::SATELLITES_INVALID_AFTER_MS;
-        SATELLITES_INVALID.store(!valid_window, Ordering::Release);
+        let post_id_window = (elapsed as u64)
+            >= config::timers::SATELLITES_INVALID_AFTER_MS;
+        // LED green during identify window, blue/yellow when spoofing.
+        // Reuse SATELLITES_INVALID flag (yellow) for the spoof phase to
+        // keep visual feedback distinct from passthrough (green).
+        SATELLITES_INVALID.store(post_id_window, Ordering::Release);
+
+        if !post_id_window {
+            // Identify window — pass chip's NMEA verbatim. Drone needs the
+            // authentic chip stream to recognise the module type.
+            #[cfg(feature = "nav-debug")]
+            {
+                let stype = if line.len() >= 6 { &line[3..6] } else { b"---" };
+                let prop = line.len() >= 2 && line[1] == b'P';
+                let c = match stype {
+                    b"GSV" => &nav_debug::GSV_THROUGH,
+                    b"VTG" => &nav_debug::VTG_THROUGH,
+                    b"ZDA" => &nav_debug::ZDA_THROUGH,
+                    b"TXT" => &nav_debug::TXT_THROUGH,
+                    _ if prop => &nav_debug::PROP_THROUGH,
+                    _ => &nav_debug::OTHER_THROUGH,
+                };
+                nav_debug::bump(c);
+            }
+            tx_trace("nmea-id-window", line);
+            enqueue(line);
+            return;
+        }
 
         if is_gga || is_rmc || is_gsa || is_gll {
             let mut work = [0u8; 320];
@@ -1335,13 +1472,11 @@ async fn process_nmea_line(
                 else if is_rmc { "RMC" }
                 else if is_gsa { "GSA" }
                 else { "GLL" };
-            let result = if valid_window {
-                nmea::force_3d_fix_sentence(line, target, fallback_time, fallback_date, &mut work)
-            } else {
-                nmea::force_no_fix_sentence(line, target, fallback_time, fallback_date, &mut work)
-            };
+            let result = nmea::force_3d_fix_sentence(
+                line, target, fallback_time, fallback_date, &mut work,
+            );
             if let Some(n) = result {
-                tx_trace(if valid_window { "force3d-rewrite" } else { "force-nofix-rewrite" }, &work[..n]);
+                tx_trace("force3d-rewrite", &work[..n]);
                 enqueue(&work[..n]);
                 #[cfg(feature = "nav-debug")]
                 {
@@ -1352,9 +1487,8 @@ async fn process_nmea_line(
                     nav_debug::bump(c);
                 }
                 nav_dbg!(
-                    "[nav-debug] {=str} {=str} ok len={=u16} t={=u8}:{=u8}:{=u8} cache_t={=u8} elapsed={=u32}ms",
+                    "[nav-debug] {=str} FIX3D ok len={=u16} t={=u8}:{=u8}:{=u8} cache_t={=u8} elapsed={=u32}ms",
                     kind,
-                    if valid_window { "FIX3D" } else { "NOFIX" },
                     n as u16,
                     fallback_time.hour, fallback_time.minute, fallback_time.second,
                     if time_cache.last_time.is_some() { 1u8 } else { 0u8 },
@@ -1387,35 +1521,25 @@ async fn process_nmea_line(
         // Outside the valid window pass through verbatim — chip's "no sats"
         // is consistent with our NOFIX rewrite.
         if is_gsv {
-            if valid_window {
-                let mut work = [0u8; 256];
-                if let Some(n) = nmea::synthesize_gsv(line, &mut work) {
-                    tx_trace("gsv-synth", &work[..n]);
-                    enqueue(&work[..n]);
-                    #[cfg(feature = "nav-debug")]
-                    nav_debug::bump(&nav_debug::GSV_SYNTH);
-                    nav_dbg!(
-                        "[nav-debug] GSV SYNTH ok len={=u16} talker={=[u8]:a}",
-                        n as u16,
-                        &line[1..3],
-                    );
-                } else {
-                    tx_trace("gsv-fallback", line);
-                    enqueue(line);
-                    #[cfg(feature = "nav-debug")]
-                    nav_debug::bump(&nav_debug::GSV_REJECT);
-                    nav_dbg!(
-                        "[nav-debug] GSV synth REJECT (checksum/struct) → verbatim len={=u16}",
-                        line.len() as u16,
-                    );
-                }
+            // Post-id-window only — synth 4 sats per talker.
+            let mut work = [0u8; 256];
+            if let Some(n) = nmea::synthesize_gsv(line, &mut work) {
+                tx_trace("gsv-synth", &work[..n]);
+                enqueue(&work[..n]);
+                #[cfg(feature = "nav-debug")]
+                nav_debug::bump(&nav_debug::GSV_SYNTH);
+                nav_dbg!(
+                    "[nav-debug] GSV SYNTH ok len={=u16} talker={=[u8]:a}",
+                    n as u16,
+                    &line[1..3],
+                );
             } else {
-                tx_trace("gsv-passthrough", line);
+                tx_trace("gsv-fallback", line);
                 enqueue(line);
                 #[cfg(feature = "nav-debug")]
-                nav_debug::bump(&nav_debug::GSV_THROUGH);
+                nav_debug::bump(&nav_debug::GSV_REJECT);
                 nav_dbg!(
-                    "[nav-debug] GSV NOFIX-window passthrough len={=u16}",
+                    "[nav-debug] GSV synth REJECT (checksum/struct) → verbatim len={=u16}",
                     line.len() as u16,
                 );
             }
@@ -1428,21 +1552,16 @@ async fn process_nmea_line(
         // claim of fix is trustworthy. Without this rewrite the chip's `0`
         // (no-fix) leaks through and contradicts our `fq=3` GGA.
         if is_gntxt_status {
+            // Post-id-window only — flip field 13 to '3' (3D fix indicator).
             let mut work = [0u8; 256];
-            let want = if valid_window { b'3' } else { b'0' };
-            if let Some(n) = nmea::rewrite_gntxt_status(line, want, &mut work) {
-                tx_trace(
-                    if valid_window { "gntxt-fix3d" } else { "gntxt-nofix" },
-                    &work[..n],
-                );
+            if let Some(n) = nmea::rewrite_gntxt_status(line, b'3', &mut work) {
+                tx_trace("gntxt-fix3d", &work[..n]);
                 enqueue(&work[..n]);
                 #[cfg(feature = "nav-debug")]
                 nav_debug::bump(&nav_debug::GNTXT_STATUS_REWRITE);
                 nav_dbg!(
-                    "[nav-debug] GNTXT {=str} ok len={=u16} field13={=u8}",
-                    if valid_window { "FIX3D" } else { "NOFIX" },
+                    "[nav-debug] GNTXT FIX3D ok len={=u16}",
                     n as u16,
-                    want,
                 );
             } else {
                 tx_trace("gntxt-fallback", line);
