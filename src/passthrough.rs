@@ -255,31 +255,40 @@ impl PositionBuffer {
         }
     }
 
-    /// Get position from N seconds ago (approximate)
-    /// Returns None if not enough history
+    /// Get position from N seconds ago (approximate).
+    /// Ignores entries newer than the requested lookback, so a just-pushed
+    /// spoof sample cannot become LAST_GOOD.
     pub fn get_position_at(&self, seconds_ago: u32, current_time_ms: u32) -> Option<(i32, i32, i32)> {
         if self.count == 0 {
             return None;
         }
 
-        let target_time = current_time_ms.wrapping_sub(seconds_ago * 1000);
-        let mut best_idx = 0;
+        let lookback_ms = seconds_ago * 1000;
+        let target_time = current_time_ms.wrapping_sub(lookback_ms);
+        let mut best_idx = None;
         let mut best_diff = u32::MAX;
 
         // Find entry closest to target time
         for i in 0..self.count {
             let idx = (self.write_idx + 15 - 1 - i) % 15;
             let entry = &self.entries[idx];
+            let age_ms = current_time_ms.wrapping_sub(entry.timestamp_ms);
+            if age_ms < lookback_ms {
+                continue;
+            }
+
             let diff = entry.timestamp_ms.abs_diff(target_time);
 
             if diff < best_diff {
                 best_diff = diff;
-                best_idx = idx;
+                best_idx = Some(idx);
             }
         }
 
-        let entry = &self.entries[best_idx];
-        Some((entry.lat, entry.lon, entry.alt))
+        best_idx.map(|idx| {
+            let entry = &self.entries[idx];
+            (entry.lat, entry.lon, entry.alt)
+        })
     }
 }
 

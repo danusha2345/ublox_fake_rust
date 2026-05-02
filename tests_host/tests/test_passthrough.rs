@@ -765,6 +765,40 @@ fn test_position_buffer_stale_entries_after_long_gap() {
         "Stale entry should be from pre-loss flight, lat={}", lat);
 }
 
+/// If a spoof sample is pushed before spoof analysis, get_position_at(2) must
+/// not choose it just because old clean samples are far from the target time.
+#[test]
+fn test_position_buffer_rejects_fresh_entry_on_lookback() {
+    let mut buf = PositionBuffer::new();
+
+    // Clean history before a long gap.
+    for i in 0u32..10 {
+        buf.push(BASE_LAT + (i as i32) * 100, BASE_LON, BASE_ALT, i * 200);
+    }
+
+    let now_ms = 32000u32;
+    let spoof_lat = BASE_LAT + 1_000_000;
+    buf.push(spoof_lat, BASE_LON, BASE_ALT, now_ms);
+
+    let (lat, _, _) = buf.get_position_at(2, now_ms)
+        .expect("Should skip fresh spoof sample and return stale clean history");
+    assert_ne!(lat, spoof_lat, "Fresh sample must not become LAST_GOOD");
+    assert!(lat >= BASE_LAT && lat <= BASE_LAT + 9 * 100,
+        "Position should come from pre-gap clean history, lat={}", lat);
+}
+
+/// A buffer containing only too-fresh samples has no entry for a non-zero
+/// lookback. This guards against silently falling back to current coordinates.
+#[test]
+fn test_position_buffer_returns_none_when_only_fresh_entries_exist() {
+    let mut buf = PositionBuffer::new();
+
+    buf.push(BASE_LAT, BASE_LON, BASE_ALT, 1000);
+
+    assert!(buf.get_position_at(2, 1500).is_none(),
+        "Fresh-only history should not satisfy a 2s lookback");
+}
+
 // ============================================================================
 // Group 6: Dynamic offset computation and recomputation
 //
