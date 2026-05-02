@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 u-blox GNSS M10 emulator written in Rust for RP2350/RP2354 microcontrollers. Uses Embassy async framework instead of FreeRTOS.
 
-**Note**: RP2040 no longer supported — requires ~221 KB RAM for buffers, exceeding available 264 KB.
+**Note**: only RP2350/RP2354 are supported; the old Cortex-M0+ target was removed because current buffers require too much RAM.
 
 **Original C version**: `../ublox_fake_unified/` - FreeRTOS based, for reference.
 
@@ -31,7 +31,7 @@ make rp2350                           # Build UF2 for RP2350
 make rp2354                           # Build UF2 for RP2354
 make flash                            # Flash via probe-rs (RP2350)
 make flash-rp2354                     # Flash via probe-rs (RP2354)
-make test                             # Run all 128 host-side tests
+make test                             # Run all 130 host-side tests
 
 cargo rb                              # run release binary (alias)
 cargo rp2350                          # build ELF only (alias)
@@ -43,13 +43,13 @@ cargo rp2354                          # build ELF only (alias)
 `spoof_detector.rs` is pure logic (no embassy/cortex-m deps) and can be tested on host via `tests_host/`.
 
 ```bash
-cd tests_host && cargo test            # All 128 tests
+cd tests_host && cargo test            # All 130 tests
 cd tests_host && cargo test vuln       # Only regression tests
 ```
 
 **Structure**: `tests_host/` is a standalone crate (NOT in workspace) with `defmt_mock/` (no-op macros) and `#[path]` to `../../src/spoof_detector.rs`.
 
-**Test groups** (128 tests — 87 spoof_detector + 33 passthrough + 8 coordinates):
+**Test groups** (130 tests — 87 spoof_detector + 35 passthrough + 8 coordinates):
 
 Spoof detector (87 tests):
 | Group | Tests | Coverage |
@@ -70,14 +70,14 @@ Spoof detector (87 tests):
 | 13: Leash+altitude | 5 | Gradual drift, leash freeze, altitude jump |
 | 14: Satellite loss | 12 | Loss+spoof+recovery cycles, gap thresholds, NoFix persistence |
 
-Passthrough (33 tests):
+Passthrough (35 tests):
 | Group | Tests | Coverage |
 |-------|-------|----------|
 | 1: UBX parser | 6 | Frame parsing, checksum, split frames |
 | 2: Offset+ECEF | 8 | LLH offset, ECEF replacement, round-trip |
 | 3: Spoof modify | 5 | Coord replace, velocity zero, status degrade |
 | 4: Extract+Buffer | 3 | Position extraction, PositionBuffer ring |
-| 5: Buffer fix_type | 3 | No-fix filtering, stale entries, corruption demo |
+| 5: Buffer fix_type | 5 | No-fix filtering, stale/fresh entry guards, corruption demo |
 | 6: Dynamic offset | 8 | Offset recompute, spoofed-base bug, full pipeline |
 
 **Note**: Coord recovery requires 6 samples (not 5) — returning from spoofed position is itself a teleport that resets normal_count.
@@ -124,13 +124,15 @@ Passthrough (33 tests):
 ### Operating Modes
 | Mode | ID | LED | Spoof Detection | Description |
 |------|----|-----|-----------------|-------------|
-| Emulation | 0 | green→yellow | No | Generates fake GNSS data with SEC-SIGN |
+| Emulation | 0 | green→yellow | No analyzer | Protects by replacing the GNSS source with generated NAV + SEC-SIGN; no real coordinates |
 | Passthrough | 1 | blue | Yes | Forwards real GNSS data |
 | PassthroughRaw | 2 | purple | No | Pure transparent forwarding |
 | PassthroughOffset | 3 | white | Yes | Passthrough + coordinate offset |
 | PassthroughOffsetNoRecovery | 4 | amber | Yes, latched | PassthroughOffset without clearing `SPOOF_DETECTED` on clean/recovery data |
 
 Mode persisted to flash. Button: 1-4 clicks → modes 0-3, 5 clicks → model select, 6 clicks → PassthroughOffsetNoRecovery (mode byte 4). Timeout: 800ms. Hot-switch.
+
+Emulation does not run `SpoofDetector::analyze()` because it does not consume the external GNSS stream. It still protects against external GNSS spoofing by fully replacing the GNSS source with generated UBX/NAV + SEC-SIGN; the tradeoff is no real coordinates.
 
 ### PassthroughOffset Modes
 
@@ -314,7 +316,7 @@ Mode persisted to flash. Button: 1-4 clicks → modes 0-3, 5 clicks → model se
 
 `num_sv=92` is an impossible value (max real ~40) used as spoof marker.
 
-**Known bug (Jan 2026)**: SEC-UNIQID race in drone auto-detection. Mavic 4 Pro sends SEC-UNIQID poll BEFORE CFG-VALSET (auto-detect trigger). **Workaround**: Set `DRONE_MODEL` to target model in `main.rs` (default Air 3S = 2).
+**Historical caveat (Jan 2026)**: SEC-UNIQID/model auto-detection can race because Mavic 4 Pro may send SEC-UNIQID poll before CFG-VALSET. This no longer controls the normal private-key path: `sec_sign::get_private_key()` uses the flash-extracted key first. Model selection mainly affects NAV/SEC-SIGN timings, SEC-UNIQID, CFG-0x41 template, and hardcoded fallback keys.
 
 ### NAV Output Start Timing
 
@@ -386,7 +388,7 @@ After 20 seconds from NAV output start, satellites become invalid (fix_type=0, n
 | Air 3S | 2 | 650ms | 2s |
 | Mavic 3 Pro | 3 | 650ms | 2s |
 
-Default: `DRONE_MODEL=2` (Air 3S). Mavic 4 Pro: per-unit unique keys (3 known). Use key extraction for correct key.
+Private key source: flash-extracted key first, hardcoded model key only as fallback. `DRONE_MODEL` is therefore secondary for current u-blox DJI work; it still selects timings, SEC-UNIQID, CFG-0x41 template, and fallback key. Mavic 4 Pro can have per-unit unique keys, so key extraction is the authoritative path.
 
 **Algorithm**: SHA256 over all transmitted UBX (except SEC-SIGN itself) → fold 32→24 bytes → ECDSA SECP192R1 sign with deterministic k (HMAC-SHA256, simplified RFC6979). Key crates: `p192`, `sha2`, `hmac`.
 

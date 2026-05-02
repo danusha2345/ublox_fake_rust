@@ -30,7 +30,7 @@
 | 0x24 | **CFG-NAV5** | var | Настройки навигационного движка. Просто ACK. |
 | 0x39 | **CFG-ITFM** | var | Мониторинг помех/джамминга. Просто ACK. |
 | 0x3E | **CFG-GNSS** | var | Конфигурация GNSS систем. Просто ACK. |
-| 0x41 | **CFG-0x41** | 0 (poll) | **DJI проприетарная**: возвращает 256 байт с приватным ключом SEC-SIGN (offset 175 для Air 3/Mavic 4 Pro, offset 115 для Air 3S). |
+| 0x41 | **CFG-0x41** | 0 (poll) | **DJI проприетарная**: возвращает 256 байт с приватным ключом SEC-SIGN (offset 175 для Air 3/Mavic 4 Pro, offset 115 для Air 3S/Mavic 3 Pro). |
 | 0x86 | **CFG-PMS** | var | Управление питанием. Просто ACK. |
 | 0x8A | **CFG-VALSET** | ≥4 | M10: установка значений. Header(4) + key-value пары. Размер value определяется по bits 28-30 key. |
 | 0x8B | **CFG-VALGET** | ≥8 | M10: запрос значений. Возвращает CFG-VALGET response с запрошенными ключами. |
@@ -80,7 +80,7 @@
 | 0x40 | **MGA-INI** | var | Начальные данные |
 | 0x80 | **MGA-DBD** | var | База данных навигации |
 
-Все MGA-* сообщения подтверждаются ACK-ACK.
+MGA-* сообщения подтверждаются ACK-ACK только в Emulation. В processed/raw passthrough ACK должен прийти от реального GNSS, чтобы не дублировать MGA-ACK и не засорять TX очередь.
 
 ---
 
@@ -155,8 +155,9 @@
 - Алгоритм: ECDSA SECP192R1 (P-192)
 - Hash: SHA256 складывается по XOR в 24 байта
 - k: Детерминистический по RFC6979 (HMAC-SHA256)
-- Период: 4 сек (Air 3), 2 сек (Air 3S, Mavic 4 Pro)
-- Первая задержка: 1000ms (Air 3), 650ms (Air 3S, Mavic 4 Pro)
+- Период: 2 сек для Air 3, Air 3S, Mavic 4 Pro и Mavic 3 Pro
+- Первая задержка: 1000ms (Air 3), 650ms (Air 3S, Mavic 4 Pro, Mavic 3 Pro)
+- Источник приватного ключа: flash-extracted key имеет приоритет; hardcoded ключ по модели используется только как fallback
 
 ---
 
@@ -196,7 +197,7 @@ Poll-запрос (payload=0) возвращает 256-байтный ответ
 
 **Приватный ключ** (24 байта, big-endian):
 - Air 3 / Mavic 4 Pro: offset **175** (шаблон с CFG-RINV)
-- Air 3S: offset **115** (шаблон без CFG-RINV, больше FF-padding)
+- Air 3S / Mavic 3 Pro: offset **115** (шаблон без CFG-RINV, больше FF-padding)
 
 ---
 
@@ -209,6 +210,7 @@ Poll-запрос (payload=0) возвращает 256-байтный ответ
 | DJI Air 3 | 666ms | 700ms |
 | DJI Air 3S | 780ms | 780ms |
 | DJI Mavic 4 Pro | 399ms | 400ms |
+| DJI Mavic 3 Pro | estimated | 780ms |
 
 ```
 Первая UBX команда → +delay → NAV выход → +650ms/1000ms → Первый SEC-SIGN
@@ -218,9 +220,10 @@ Poll-запрос (payload=0) возвращает 256-байтный ответ
 
 | Модель | Период | Первая задержка |
 |--------|--------|-----------------|
-| DJI Air 3 | 4 сек | 1000ms |
+| DJI Air 3 | 2 сек | 1000ms |
 | DJI Air 3S | 2 сек | 650ms |
 | DJI Mavic 4 Pro | 2 сек | 650ms |
+| DJI Mavic 3 Pro | 2 сек | 650ms |
 
 ---
 

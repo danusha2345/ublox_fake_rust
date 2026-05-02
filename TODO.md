@@ -8,7 +8,7 @@
 ## 2. Advanced Spoof Detection: Time-based ✅ DONE
 - [x] **GNSS Time-based Detection**:
     - Added `GnssTime` struct extracted from NAV-PVT
-    - Detection: time jumps backwards (>1s) or forwards (>30s) = spoofing
+    - Detection: time jumps backwards (>1s) or forwards (>5s) = spoofing
     - Recovery: when GNSS time matches projected system clock time (±5s)
 - [x] **System Clock Drift Detection**:
     - Calibrates internal clock with GNSS time (first 5 seconds)
@@ -28,34 +28,18 @@
 2. ✅ Speed anomaly (>30 m/s)
 3. ✅ GNSS time jumps (backwards/forward)
 4. ✅ System clock drift (calibrated internal clock vs GNSS time)
-5. ❌ Altitude anomaly (DISABLED - kept in code)
-6. ❌ Acceleration anomaly (DISABLED - kept in code)
-7. ❌ CNO uniformity (DISABLED - kept in code)
+5. ✅ Altitude anomaly (>10m jump)
+6. ✅ Last-good/origin drift guards
+7. ❌ Acceleration anomaly (DISABLED - kept in code)
+8. ❌ CNO uniformity (DISABLED - kept in code)
 
-## 🐛 Known Bug: SEC-UNIQID Race Condition (Jan 2026)
+## Historical Caveat: SEC-UNIQID Model Race (Jan 2026)
 
-**Problem**: When Mavic 4 Pro connects, auto-detection triggers at CFG-VALSET, but SEC-UNIQID is sent BEFORE that (in response to SEC-UNIQID poll). Result: Mavic 4 receives Air 3's chip ID.
+**Status**: Not the main key-selection path anymore. Current u-blox workflow auto-extracts the private SEC-SIGN key at boot and stores it in flash; `sec_sign::get_private_key()` uses that flash key before any hardcoded model key.
 
-**Symptom**: Auto-detection shows "Mavic 4 Pro", SEC-SIGN uses correct key, but signatures rejected by drone.
+**Remaining impact**: Model selection still affects NAV/SEC-SIGN timings, SEC-UNIQID, CFG-0x41 template and hardcoded fallback if no flash key exists.
 
-**Timeline**:
-1. Mavic sends SEC-UNIQID poll → We respond with **Air 3 chip ID** (wrong!)
-2. Mavic sends CFG-VALGET → SAW_CFG_VALGET = true
-3. Mavic sends CFG-VALSET → **Detection triggers** → DRONE_MODEL = Mavic4Pro (too late)
-4. SEC-SIGN computed with Mavic 4 key → Signature OK, but drone already has wrong ID
-
-**Workaround**: Set `DRONE_MODEL` default to target model in `main.rs:172` (currently Air 3S = 2). Auto-detection skips when Air 3S is set manually.
-
-**Fix (TODO)**: Detect Mavic 4 Pro immediately on SEC-UNIQID poll (Air 3 never sends this):
-```rust
-ubx::UbxCommand::SecUniqidPoll => {
-    if !DRONE_DETECTED.load(Ordering::Acquire) {
-        DRONE_MODEL.store(1, Ordering::Release);  // Mavic 4 Pro
-        DRONE_DETECTED.store(true, Ordering::Release);
-    }
-    // ... send correct SEC-UNIQID
-}
-```
+**Possible cleanup**: Keep or remove old model auto-detection notes only after validating whether SEC-UNIQID/template differences matter for the current drone set when a real extracted key is present.
 
 ## Completed Features
 - [x] **DJI Air 3S support** (Jan 2026): Private key, SEC-UNIQID, CFG-0x41 template (no CFG-RINV, key @offset 115), timers (SEC-SIGN 2s, Config→NAV 780ms). DroneModel::Air3S = 2.
@@ -65,5 +49,4 @@ ubx::UbxCommand::SecUniqidPoll => {
 - [x] Test time-based detection with simulated spoofing (tested Jan 2026)
 - [ ] Add signal-level anti-jam detection (AGC analysis)
 - [ ] Implement carrier-phase divergence detection
-- [ ] **Fix SEC-UNIQID auto-detection race condition**
-- [ ] Air 3S auto-detection pattern analysis (currently manual selection only)
+- [ ] Re-evaluate whether model auto-detection is still needed when flash key extraction succeeds

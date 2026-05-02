@@ -1,6 +1,6 @@
 # Makefile for ublox_fake firmware
 
-.PHONY: all clean rp2040 rp2350 rp2354 flash flash-rp2354 test
+.PHONY: all clean rp2350 rp2354 flash flash-rp2354 test
 
 # Default target
 all: rp2350
@@ -8,8 +8,9 @@ all: rp2350
 # Path to cargo binaries
 CARGO_BIN = $(HOME)/.cargo/bin
 
-# RP2350 Family ID for UF2
-RP2040_FAMILY = 0xe48bff56
+# RP2350 Family ID for UF2. elf2uf2-rs may emit a legacy family id by default,
+# so the patch step replaces that marker in generated RP2350/RP2354 UF2 files.
+ELF2UF2_DEFAULT_FAMILY = 0xe48bff56
 RP2350_FAMILY = 0xe48bff59
 
 # Python script for patching UF2 Family ID
@@ -18,14 +19,8 @@ python3 -c "import sys; \
 	OLD=int(sys.argv[3],16); NEW=int(sys.argv[4],16); \
 	d=bytearray(open(sys.argv[1],'rb').read()); \
 	[d.__setitem__(slice(i*512+0x1C,i*512+0x20), NEW.to_bytes(4,'little')) for i in range(len(d)//512) if int.from_bytes(d[i*512+0x1C:i*512+0x20],'little')==OLD]; \
-	open(sys.argv[2],'wb').write(d)" $(1) $(2) $(RP2040_FAMILY) $(RP2350_FAMILY)
+	open(sys.argv[2],'wb').write(d)" $(1) $(2) $(ELF2UF2_DEFAULT_FAMILY) $(RP2350_FAMILY)
 endef
-
-# Build for RP2040 (external flash, Cortex-M0+)
-rp2040:
-	cargo build --release --features rp2040 --target thumbv6m-none-eabi
-	$(CARGO_BIN)/elf2uf2-rs target/thumbv6m-none-eabi/release/ublox_fake ublox_fake_rp2040.uf2
-	@echo "Built: ublox_fake_rp2040.uf2"
 
 # Build for RP2350 (external flash, Cortex-M33)
 rp2350:

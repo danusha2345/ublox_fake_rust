@@ -1,125 +1,86 @@
-# Инструкция по работе с платой
+# Краткая инструкция по работе с платой
 
 ## Подключение
 
 ```
 ┌─────────────────────────────────────┐
-│          RP2350 плата               │
+│          RP2350/RP2354 плата        │
 ├─────────────────────────────────────┤
-│  GPIO0 (TX) ────► К дрону (RX)      │
-│  GPIO1 (RX) ◄──── От дрона (TX)     │
-│  GPIO5 (RX) ◄──── От GNSS (TX)      │  ← только для Passthrough
-│  GND ────────────── GND             │
+│  GPIO0 (UART0 TX) ─► К дрону RX     │
+│  GPIO1 (UART0 RX) ◄─ От дрона TX    │
+│  GPIO5 (UART1 RX) ◄─ От GNSS TX     │
+│  GPIO13 ───────────► PWR кнопки     │
+│  GPIO14 ◄─────────── INPUT кнопки   │
+│  GND ──────────────► GND            │
 └─────────────────────────────────────┘
 ```
 
-**Baudrate**: 921600 бод (8N1)
+**Baudrate**: 921600 бод (8N1).
 
-## Режимы работы
+LED:
+- RP2350: WS2812B на GPIO25.
+- RP2354: простой GPIO LED, GPIO11 анод и GPIO12 катод/земля.
 
-| Режим | LED | Описание |
-|-------|-----|----------|
-| **Emulation** | Зелёный | Генерация фейковых GNSS данных |
-| **Emulation** (>20 сек) | Жёлтый | Спутники стали "невалидными" |
-| **Passthrough** | Синий | Прозрачная передача от внешнего GNSS |
+## Режимы и кнопка
 
-LED мигает с частотой 1 Гц (500ms вкл / 500ms выкл).
+Короткие нажатия считаются серией с таймаутом 800 мс после отпускания кнопки.
 
-## Переключение режимов
+| Нажатия | Режим | Что делает |
+|---------|-------|------------|
+| 1 | Emulation | Полностью заменяет GNSS поток своими UBX/NAV и SEC-SIGN |
+| 2 | Passthrough | Пропускает внешний GNSS с spoof detection и собственной SEC-SIGN |
+| 3 | PassthroughRaw | Полностью прозрачный мост без парсинга, spoof detection и своей SEC-SIGN |
+| 4 | PassthroughOffset | Passthrough + фиксированный offset координат |
+| 5 | Model select | Вход в выбор модели для таймингов/SEC-UNIQID/CFG-0x41/fallback |
+| 6 | PassthroughOffsetNoRecovery | Как PassthroughOffset, но `SPOOF_DETECTED` не очищается по recovery |
 
-**Нажать кнопку** — режим переключается циклически:
-```
-Emulation → Passthrough → Emulation → ...
-```
+Длинное удержание 3+ секунды запускает ручное извлечение SEC-SIGN ключа через reboot-флаг.
 
-Режим сохраняется во flash и восстанавливается после перезагрузки.
+## LED-индикация
 
-## Поведение в режиме Emulation
+RP2350:
+- Зелёный/жёлтый blink — Emulation; жёлтый после 20 секунд, когда спутники становятся невалидными.
+- Синий blink — Passthrough.
+- Пурпурный blink — PassthroughRaw.
+- Белый blink — PassthroughOffset.
+- Янтарный короткий blink — PassthroughOffsetNoRecovery.
+- Быстрый красный blink — spoof detected в processed passthrough режимах.
 
-```
-Включение платы ───────────────► LED зелёный (мигает)
-     │
-     ▼
-Ожидание команды от дрона
-     │
-     ▼ (первая UBX команда)
-     │
-Задержка 400-700ms
-     │
-     ▼
-NAV данные начинают передаваться
-(3D fix, 18 спутников)
-     │
-     ▼ (+20 секунд)
-     │
-Спутники невалидны ────────────► LED жёлтый
-(fix_type=0, num_sv=1)
-```
+RP2354:
+- 1/2/3/4/6 вспышек — режимы 1/2/3/4/6.
+- Быстрое непрерывное мигание — spoof detected.
 
-## Сброс таймера 20 секунд
+## Emulation и spoofing
 
-Переключить режим кнопкой: **Passthrough → Emulation**
+В режиме Emulation внешний GNSS поток не используется: прошивка полностью заменяет его своими сообщениями. Поэтому внешний spoofing реального GNSS-модуля не может попасть к дрону. Это защита изоляцией/заменой источника, а не нормальная работа с реальными координатами и не работа `SpoofDetector::analyze()`.
 
----
+## SEC-SIGN ключ
+
+Для текущего u-blox пути модель дрона не является главным способом выбрать приватный ключ. При загрузке прошивка:
+
+1. Загружает ранее извлечённый ключ из flash, если он есть.
+2. Если ключа нет, пытается автоматически обнаружить GNSS на UART1, опросить `CFG-0x41`, извлечь ключ и сохранить его во flash.
+3. Только если flash/auto key недоступен, использует hardcoded fallback по `DRONE_MODEL`.
+
+Model select остаётся полезен для таймингов NAV/SEC-SIGN, `SEC-UNIQID`, шаблона `CFG-0x41` и fallback ключей.
+
+| Модель | Нажатия в model select | SEC-SIGN period | Config→NAV delay |
+|--------|-------------------------|-----------------|------------------|
+| DJI Air 3 | 1 | 2 секунды | 700 мс |
+| DJI Mavic 4 Pro | 2 | 2 секунды | 400 мс |
+| DJI Air 3S | 3 | 2 секунды | 780 мс |
+| DJI Mavic 3 Pro | 4 | 2 секунды | 780 мс |
 
 ## Настраиваемые параметры
 
-### 1. Размер flash памяти
+Основные параметры находятся в `src/config.rs`:
 
-**Файл**: [`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs#L8) (строка 8)
+| Параметр | Где |
+|----------|-----|
+| Flash size | `FLASH_SIZE_BYTES`: 4 МБ для RP2350, 2 МБ для RP2354 |
+| Пины | `pins` module |
+| Тайминги | `timers` module |
+| Координаты Emulation | `default_position` |
+| Целевая точка PassthroughOffset | `offset_target` |
 
-```rust
-pub const FLASH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4MB по умолчанию
-```
-
-**Изменить для**: плат с 2MB flash → `2 * 1024 * 1024`
-
-**Автоматически пересчитывается**: офсет для записи конфигурации во flash
-
-### 2. GPIO пины
-
-**Файл**: [`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs) (модуль `pins`)
-
-| Назначение | По умолчанию | Где менять |
-|------------|--------------|------------|
-| UART0 TX (к дрону) | GPIO0 | `config.rs` → `UART0_TX` |
-| UART0 RX (от дрону) | GPIO1 | `config.rs` → `UART0_RX` |
-| UART1 RX (от GNSS) | GPIO5 | `config.rs` → `UART1_RX` |
-| WS2812 LED | GPIO16 | `main.rs` строка ~70 → `WS2812LedPin` |
-| Кнопка PWR | GPIO10 | `main.rs` строка ~264 |
-| Кнопка INPUT | GPIO11 | `main.rs` строка ~265 |
-
-**WS2812 LED пин** — изменяется через type alias:
-
-**Файл**: [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L70) (строка ~70)
-
-```rust
-type WS2812LedPin = embassy_rp::peripherals::PIN_16; // ← Изменить PIN_XX
-```
-
-Пример для GPIO25: `PIN_25`
-
-### 3. Модель дрона (SEC-SIGN ключ)
-
-**Файл**: [`src/main.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/main.rs#L168) (строка 168)
-
-```rust
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(1); // 0 = Air 3, 1 = Mavic 4 Pro
-```
-
-| Модель | Значение | Период SEC-SIGN | Задержка NAV |
-|--------|----------|-----------------|--------------|
-| DJI Air 3 | `0` | 4 секунды | 700 мс |
-| DJI Mavic 4 Pro (по умолчанию) | `1` | 2 секунды | 400 мс |
-
-### 4. Координаты по умолчанию
-
-**Файл**: [`src/config.rs`](file:///home2/Git_projects/ublox_gnss_emulator/ublox_fake_rust/src/config.rs) (модуль `default_position`)
-
-```rust
-pub const LATITUDE: f64 = 25.7860556;   // Flamingo Park, Miami Beach
-pub const LONGITUDE: f64 = -80.1380556;
-pub const ALTITUDE_M: i32 = 3;
-```
-
-**После изменения**: пересобрать проект → `make rp2350`
+После изменения прошивку пересобрать через `make rp2350` или `make rp2354`.
