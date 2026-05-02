@@ -100,13 +100,13 @@ Passthrough (33 tests):
 | `gnss_processing_task` | async | Parses UBX frames, spoof detection, forwards to GNSS_RX_CHANNEL |
 | `nav_message_task` | 200ms (5Hz) | Sends NAV-* messages (Timer::at for drift-free timing) |
 | `mon_message_task` | 1s | Sends MON-HW, MON-RF, MON-COMMS |
-| `button_task` | async | Mode selection by click count (1/2/3/4 clicks) |
+| `button_task` | async | Mode selection by click count (1-4, 6 clicks; 5 clicks = model select) |
 
 ### Core1 Tasks
 | Task | Purpose |
 |------|---------|
-| `led_task` (RP2350) | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, red=spoof) |
-| `simple_led_task` (RP2354) | GPIO LED blink code (1-4 blinks = mode number, fast blink = spoof) |
+| `led_task` (RP2350) | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, white=offset, amber=no-recovery, red=spoof) |
+| `simple_led_task` (RP2354) | GPIO LED blink code (1-4/6 blinks = mode, fast blink = spoof) |
 | `sec_sign_compute_task` | ECDSA signature computation (~59ms per signature) |
 | `sec_sign_timer_task` | Waits for FIRST_CONFIG_MILLIS or 2s fallback, then first_delay → immediate first SEC-SIGN → period ticker (moved from Core0 to avoid UART interrupt starvation) |
 
@@ -128,12 +128,13 @@ Passthrough (33 tests):
 | Passthrough | 1 | blue | Yes | Forwards real GNSS data |
 | PassthroughRaw | 2 | purple | No | Pure transparent forwarding |
 | PassthroughOffset | 3 | white | Yes | Passthrough + coordinate offset |
+| PassthroughOffsetNoRecovery | 4 | amber | Yes, latched | PassthroughOffset without clearing `SPOOF_DETECTED` on clean/recovery data |
 
-Mode persisted to flash. Button: 1-4 clicks → mode 0-3. Timeout: 800ms. Hot-switch.
+Mode persisted to flash. Button: 1-4 clicks → modes 0-3, 5 clicks → model select, 6 clicks → PassthroughOffsetNoRecovery (mode byte 4). Timeout: 800ms. Hot-switch.
 
-### PassthroughOffset Mode
+### PassthroughOffset Modes
 
-Dynamic offset computed **once** at first 3D GPS fix and never recomputed (stays fixed for the entire flight). Target: `offset_target` in `config.rs` (Seney, Michigan).
+`PassthroughOffset` and `PassthroughOffsetNoRecovery` share the same offset, spoof detection, NAV modification, and SEC-SIGN path. Dynamic offset computed **once** at first 3D GPS fix and never recomputed (stays fixed for the entire flight). Target: `offset_target` in `config.rs` (Seney, Michigan).
 
 **LLH offset** (NAV-PVT, NAV-POSLLH): linear `offset = target - actual`, applied via addition. Always exact.
 
@@ -150,6 +151,7 @@ Dynamic offset computed **once** at first 3D GPS fix and never recomputed (stays
 - `cached_offset_llh` caches the latest offset LLH for ECEF recomputation within same epoch.
 - `pos_buffer` only stores entries with valid 3D fix (`fix_type >= 3`). No-fix entries (0,0,0 during satellite loss) are excluded to prevent LAST_GOOD corruption.
 - `dynamic_offset` is **never invalidated** after spoof recovery — recomputing from a different position would break coordinate mapping consistency (same physical location would produce different output coordinates before and after spoof event).
+- `PassthroughOffsetNoRecovery` does not start the 5s recovery timer and does not clear `SPOOF_DETECTED` after clean/recovery data; mode switch or reboot clears the latched state.
 
 ### Spoof Detection in Passthrough Mode
 
@@ -325,7 +327,7 @@ Dynamic offset computed **once** at first 3D GPS fix and never recomputed (stays
 
 ### SEC-SIGN Timer Start (Passthrough)
 
-In Passthrough/PassthroughOffset modes, `sec_sign_timer_task` triggers on `FIRST_CONFIG_MILLIS` (set by first drone UBX command, typically SEC-UNIQID at ~15ms after connect) with 2s fallback if no drone commands. After trigger, waits `first_delay` then fires first SEC-SIGN **immediately** (no extra period wait). Subsequent SEC-SIGN via `Ticker::every(period)` at loop bottom.
+In processed Passthrough modes (`Passthrough`, `PassthroughOffset`, `PassthroughOffsetNoRecovery`), `sec_sign_timer_task` triggers on `FIRST_CONFIG_MILLIS` (set by first drone UBX command, typically SEC-UNIQID at ~15ms after connect) with 2s fallback if no drone commands. After trigger, waits `first_delay` then fires first SEC-SIGN **immediately** (no extra period wait). Subsequent SEC-SIGN via `Ticker::every(period)` at loop bottom.
 
 After 20 seconds from NAV output start, satellites become invalid (fix_type=0, num_sv=1). Timer resets only on mode switch from Passthrough → Emulation.
 

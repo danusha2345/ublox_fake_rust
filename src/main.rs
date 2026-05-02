@@ -429,7 +429,7 @@ pub static LAST_GOOD_ECEF_Y: portable_atomic::AtomicI32 = portable_atomic::Atomi
 pub static LAST_GOOD_ECEF_Z: portable_atomic::AtomicI32 = portable_atomic::AtomicI32::new(0);
 
 /// Флаг для сброса спуф-детектора при смене режима (предотвращает ложные телепорты)
-/// Устанавливается при переключении в Passthrough, сбрасывается в gnss_processing_task
+/// Устанавливается при переключении в processed Passthrough, сбрасывается в gnss_processing_task
 pub static SPOOF_DETECTOR_RESET: AtomicBool = AtomicBool::new(false);
 
 /// Flash mutex type for mode persistence
@@ -452,6 +452,7 @@ pub enum OperatingMode {
     Passthrough = 1,
     PassthroughRaw = 2,     // Passthrough without spoof detection
     PassthroughOffset = 3,  // Passthrough with coordinate offset (spoof detection enabled)
+    PassthroughOffsetNoRecovery = 4, // PassthroughOffset, but spoof latch never auto-recovers
 }
 
 impl OperatingMode {
@@ -460,12 +461,29 @@ impl OperatingMode {
             0 => Self::Emulation,
             1 => Self::Passthrough,
             2 => Self::PassthroughRaw,
+            3 => Self::PassthroughOffset,
+            4 => Self::PassthroughOffsetNoRecovery,
             _ => Self::PassthroughOffset,
         }
     }
 
     fn store(self) {
         MODE.store(self as u8, Ordering::Release);
+    }
+
+    fn is_processed_passthrough(self) -> bool {
+        matches!(
+            self,
+            Self::Passthrough | Self::PassthroughOffset | Self::PassthroughOffsetNoRecovery
+        )
+    }
+
+    fn uses_coordinate_offset(self) -> bool {
+        matches!(self, Self::PassthroughOffset | Self::PassthroughOffsetNoRecovery)
+    }
+
+    fn keeps_spoof_latched(self) -> bool {
+        matches!(self, Self::PassthroughOffsetNoRecovery)
     }
 }
 
@@ -612,6 +630,8 @@ async fn main(spawner: Spawner) {
                 0 => OperatingMode::Emulation,
                 1 => OperatingMode::Passthrough,
                 2 => OperatingMode::PassthroughRaw,
+                3 => OperatingMode::PassthroughOffset,
+                4 => OperatingMode::PassthroughOffsetNoRecovery,
                 _ => OperatingMode::PassthroughOffset,
             };
             mode.store();
@@ -957,6 +977,24 @@ async fn led_task(
                     }
                 }
             }
+            OperatingMode::PassthroughOffsetNoRecovery => {
+                // PassthroughOffset with latched spoof: amber short blink, red if spoofing
+                if spoof_detected {
+                    // Fast blinking red (same as regular Passthrough)
+                    if blink_counter.is_multiple_of(2) {
+                        RGB8::new(50, 0, 0)  // Red ON
+                    } else {
+                        RGB8::new(0, 0, 0)   // OFF
+                    }
+                } else {
+                    // Normal: amber short blink (distinct from white Offset)
+                    if blink_counter % 6 < 2 {
+                        RGB8::new(35, 12, 0)  // Amber
+                    } else {
+                        RGB8::new(0, 0, 0)    // Off
+                    }
+                }
+            }
             OperatingMode::Emulation => {
                 // Slow blink (500ms cycle)
                 if blink_counter % 5 < 3 {
@@ -983,6 +1021,7 @@ async fn led_task(
 /// - Режим 2 (Passthrough):      2 вспышки  (50ms ON, 150ms OFF, 50ms ON, длинная пауза)
 /// - Режим 3 (PassthroughRaw):   3 вспышки
 /// - Режим 4 (PassthroughOffset): 4 вспышки
+/// - Режим 6 (PassthroughOffsetNoRecovery): 6 вспышек
 /// При спуфинге: быстрое непрерывное мигание (50ms ON, 50ms OFF)
 #[cfg(feature = "rp2354")]
 #[embassy_executor::task]
@@ -1036,7 +1075,7 @@ async fn simple_led_task(mut led: Output<'static>) {
         let spoof_detected = SPOOF_DETECTED.load(Ordering::Acquire);
 
         // При спуфинге — быстрое мигание независимо от режима
-        if spoof_detected && matches!(mode, OperatingMode::Passthrough | OperatingMode::PassthroughOffset) {
+        if spoof_detected && mode.is_processed_passthrough() {
             // 50ms ON, 50ms OFF (каждый тик переключаем)
             if tick.is_multiple_of(2) {
                 led.set_high();
@@ -1052,6 +1091,7 @@ async fn simple_led_task(mut led: Output<'static>) {
             OperatingMode::Passthrough => 2,
             OperatingMode::PassthroughRaw => 3,
             OperatingMode::PassthroughOffset => 4,
+            OperatingMode::PassthroughOffsetNoRecovery => 6,
         };
 
         // Паттерн: 50ms ON, 150ms OFF между вспышками
@@ -1231,7 +1271,9 @@ async fn uart0_tx_task(mut tx: embassy_rp::uart::BufferedUartTx) {
                     }
                 }
             }
-            OperatingMode::Passthrough | OperatingMode::PassthroughOffset => {
+            OperatingMode::Passthrough
+            | OperatingMode::PassthroughOffset
+            | OperatingMode::PassthroughOffsetNoRecovery => {
                 // PRIORITY: if SEC-SIGN in progress, wait ONLY for result
                 // Do NOT consume GNSS_RX_CHANNEL — packets stay in channel (depth 128, ~5 pkts during 47ms ECDSA)
                 if SEC_SIGN_IN_PROGRESS.load(Ordering::Acquire) {
@@ -1564,7 +1606,7 @@ async fn gnss_processing_task() {
     let mut detector: Option<SpoofDetector> = None;
     let mut pos_buffer: Option<PositionBuffer> = None;
 
-    // Dynamic offset for PassthroughOffset — computed once at first 3D GPS fix
+    // Dynamic offset for offset modes — computed once at first 3D GPS fix
     let mut dynamic_offset: Option<DynamicOffset> = None;
     let mut cached_offset_llh: Option<(i32, i32, i32)> = None; // (lat, lon, height_mm) after offset
     let mut first_offset_logged = false;
@@ -1588,9 +1630,10 @@ async fn gnss_processing_task() {
                     DIAG_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-        } else if mode == OperatingMode::Passthrough || mode == OperatingMode::PassthroughOffset {
-            // Initialize parsers if first time entering Passthrough/PassthroughOffset
-            let apply_offset = mode == OperatingMode::PassthroughOffset;
+        } else if mode.is_processed_passthrough() {
+            // Initialize parsers if first time entering processed Passthrough mode
+            let apply_offset = mode.uses_coordinate_offset();
+            let keep_spoof_latched = mode.keeps_spoof_latched();
 
             if parser.is_none() {
                 parser = Some(UbxFrameParser::new());
@@ -1679,26 +1722,30 @@ async fn gnss_processing_task() {
                                 SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                                 warn!("SPOOF DETECTED");
                             } else if !is_spoofed && was_spoofed {
-                                let recovery_start = SPOOF_RECOVERY_START_MS.load(Ordering::Acquire);
-                                if recovery_start == 0 {
-                                    SPOOF_RECOVERY_START_MS.store(now_ms, Ordering::Release);
-                                    info!("Spoof may have ended, starting 5s recovery timer");
+                                if keep_spoof_latched {
+                                    SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
                                 } else {
-                                    let elapsed = now_ms.wrapping_sub(recovery_start);
-                                    if elapsed >= 5000 {
-                                        SPOOF_DETECTED.store(false, Ordering::Release);
-                                        SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
-                                        // Dynamic offset is NOT invalidated here — it was computed
-                                        // at the first genuine 3D fix (takeoff) and must stay fixed
-                                        // for the entire flight to keep coordinate mapping consistent.
-                                        info!("Spoof recovery complete after 5s of clean data");
+                                    let recovery_start = SPOOF_RECOVERY_START_MS.load(Ordering::Acquire);
+                                    if recovery_start == 0 {
+                                        SPOOF_RECOVERY_START_MS.store(now_ms, Ordering::Release);
+                                        info!("Spoof may have ended, starting 5s recovery timer");
+                                    } else {
+                                        let elapsed = now_ms.wrapping_sub(recovery_start);
+                                        if elapsed >= 5000 {
+                                            SPOOF_DETECTED.store(false, Ordering::Release);
+                                            SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
+                                            // Dynamic offset is NOT invalidated here — it was computed
+                                            // at the first genuine 3D fix (takeoff) and must stay fixed
+                                            // for the entire flight to keep coordinate mapping consistent.
+                                            info!("Spoof recovery complete after 5s of clean data");
 
-                                        // NOTE: Do NOT reset SEC_SIGN_ACC here.
-                                        // In passthrough modes, the hash is self-consistent: all bytes
-                                        // sent to the drone (including modified NAV during spoofing) are
-                                        // accumulated. Resetting mid-period drops packets from the hash
-                                        // that were already sent → SEC-SIGN verification failure on drone.
-                                        // Hash reset is only needed on MODE SWITCH (stale emulation hashes).
+                                            // NOTE: Do NOT reset SEC_SIGN_ACC here.
+                                            // In passthrough modes, the hash is self-consistent: all bytes
+                                            // sent to the drone (including modified NAV during spoofing) are
+                                            // accumulated. Resetting mid-period drops packets from the hash
+                                            // that were already sent → SEC-SIGN verification failure on drone.
+                                            // Hash reset is only needed on MODE SWITCH (stale emulation hashes).
+                                        }
                                     }
                                 }
                             } else if is_spoofed {
@@ -1707,7 +1754,7 @@ async fn gnss_processing_task() {
                         }
                     }
 
-                    // Compute dynamic offset at first 3D GPS fix (PassthroughOffset mode)
+                    // Compute dynamic offset at first 3D GPS fix (offset modes)
                     if apply_offset && dynamic_offset.is_none()
                         && class == 0x01 && id == 0x07 && frame.len() >= 100
                     {
@@ -1732,7 +1779,7 @@ async fn gnss_processing_task() {
                         }
                     }
 
-                    // Apply coordinate offset in PassthroughOffset mode (before spoof modification)
+                    // Apply coordinate offset in offset modes (before spoof modification)
                     // LLH messages: linear offset (always exact).
                     // ECEF messages: recompute from offset LLH via llh_to_ecef_cm() for geometric consistency.
                     // Spoof detection above used original coordinates; offset is applied to output only.
@@ -1793,7 +1840,7 @@ async fn gnss_processing_task() {
                     }
 
                     // Modify ALL NAV messages if spoofing detected (AFTER offset)
-                    // Replaces coordinates with LAST_GOOD values (+offset in Mode 4)
+                    // Replaces coordinates with LAST_GOOD values (+offset in offset modes)
                     // and degrades status fields (fix_type=0, num_sv=2, high accuracy values)
                     let is_spoofed = SPOOF_DETECTED.load(Ordering::Acquire);
                     if class == 0x01 && is_spoofed {
@@ -1805,7 +1852,7 @@ async fn gnss_processing_task() {
                         let good_ecef_y = LAST_GOOD_ECEF_Y.load(Ordering::Acquire);
                         let good_ecef_z = LAST_GOOD_ECEF_Z.load(Ordering::Acquire);
 
-                        // In PassthroughOffset: apply offset to LAST_GOOD values
+                        // In offset modes: apply offset to LAST_GOOD values
                         let (rep_lat, rep_lon, rep_alt) = if let Some(ref off) = dynamic_offset {
                             (good_lat.saturating_add(off.lat_1e7),
                              good_lon.saturating_add(off.lon_1e7),
@@ -1814,7 +1861,7 @@ async fn gnss_processing_task() {
                             (good_lat, good_lon, good_alt)
                         };
                         let (rep_ex, rep_ey, rep_ez) = if dynamic_offset.is_some() {
-                            // PassthroughOffset: recompute ECEF from offset LLH for consistency
+                            // Offset modes: recompute ECEF from offset LLH for consistency
                             coordinates::llh_to_ecef_cm(rep_lat, rep_lon, rep_alt)
                         } else {
                             // Passthrough (no offset): use raw ECEF from LAST_GOOD
@@ -1837,7 +1884,7 @@ async fn gnss_processing_task() {
                         recalc_checksum(&mut frame);
                     }
 
-                    // Filter SEC-SIGN in Passthrough/PassthroughOffset — always generate our own.
+                    // Filter SEC-SIGN in processed Passthrough modes — always generate our own.
                     // This eliminates dirty hash (per-packet spoof checks) and timing gaps
                     // (phase mismatch between real GNSS timer and our timer on spoof transitions).
                     if class == 0x27 && id == 0x04 {
@@ -2408,22 +2455,22 @@ async fn sec_sign_timer_task() {
     let session_id = DEFAULT_SESSION_ID;
 
     // Wait for message output to start
-    // In Passthrough/PassthroughOffset modes, don't wait for MSG_OUTPUT_STARTED -
+    // In processed Passthrough modes, don't wait for MSG_OUTPUT_STARTED -
     // it's set by nav_message_task which requires first UBX command from host.
     // Trigger on FIRST_CONFIG_MILLIS (set by first drone command, ~15ms after connect)
     // with 2s fallback if no drone commands received.
     let start_time = embassy_time::Instant::now();
     loop {
         let mode = OperatingMode::load();
-        if mode == OperatingMode::Passthrough || mode == OperatingMode::PassthroughOffset {
+        if mode.is_processed_passthrough() {
             // Trigger on first drone command (SEC-UNIQID poll ~15ms after connect)
             // Fallback to 2s if no drone commands received
             let first_config = FIRST_CONFIG_MILLIS.load(Ordering::Acquire);
             if first_config != 0 || start_time.elapsed().as_millis() >= 2000 {
                 if first_config != 0 {
-                    info!("SEC-SIGN timer: Passthrough/Offset mode, triggered by first drone command");
+                    info!("SEC-SIGN timer: processed Passthrough mode, triggered by first drone command");
                 } else {
-                    info!("SEC-SIGN timer: Passthrough/Offset mode, fallback after 2s (no drone commands)");
+                    info!("SEC-SIGN timer: processed Passthrough mode, fallback after 2s (no drone commands)");
                 }
                 break;
             }
@@ -2484,7 +2531,7 @@ async fn sec_sign_timer_task() {
             ticker.next().await;
             continue;  // SEC-SIGN timer skipped in Raw mode
         }
-        // All other modes: Emulation, Passthrough, PassthroughOffset — always generate SEC-SIGN
+        // All other modes: Emulation and processed Passthrough — always generate SEC-SIGN
 
         // If previous SEC-SIGN cycle hasn't completed (signature not yet sent),
         // force-clear the stuck flag. Normal cycle completes in ~60ms; if flag is
@@ -2537,7 +2584,7 @@ async fn sec_sign_timer_task() {
 /// Mode button task - hot-switches mode without reboot
 /// Выбор режима по количеству коротких нажатий:
 /// 1 нажатие → Emulation (зелёный), 2 → Passthrough (синий), 3 → PassthroughRaw (фиолетовый)
-/// 4 нажатия → PassthroughOffset (белый), 5 нажатий → выбор модели дрона (cyan)
+/// 4 нажатия → PassthroughOffset (белый), 5 → выбор модели дрона (cyan), 6 → PassthroughOffsetNoRecovery
 /// Использует RP2350-E9 Errata Workaround (Input Latch-up fix)
 #[embassy_executor::task]
 async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) {
@@ -2637,7 +2684,7 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
                             info!("MODEL SELECT: no model selected");
                         }
                     } else {
-                        // ===== Фаза 1: выбор режима (1-4 клика) =====
+                        // ===== Фаза 1: выбор режима (1-4 или 6 кликов) =====
                         apply_mode_by_clicks(click_count, flash_mutex).await;
                     }
                     click_count = 0;
@@ -2652,7 +2699,7 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
             Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
 
             if flex.is_high() {
-                click_count = click_count.saturating_add(1).min(5);
+                click_count = click_count.saturating_add(1).min(6);
                 info!("button_task: click #{}", click_count);
 
                 // Ждём отпускания кнопки с E9 workaround и защитой от зависания
@@ -2710,13 +2757,15 @@ async fn button_task(mut flex: Flex<'static>, flash_mutex: &'static FlashMutex) 
 }
 
 /// Применяет режим по количеству нажатий кнопки
-/// 1 клик → Emulation, 2 → Passthrough, 3 → PassthroughRaw, 4 → PassthroughOffset
+/// 1 клик → Emulation, 2 → Passthrough, 3 → PassthroughRaw, 4 → PassthroughOffset,
+/// 6 кликов → PassthroughOffsetNoRecovery. 5 кликов зарезервированы под выбор модели.
 async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex) {
     let new_mode = match click_count {
         1 => OperatingMode::Emulation,
         2 => OperatingMode::Passthrough,
         3 => OperatingMode::PassthroughRaw,
         4 => OperatingMode::PassthroughOffset,
+        6 => OperatingMode::PassthroughOffsetNoRecovery,
         _ => return, // 0 нажатий - нечего делать
     };
 
@@ -2750,14 +2799,14 @@ async fn apply_mode_by_clicks(click_count: u8, flash_mutex: &'static FlashMutex)
     // Stale hashes from previous mode would corrupt first signature
     SEC_SIGN_ACC_NEEDS_RESET.store(true, Ordering::Release);
 
-    // Сброс спуф-детектора при переключении в Passthrough или PassthroughOffset
+    // Сброс спуф-детектора при переключении в processed Passthrough
     // Это предотвращает ложную детекцию "телепорта" при переходе из Emulation
     // (координаты эмуляции отличаются от реальных GNSS координат)
-    if new_mode == OperatingMode::Passthrough || new_mode == OperatingMode::PassthroughOffset {
+    if new_mode.is_processed_passthrough() {
         SPOOF_DETECTOR_RESET.store(true, Ordering::Release);
         SPOOF_DETECTED.store(false, Ordering::Release);
         SPOOF_RECOVERY_START_MS.store(0, Ordering::Release);
-        info!("SPOOF_DETECTOR_RESET set (entering passthrough mode, prevents false teleport)");
+        info!("SPOOF_DETECTOR_RESET set (entering processed passthrough mode, prevents false teleport)");
     }
 
     // Сохраняем во flash
