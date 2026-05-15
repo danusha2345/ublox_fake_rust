@@ -1,3 +1,5 @@
+[![Boosty](https://img.shields.io/badge/Boosty-Buy_me_a_coffee-FF7143?logo=boosty&logoColor=white&style=for-the-badge)](https://boosty.to/danusha/donate)
+
 # u-blox GNSS M10 Emulator (Rust/Embassy)
 
 Эмулятор GNSS приёмника u-blox серии M10 на микроконтроллерах RP2350/RP2354.
