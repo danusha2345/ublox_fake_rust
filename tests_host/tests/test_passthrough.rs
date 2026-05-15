@@ -172,6 +172,7 @@ fn build_nav_sat_frame(num_svs: u8) -> heapless::Vec<u8, 1280> {
 }
 
 /// Build a syntactically-valid NAV-SVINFO frame (class=0x01, id=0x30, minimal payload=8 bytes).
+#[allow(dead_code)]
 fn build_nav_svinfo_frame(num_ch: u8) -> heapless::Vec<u8, 1280> {
     let mut payload = [0u8; 8];
     payload[4] = num_ch;

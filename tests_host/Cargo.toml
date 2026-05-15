@@ -8,3 +8,10 @@ defmt = { path = "defmt_mock" }
 heapless = "0.8"
 libm = "0.2"
 portable-atomic = { version = "1", features = ["critical-section"] }
+
+# Mirror the firmware's rp2354 feature so cfg(feature = "rp2354") in shared
+# source files (config.rs) is "known" to cargo and doesn't trip
+# `unexpected_cfgs`. The flag stays off here — host tests always build the
+# RP2350 (default) branch of the config.
+[features]
+rp2354 = []

@@ -70,6 +70,7 @@ const BASE_LAT: i32 = 259_664_430;
 const BASE_LON: i32 = -801_223_710;
 
 /// ~100m north delta (1 degree lat ≈ 111320m, so 100m ≈ 0.000898° ≈ 8984 in 1e-7)
+#[allow(dead_code)]
 const DELTA_100M_LAT: i32 = 8_984;
 
 /// ~2001m north (just over TELEPORT_M=2000m)
