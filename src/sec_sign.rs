@@ -4,6 +4,7 @@
 //! Pure Rust implementation using p192 primitives
 
 use crate::config::DroneModel;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use hmac::{Hmac, Mac};
 use p192::elliptic_curve::group::GroupEncoding;
 use p192::{ProjectivePoint, Scalar};
@@ -45,27 +46,37 @@ pub const PRIVATE_KEY_MAVIC3PRO: [u8; 24] = [
 #[allow(dead_code)]
 pub const PRIVATE_KEY: [u8; 24] = PRIVATE_KEY_AIR3;
 
-/// Flash-loaded key (set once at boot, read-only after)
-/// Safety: Written once in main() before any tasks start, read-only after.
-static mut FLASH_KEY_STORAGE: Option<[u8; 24]> = None;
+/// Flash-loaded key storage: 24 bytes + presence flag.
+///
+/// Lock-free latched init — written once via `set_flash_key()` in `main()`
+/// before any tasks start, then read-only forever. AtomicBool with
+/// Release/Acquire pairing guarantees readers see all 24 bytes if they see
+/// HAS_FLASH_KEY=true.
+static FLASH_KEY: [AtomicU8; 24] = [const { AtomicU8::new(0) }; 24];
+static HAS_FLASH_KEY: AtomicBool = AtomicBool::new(false);
 
 /// Set the flash-loaded key. Call once at boot, before tasks start.
-/// # Safety
-/// Must be called before any tasks access get_private_key()
-pub unsafe fn set_flash_key(key: [u8; 24]) {
-    FLASH_KEY_STORAGE = Some(key);
+pub fn set_flash_key(key: [u8; 24]) {
+    for (slot, &byte) in FLASH_KEY.iter().zip(key.iter()) {
+        slot.store(byte, Ordering::Relaxed);
+    }
+    HAS_FLASH_KEY.store(true, Ordering::Release);
 }
 
 /// Check if a flash-loaded key is set.
 pub fn has_flash_key() -> bool {
-    unsafe { FLASH_KEY_STORAGE.is_some() }
+    HAS_FLASH_KEY.load(Ordering::Acquire)
 }
 
 /// Get private key for specified drone model.
 /// Returns flash-stored key if available, otherwise falls back to hardcoded constants.
 pub fn get_private_key(model: DroneModel) -> [u8; 24] {
     // Flash key overrides hardcoded keys
-    if let Some(key) = unsafe { FLASH_KEY_STORAGE } {
+    if HAS_FLASH_KEY.load(Ordering::Acquire) {
+        let mut key = [0u8; 24];
+        for (i, slot) in FLASH_KEY.iter().enumerate() {
+            key[i] = slot.load(Ordering::Relaxed);
+        }
         return key;
     }
     match model {

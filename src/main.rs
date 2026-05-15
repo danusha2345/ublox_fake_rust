@@ -659,7 +659,7 @@ async fn main(spawner: Spawner) {
             info!("Loaded extracted private key from flash:");
             info!("  key[0..12]:  {:02x}", &key[..12]);
             info!("  key[12..24]: {:02x}", &key[12..24]);
-            unsafe { sec_sign::set_flash_key(key); }
+            sec_sign::set_flash_key(key);
         } else {
             info!("No extracted key in flash (using hardcoded)");
         }
@@ -671,7 +671,7 @@ async fn main(spawner: Spawner) {
             } else {
                 error!("BOOT [{}ms]: FAILED to save extracted key!", boot_t0.elapsed().as_millis());
             }
-            unsafe { sec_sign::set_flash_key(*key); }
+            sec_sign::set_flash_key(*key);
         }
     };
 
