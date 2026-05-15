@@ -1063,3 +1063,127 @@ fn test_all_nav_messages_spoof_replacement_with_offset() {
     assert_eq!(read_i32_le(&sol, 6 + 16), rep_ey);
     assert_eq!(read_i32_le(&sol, 6 + 20), rep_ez);
 }
+
+// ============================================================================
+// Group 7: apply_offset boundary cases — i32 overflow and out-of-range LLH
+// ============================================================================
+//
+// `apply_offset_nav_pvt` / `apply_offset_nav_posllh` use `saturating_add` on the
+// raw i32 lat/lon/alt fields. These tests pin down that behavior so a future
+// refactor doesn't silently switch to wrapping_add (which would map e.g.
+// i32::MAX + 1 to i32::MIN and produce coordinates on the wrong side of the
+// planet).
+//
+// Note: the firmware operates in DJI ranges (~Florida → Michigan, ±100° lon
+// total) where saturation never triggers in practice. These tests cover the
+// invariant, not a real flight scenario.
+
+/// saturating_add clamps lat/lon/alt to i32::MAX instead of wrapping.
+#[test]
+fn test_apply_offset_nav_pvt_saturates_on_overflow() {
+    let near_max = i32::MAX - 100;
+    let mut frame = build_nav_pvt_frame(near_max, near_max, near_max, 3, 12);
+    let off = DynamicOffset {
+        lat_1e7: 10_000,
+        lon_1e7: 10_000,
+        alt_mm: 10_000,
+    };
+
+    apply_offset_nav_pvt(&mut frame, &off);
+
+    assert_eq!(read_i32_le(&frame, 6 + 24), i32::MAX, "lon must saturate, not wrap");
+    assert_eq!(read_i32_le(&frame, 6 + 28), i32::MAX, "lat must saturate, not wrap");
+    assert_eq!(read_i32_le(&frame, 6 + 32), i32::MAX, "height must saturate, not wrap");
+    assert_eq!(read_i32_le(&frame, 6 + 36), i32::MAX, "hMSL must saturate, not wrap");
+}
+
+/// saturating_add clamps to i32::MIN on negative overflow.
+#[test]
+fn test_apply_offset_nav_pvt_saturates_on_underflow() {
+    let near_min = i32::MIN + 100;
+    let mut frame = build_nav_pvt_frame(near_min, near_min, near_min, 3, 12);
+    let off = DynamicOffset {
+        lat_1e7: -10_000,
+        lon_1e7: -10_000,
+        alt_mm: -10_000,
+    };
+
+    apply_offset_nav_pvt(&mut frame, &off);
+
+    assert_eq!(read_i32_le(&frame, 6 + 24), i32::MIN, "lon must saturate downwards");
+    assert_eq!(read_i32_le(&frame, 6 + 28), i32::MIN, "lat must saturate downwards");
+    assert_eq!(read_i32_le(&frame, 6 + 32), i32::MIN, "height must saturate downwards");
+    assert_eq!(read_i32_le(&frame, 6 + 36), i32::MIN, "hMSL must saturate downwards");
+}
+
+/// apply_offset is purely linear on the i32 field — it does NOT renormalize
+/// across the ±180° lon meridian. Past 180° the result is geographically
+/// nonsense but stays a finite i32 value (no wrap to negative).
+///
+/// This pins the contract: callers are responsible for choosing offsets that
+/// keep the result inside the valid UBX range. In production both
+/// `default_position` and `offset_target` sit at ~−80° lon, so the result is
+/// always in-range.
+#[test]
+fn test_apply_offset_nav_pvt_does_not_normalize_across_180_meridian() {
+    // lat=0, lon=170° (1.7e9). 170° + 20° = 190° linearly (1.9e9 < i32::MAX).
+    let lon_170 = 1_700_000_000i32;
+    let mut frame = build_nav_pvt_frame(0, lon_170, BASE_ALT, 3, 12);
+    let off = DynamicOffset { lat_1e7: 0, lon_1e7: 200_000_000, alt_mm: 0 };
+
+    apply_offset_nav_pvt(&mut frame, &off);
+
+    assert_eq!(
+        read_i32_le(&frame, 6 + 24),
+        1_900_000_000,
+        "lon must remain linear at 190° (no ±180° normalization)"
+    );
+}
+
+/// Same linearity contract for latitude — past 90° the value is geographically
+/// nonsense but stays linear (no clamping at the poles).
+#[test]
+fn test_apply_offset_nav_pvt_does_not_clamp_at_poles() {
+    // lat=89° (8.9e8), offset +5° → 94° (9.4e8). Both well inside i32 range.
+    let lat_89 = 890_000_000i32;
+    let mut frame = build_nav_pvt_frame(lat_89, BASE_LON, BASE_ALT, 3, 12);
+    let off = DynamicOffset { lat_1e7: 50_000_000, lon_1e7: 0, alt_mm: 0 };
+
+    apply_offset_nav_pvt(&mut frame, &off);
+
+    assert_eq!(
+        read_i32_le(&frame, 6 + 28),
+        940_000_000,
+        "lat must remain linear at 94° (no clamp at +90°)"
+    );
+}
+
+/// apply_offset_nav_posllh uses the same saturating_add semantics.
+#[test]
+fn test_apply_offset_nav_posllh_saturates_on_overflow() {
+    let near_max = i32::MAX - 50;
+    let mut frame = build_nav_posllh_frame(near_max, near_max, near_max);
+    let off = DynamicOffset { lat_1e7: 100, lon_1e7: 100, alt_mm: 100 };
+
+    apply_offset_nav_posllh(&mut frame, &off);
+
+    assert_eq!(read_i32_le(&frame, 6 + 4),  i32::MAX, "POSLLH lon must saturate");
+    assert_eq!(read_i32_le(&frame, 6 + 8),  i32::MAX, "POSLLH lat must saturate");
+    assert_eq!(read_i32_le(&frame, 6 + 12), i32::MAX, "POSLLH height must saturate");
+    assert_eq!(read_i32_le(&frame, 6 + 16), i32::MAX, "POSLLH hMSL must saturate");
+}
+
+/// Zero offset must be an identity — defends against future "optimization"
+/// that skips the function on Some(off) without checking its values.
+#[test]
+fn test_apply_offset_nav_pvt_zero_offset_is_identity() {
+    let mut frame = build_nav_pvt_frame(BASE_LAT, BASE_LON, BASE_ALT, 3, 12);
+    let off = DynamicOffset { lat_1e7: 0, lon_1e7: 0, alt_mm: 0 };
+
+    apply_offset_nav_pvt(&mut frame, &off);
+
+    assert_eq!(read_i32_le(&frame, 6 + 24), BASE_LON);
+    assert_eq!(read_i32_le(&frame, 6 + 28), BASE_LAT);
+    assert_eq!(read_i32_le(&frame, 6 + 32), BASE_ALT);
+    assert_eq!(read_i32_le(&frame, 6 + 36), BASE_ALT);
+}
