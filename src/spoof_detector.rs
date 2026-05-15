@@ -36,6 +36,8 @@ pub mod thresholds {
     pub const MAX_SPEED_MS: f32 = 30.0;
 
     /// Maximum realistic vertical speed in m/s (15 m/s for aggressive maneuvers)
+    /// Kept for future use — current detector folds altitude into `TELEPORT_ALT_M`.
+    #[allow(dead_code)]
     pub const MAX_VERTICAL_SPEED_MS: f32 = 15.0;
 
     /// Maximum realistic acceleration in m/s² (20 m/s² = ~2G)
