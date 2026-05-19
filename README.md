@@ -37,7 +37,7 @@ https://github.com/user-attachments/assets/009fe2d5-b790-4971-bd18-5e043e086aaa
   - RP2350A: внешняя QSPI flash
   - RP2354A: 2 МБ встроенной flash (рекомендуется)
 - **Flash**: 4 МБ (RP2350, внешняя QSPI) / 2 МБ (RP2354, встроенная)
-- **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (921600 бод)
+- **UART0**: TX=GPIO0, RX=GPIO1 — к дрону/хосту (460800 бод)
 - **UART1**: RX=GPIO5 — от внешнего GNSS модуля (для passthrough)
 - **LED RP2350**: WS2812B на GPIO25 (цветовая индикация)
 - **LED RP2354**: Simple GPIO LED на GPIO11/GPIO12 (blink code индикация)
@@ -241,7 +241,7 @@ LED индикация в режиме Emulation:
 
 Реализация: `spoof_detector.rs` (алгоритмы), `passthrough.rs` (UBX парсер, модификация)
 
-### PassthroughRaw (LED пурпурный)
+### PassthroughRaw (LED белый)
 
 Полностью прозрачная ретрансляция данных без какой-либо обработки:
 - Вход: UART1 RX (GPIO5) от реального GNSS
@@ -293,7 +293,7 @@ ECEF-координаты пересчитываются на каждом фр�
 - **Индикация LED (RP2350 — WS2812B цветной)**:
   - Зелёный/жёлтый — Emulation (жёлтый = спутники невалидны)
   - Синий — Passthrough
-  - Пурпурный — PassthroughRaw
+  - Белый — PassthroughRaw
   - Белый — PassthroughOffset
   - Янтарный — PassthroughOffsetNoRecovery
   - Быстро моргающий красный — спуфинг обнаружен
@@ -477,7 +477,7 @@ A4 20 01
 
 ```rust
 // UART baudrate
-pub const DEFAULT_BAUDRATE: u32 = 921600;
+pub const DEFAULT_BAUDRATE: u32 = 460800;
 
 // Тайминги
 pub const NAV_MEAS_PERIOD_MS: u32 = 200;  // 5Hz

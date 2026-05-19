@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 /// Default UART baudrate
-pub const DEFAULT_BAUDRATE: u32 = 921600;
+pub const DEFAULT_BAUDRATE: u32 = 460800;
 
 /// Flash memory size in bytes
 #[cfg(not(feature = "rp2354"))]
