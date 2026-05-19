@@ -15,7 +15,7 @@
 └─────────────────────────────────────┘
 ```
 
-**Baudrate**: 460800 бод (8N1).
+**Baudrate**: 921600 бод (8N1).
 
 LED:
 - RP2350: WS2812B на GPIO25.
@@ -41,7 +41,7 @@ LED:
 RP2350:
 - Зелёный/жёлтый blink — Emulation; жёлтый после 20 секунд, когда спутники становятся невалидными.
 - Синий blink — Passthrough.
-- Белый blink — PassthroughRaw.
+- Пурпурный blink — PassthroughRaw.
 - Белый blink — PassthroughOffset.
 - Янтарный короткий blink — PassthroughOffsetNoRecovery.
 - Быстрый красный blink — spoof detected в processed passthrough режимах.

@@ -25,8 +25,6 @@ mod version {
     include!(concat!(env!("OUT_DIR"), "/version.rs"));
 }
 
-const FLASH_SETTINGS_VERSION: &str = "raw460800-v1";
-
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use defmt::*;
 use defmt_rtt as _;
@@ -373,7 +371,7 @@ fn log_stored_valset() {
     diag_valset_store::log_stored();
 }
 
-/// Current operating mode (default = PassthroughRaw)
+/// Current operating mode (0 = Emulation, 1 = Passthrough)
 static MODE: AtomicU8 = AtomicU8::new(2);
 
 /// NAV message measurement period in milliseconds (default from config)
@@ -626,22 +624,8 @@ async fn main(spawner: Spawner) {
     {
         let mut flash = flash_mutex.lock().await;
 
-        let stored_version = flash_storage::load_version(&mut flash);
-        let settings_profile_changed = stored_version
-            .as_ref()
-            .map_or(true, |stored| stored.as_str() != FLASH_SETTINGS_VERSION);
-
-        // Load operating mode. On a newly flashed firmware build, force the
-        // known-safe default so stale flash mode from the previous build does
-        // not select a different mode at the bench.
-        if settings_profile_changed {
-            OperatingMode::PassthroughRaw.store();
-            if flash_storage::save_mode(&mut flash, OperatingMode::PassthroughRaw as u8).await {
-                info!("Settings profile changed, defaulting mode to PassthroughRaw");
-            } else {
-                warn!("Failed to save default PassthroughRaw mode after settings profile change");
-            }
-        } else if let Some(mode_byte) = flash_storage::load_mode(&mut flash) {
+        // Load operating mode
+        if let Some(mode_byte) = flash_storage::load_mode(&mut flash) {
             let mode = match mode_byte {
                 0 => OperatingMode::Emulation,
                 1 => OperatingMode::Passthrough,
@@ -653,11 +637,9 @@ async fn main(spawner: Spawner) {
             mode.store();
             info!("Loaded mode {} from flash: {:?}", mode_byte, mode);
         } else {
-            info!("No saved mode, defaulting to PassthroughRaw");
-            OperatingMode::PassthroughRaw.store();
-            if !flash_storage::save_mode(&mut flash, OperatingMode::PassthroughRaw as u8).await {
-                warn!("Failed to save default PassthroughRaw mode");
-            }
+            // No saved mode, default to Passthrough
+            info!("No saved mode, defaulting to Passthrough");
+            OperatingMode::Passthrough.store();
         }
 
         // Load drone model from flash (if set via button)
@@ -670,8 +652,7 @@ async fn main(spawner: Spawner) {
 
         // Save firmware version to flash (skips write if unchanged)
         info!("Firmware version: {}", version::FW_VERSION);
-        info!("Flash settings profile: {}", FLASH_SETTINGS_VERSION);
-        flash_storage::save_version(&mut flash, FLASH_SETTINGS_VERSION);
+        flash_storage::save_version(&mut flash, version::FW_VERSION);
 
         // Load previously extracted key from flash (if any)
         if let Some(key) = flash_storage::load_key(&mut flash) {
@@ -971,9 +952,9 @@ async fn led_task(
                 }
             }
             OperatingMode::PassthroughRaw => {
-                // Raw passthrough (no spoof detection): white (blink every 5 ticks = 500ms)
+                // Raw passthrough (no spoof detection): purple (blink every 5 ticks = 500ms)
                 if blink_counter % 5 < 3 {
-                    RGB8::new(20, 20, 20)  // White
+                    RGB8::new(20, 0, 30)  // Purple
                 } else {
                     RGB8::new(0, 0, 0)    // Off
                 }
@@ -1499,7 +1480,8 @@ async fn diag_stats_task() {
     }
 }
 
-fn calculate_uart_baud_dividers(baudrate: u32) -> (u16, u8) {
+/// Set UART0 baudrate using direct register access
+fn set_uart0_baudrate(baudrate: u32) {
     let clk_peri = embassy_rp::clocks::clk_peri_freq();
     let baud_rate_div = (8 * clk_peri) / baudrate;
     let mut baud_ibrd = baud_rate_div >> 7;
@@ -1513,12 +1495,6 @@ fn calculate_uart_baud_dividers(baudrate: u32) -> (u16, u8) {
         baud_fbrd = 0;
     }
 
-    (baud_ibrd as u16, baud_fbrd as u8)
-}
-
-/// Set UART0 baudrate using direct register access
-fn set_uart0_baudrate(baudrate: u32) {
-    let (baud_ibrd, baud_fbrd) = calculate_uart_baud_dividers(baudrate);
     let r = rp_pac::UART0;
 
     // Wait for UART to finish transmitting
@@ -1542,33 +1518,6 @@ fn set_uart0_baudrate(baudrate: u32) {
     });
 }
 
-/// Set UART1 baudrate using direct register access
-fn set_uart1_baudrate(baudrate: u32) {
-    let (baud_ibrd, baud_fbrd) = calculate_uart_baud_dividers(baudrate);
-    let r = rp_pac::UART1;
-
-    // Disable UART before touching divisor registers.
-    r.uartcr().write(|w| w.set_uarten(false));
-
-    r.uartibrd().write(|w| w.set_baud_divint(baud_ibrd));
-    r.uartfbrd().write(|w| w.set_baud_divfrac(baud_fbrd));
-
-    // Dummy write to latch new baud rate
-    r.uartlcr_h().modify(|_| {});
-
-    // Re-enable UART1 RX path. TX exists only because BufferedUart requires it.
-    r.uartcr().write(|w| {
-        w.set_uarten(true);
-        w.set_rxe(true);
-        w.set_txe(true);
-    });
-}
-
-fn apply_uart_baudrate(baudrate: u32) {
-    set_uart0_baudrate(baudrate);
-    set_uart1_baudrate(baudrate);
-}
-
 /// UART0 RX task - receives and processes UBX commands from drone
 /// Runs in BOTH modes to preserve settings during hot-switch
 #[embassy_executor::task]
@@ -1580,7 +1529,7 @@ async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
         // Check for pending baudrate change
         if let Some(new_baudrate) = BAUDRATE_CHANGE.try_take() {
             info!("Applying baudrate change to {}", new_baudrate);
-            apply_uart_baudrate(new_baudrate);
+            set_uart0_baudrate(new_baudrate);
         }
 
         match rx.read(&mut buf).await {
@@ -1595,7 +1544,7 @@ async fn uart0_rx_task(mut rx: embassy_rp::uart::BufferedUartRx) {
                 // Apply baudrate change after processing commands
                 if let Some(new_baudrate) = BAUDRATE_CHANGE.try_take() {
                     info!("Applying baudrate change to {}", new_baudrate);
-                    apply_uart_baudrate(new_baudrate);
+                    set_uart0_baudrate(new_baudrate);
                 }
             }
             Ok(_) => {}
@@ -2634,7 +2583,7 @@ async fn sec_sign_timer_task() {
 
 /// Mode button task - hot-switches mode without reboot
 /// Выбор режима по количеству коротких нажатий:
-/// 1 нажатие → Emulation (зелёный), 2 → Passthrough (синий), 3 → PassthroughRaw (белый)
+/// 1 нажатие → Emulation (зелёный), 2 → Passthrough (синий), 3 → PassthroughRaw (фиолетовый)
 /// 4 нажатия → PassthroughOffset (белый), 5 → выбор модели дрона (cyan), 6 → PassthroughOffsetNoRecovery
 /// Использует RP2350-E9 Errata Workaround (Input Latch-up fix)
 #[embassy_executor::task]

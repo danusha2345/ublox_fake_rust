@@ -105,7 +105,7 @@ Passthrough (35 tests):
 ### Core1 Tasks
 | Task | Purpose |
 |------|---------|
-| `led_task` (RP2350) | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, white=raw/offset, amber=no-recovery, red=spoof) |
+| `led_task` (RP2350) | WS2812 LED blinking (green/yellow=emulation, blue=passthrough, purple=raw, white=offset, amber=no-recovery, red=spoof) |
 | `simple_led_task` (RP2354) | GPIO LED blink code (1-4/6 blinks = mode, fast blink = spoof) |
 | `sec_sign_compute_task` | ECDSA signature computation (~59ms per signature) |
 | `sec_sign_timer_task` | Waits for FIRST_CONFIG_MILLIS or 2s fallback, then first_delay → immediate first SEC-SIGN → period ticker (moved from Core0 to avoid UART interrupt starvation) |
@@ -126,7 +126,7 @@ Passthrough (35 tests):
 |------|----|-----|-----------------|-------------|
 | Emulation | 0 | green→yellow | No analyzer | Protects by replacing the GNSS source with generated NAV + SEC-SIGN; no real coordinates |
 | Passthrough | 1 | blue | Yes | Forwards real GNSS data |
-| PassthroughRaw | 2 | white | No | Pure transparent forwarding |
+| PassthroughRaw | 2 | purple | No | Pure transparent forwarding |
 | PassthroughOffset | 3 | white | Yes | Passthrough + coordinate offset |
 | PassthroughOffsetNoRecovery | 4 | amber | Yes, latched | PassthroughOffset without clearing `SPOOF_DETECTED` on clean/recovery data |
 
@@ -366,13 +366,13 @@ After 20 seconds from NAV output start, satellites become invalid (fix_type=0, n
 ## Hardware Pins
 
 ### RP2350A — SpotPear RP2350-Core-A (default)
-- UART0: TX=GPIO0, RX=GPIO1 (460800 baud, к дрону/хосту)
+- UART0: TX=GPIO0, RX=GPIO1 (921600 baud, к дрону/хосту)
 - UART1: RX=GPIO5 (от внешнего GNSS для passthrough)
 - WS2812B LED: GPIO25 (PIO0)
 - Mode button: GPIO14 (input), GPIO13 (power)
 
 ### RP2354A (`--features rp2354`)
-- UART0: TX=GPIO0, RX=GPIO1 (460800 baud)
+- UART0: TX=GPIO0, RX=GPIO1 (921600 baud)
 - UART1: RX=GPIO5 (passthrough)
 - Simple GPIO LED: GPIO11 (анод), GPIO12 (катод/земля)
 - Mode button: GPIO14 (input), GPIO13 (power)
