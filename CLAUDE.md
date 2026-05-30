@@ -31,7 +31,7 @@ make rp2350                           # Build UF2 for RP2350
 make rp2354                           # Build UF2 for RP2354
 make flash                            # Flash via probe-rs (RP2350)
 make flash-rp2354                     # Flash via probe-rs (RP2354)
-make test                             # Run all 130 host-side tests
+make test                             # Run all 139 host-side tests
 
 cargo rb                              # run release binary (alias)
 cargo rp2350                          # build ELF only (alias)
@@ -43,15 +43,15 @@ cargo rp2354                          # build ELF only (alias)
 `spoof_detector.rs` — чистая логика (без зависимостей от embassy/cortex-m), может тестироваться на хосте через `tests_host/`.
 
 ```bash
-cd tests_host && cargo test            # All 130 tests
+cd tests_host && cargo test            # All 139 tests
 cd tests_host && cargo test vuln       # Только регрессионные тесты
 ```
 
 **Структура**: `tests_host/` — standalone-крейт (НЕ в workspace) с `defmt_mock/` (no-op макросы) и `#[path]` к `../../src/spoof_detector.rs`.
 
-**Группы тестов** (130 тестов — 87 spoof_detector + 35 passthrough + 8 coordinates):
+**Группы тестов** (139 тестов — 89 spoof_detector + 42 passthrough + 8 coordinates):
 
-Spoof detector (87 тестов):
+Spoof detector (89 тестов):
 | Группа | Тесты | Покрытие |
 |--------|-------|----------|
 | 0: Утилиты | 8 | GnssTime, calc_distance, FixType |
@@ -59,9 +59,9 @@ Spoof detector (87 тестов):
 | 2: Телепортация | 5 | порог >2km, все направления |
 | 3: Скорость | 2 | граница 31 vs 29 m/s |
 | 4: GNSS time | 6 | forward/backward jumps, warmup suppression |
-| 5: Clock drift | 5 | calibration, порог 10s, recovery |
+| 5: Clock drift | 6 | calibration, порог 10s, recovery |
 | 6: Recovery | 9 | coord (5+1 samples), time (immediate), warmup |
-| 7: Gap handling | 6 | gap >5s, gap+teleport/drift/time |
+| 7: Gap handling | 8 | gap >5s, gap+teleport/drift/time, gap-aware time (чистый гэп ≠ спуф) |
 | 8: Регрессии | 6 | март 2026 vulns: immediate detect, last_good guard |
 | 9: last_good | 4 | Invariant: заморожен при spoof, переживает recovery |
 | 10: Complex | 4 | Циклы spoof/recovery, реалистичная атака |
@@ -70,15 +70,16 @@ Spoof detector (87 тестов):
 | 13: Leash+altitude | 5 | Постепенный drift, leash freeze, altitude jump |
 | 14: Satellite loss | 12 | Циклы потеря+spoof+recovery, gap thresholds, NoFix persistence |
 
-Passthrough (35 тестов):
+Passthrough (42 теста):
 | Группа | Тесты | Покрытие |
 |--------|-------|----------|
-| 1: UBX parser | 6 | Парсинг кадра, checksum, split-кадры |
+| 1: UBX parser | 7 | Парсинг кадра, checksum, split-кадры, resync на B5 B5 |
 | 2: Offset+ECEF | 8 | LLH offset, ECEF замена, round-trip |
 | 3: Spoof modify | 5 | Замена координат, velocity zero, status degrade |
 | 4: Extract+Buffer | 3 | Извлечение позиции, ring PositionBuffer |
 | 5: Buffer fix_type | 5 | Фильтрация no-fix, stale/fresh entry guards, corruption demo |
 | 6: Dynamic offset | 8 | Пересчёт offset, spoofed-base баг, full pipeline |
+| 7: Offset boundary | 6 | apply_offset: i32 overflow, out-of-range LLH |
 
 **Замечание**: для coord recovery нужно 6 samples (не 5) — возврат из spoofed позиции — сам по себе телепорт, который сбрасывает normal_count.
 
