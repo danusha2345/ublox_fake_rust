@@ -308,9 +308,10 @@ pub async fn auto_extract(
 // ============================================================================
 
 fn find_cfg41_in_buffer(data: &[u8]) -> Option<[u8; KEY_LEN]> {
-    let min_frame_len = 6 + EXPECTED_PAYLOAD_LEN + 2; // 264
-
-    for i in 0..data.len().saturating_sub(min_frame_len) {
+    // Scan to the last position where a 6-byte header still fits; the existing
+    // `frame_end > data.len()` guard below rejects an incomplete payload. Using the
+    // full 264-byte frame as the bound skipped a buffer holding exactly one frame.
+    for i in 0..data.len().saturating_sub(5) {
         if data[i] != 0xB5 || data[i + 1] != 0x62 {
             continue;
         }

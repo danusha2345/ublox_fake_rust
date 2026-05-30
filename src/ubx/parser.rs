@@ -124,6 +124,9 @@ impl UbxParser {
             ParserState::Sync2 => {
                 if byte == SYNC2 {
                     self.state = ParserState::Class;
+                } else if byte == SYNC1 {
+                    // Back-to-back 0xB5: stay in Sync2 and treat this byte as a new
+                    // frame start (handles `B5 B5 62 ...`) instead of discarding it.
                 } else {
                     self.reset();
                 }

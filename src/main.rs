@@ -385,7 +385,7 @@ static NAV_TIMEREF: AtomicU8 = AtomicU8::new(0);
 
 /// Drone model for SEC-SIGN key selection (0=Air3, 1=Mavic4Pro, 2=Air3S, 3=Mavic3Pro)
 /// Default is Air 3S. Auto-detection skipped when Air 3S is set manually.
-static DRONE_MODEL: AtomicU8 = AtomicU8::new(0); // Air3 (default)
+static DRONE_MODEL: AtomicU8 = AtomicU8::new(2); // Air3S (default — matches comment & startup blink)
 
 
 /// Model selection mode active (for LED feedback: cyan blinking)
@@ -1959,7 +1959,10 @@ fn send_nak(cls_id: u8, msg_id: u8) {
 
 /// Send a UBX message (for poll responses)
 fn send_ubx_message<M: UbxMessage>(msg: &M) {
-    let mut buf = [0u8; 256];
+    // Sized to the largest UBX frame this emits: CFG-0x41 is 6+256+2 = 264 bytes.
+    // A 256-byte buffer made build() return 0 (264 > 256), silently dropping the
+    // CFG-0x41 poll response. Match TX_CHANNEL's Vec capacity so nothing is dropped.
+    let mut buf = [0u8; 1280];
     let len = msg.build(&mut buf);
     if len > 0 {
         let mut vec = heapless::Vec::new();

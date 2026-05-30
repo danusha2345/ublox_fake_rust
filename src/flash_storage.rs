@@ -41,7 +41,9 @@ impl Default for ModeData {
 
 /// Save mode to flash. Returns true on success, false on error.
 pub async fn save_mode(flash: &mut Flash<'_, FLASH, Async, { crate::config::FLASH_SIZE_BYTES }>, mode: u8) -> bool {
-    let mut data = [0u8; ERASE_SIZE];
+    // 0xFF fill (erased-flash state) like the other save_* helpers — only the 8-byte
+    // header is programmed, the rest stays erased instead of being needlessly zeroed.
+    let mut data = [0xFFu8; ERASE_SIZE];
 
     // Prepare data
     let mode_data = ModeData {
@@ -318,8 +320,13 @@ pub fn load_and_clear_extract_request(flash: &mut Flash<'_, FLASH, Async, { crat
     if flash.blocking_read(EXTRACT_REQUEST_FLASH_OFFSET, &mut buf).is_ok() {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic == EXTRACT_REQUEST_MAGIC {
-            // Clear the flag by erasing the sector
-            let _ = flash.blocking_erase(EXTRACT_REQUEST_FLASH_OFFSET, EXTRACT_REQUEST_FLASH_OFFSET + ERASE_SIZE as u32);
+            // Clear the flag by erasing the sector. If the erase fails the flag stays
+            // set and would re-trigger extraction every boot, so don't claim success —
+            // surface the error and match the sibling save_* error handling.
+            if flash.blocking_erase(EXTRACT_REQUEST_FLASH_OFFSET, EXTRACT_REQUEST_FLASH_OFFSET + ERASE_SIZE as u32).is_err() {
+                warn!("Key extraction request found but erase failed to clear it");
+                return false;
+            }
             info!("Key extraction request found and cleared");
             return true;
         }

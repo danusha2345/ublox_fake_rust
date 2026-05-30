@@ -230,6 +230,27 @@ fn test_parser_valid_nav_pvt() {
     assert!(verify_checksum(&parsed));
 }
 
+/// A stray 0xB5 immediately before a valid frame must not desync the parser:
+/// `B5 | B5 62 ...` should still parse (regression for back-to-back sync bytes).
+#[test]
+fn test_parser_stray_sync1_before_frame() {
+    let frame = build_nav_pvt_frame(BASE_LAT, BASE_LON, BASE_ALT, 3, 12);
+    let mut parser = UbxFrameParser::new();
+
+    // Stray 0xB5 noise byte, then the real frame (which also starts with 0xB5).
+    let mut result = None;
+    let _ = parser.feed(0xB5);
+    for &b in frame.iter() {
+        if let Some(f) = parser.feed(b) {
+            result = Some(f);
+        }
+    }
+
+    let parsed = result.expect("frame after a stray 0xB5 must still parse");
+    assert_eq!(&parsed[..], &frame[..]);
+    assert!(verify_checksum(&parsed));
+}
+
 /// Two frames fed in sequence are both parsed correctly.
 #[test]
 fn test_parser_two_frames_in_sequence() {

@@ -96,6 +96,11 @@ impl UbxFrameParser {
                     self.buffer[1] = byte;
                     self.len = 2;
                     self.state = ParseState::WaitClass;
+                } else if byte == 0xB5 {
+                    // Back-to-back 0xB5: this byte is a new candidate frame start;
+                    // stay in WaitSync2 instead of discarding it (handles `B5 B5 62`).
+                    self.buffer[0] = byte;
+                    self.len = 1;
                 } else {
                     self.reset();
                 }
