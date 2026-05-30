@@ -927,6 +927,53 @@ fn test_gap_plus_time_jump() {
 }
 
 #[test]
+fn test_gap_clean_with_advancing_time_not_spoofed() {
+    // Regression: a legitimate GPS outage (tunnel, bridge, brief module reboot)
+    // longer than MAX_GAP_MS advances real GNSS time by the gap duration. That
+    // natural advance must NOT be mistaken for a forward time jump. Before the
+    // gap-aware fix in check_gnss_time this latched Spoofed on every outage >~6s.
+    let mut det = SpoofDetector::new();
+    let base_gt = gnss_time(2026, 3, 15, 12, 0, 0, 1000);
+    let (t, last_gt) = feed_warmup_with_time(&mut det, BASE_LAT, BASE_LON, 1000, base_gt);
+
+    // 8s gap, same position, GNSS time advanced by the elapsed 8s (legitimate).
+    let after_gap_ms = t + 8000;
+    let resumed_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                               last_gt.hour, last_gt.min,
+                               last_gt.sec + 8, after_gap_ms);
+    let r = det.analyze(pos_with_time(BASE_LAT, BASE_LON, after_gap_ms, resumed_gt));
+    assert_ne!(r, AnalysisResult::Spoofed,
+        "legitimate 8s GPS gap with naturally-advanced time must NOT be Spoofed");
+
+    // Following normal frame stays Normal — no lingering latch.
+    let t2 = after_gap_ms + 200;
+    let next_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                            last_gt.hour, last_gt.min,
+                            last_gt.sec + 8, t2);
+    let r2 = det.analyze(pos_with_time(BASE_LAT, BASE_LON, t2, next_gt));
+    assert_eq!(r2, AnalysisResult::Normal,
+        "frame after a clean gap must be Normal, not a lingering spoof");
+}
+
+#[test]
+fn test_gap_plus_excess_forward_time_detected() {
+    // A spoofer that captures the module during a gap and sets GNSS time far beyond
+    // the elapsed real time must still be detected — gap-awareness must not blind us.
+    let mut det = SpoofDetector::new();
+    let base_gt = gnss_time(2026, 3, 15, 12, 0, 0, 1000);
+    let (t, last_gt) = feed_warmup_with_time(&mut det, BASE_LAT, BASE_LON, 1000, base_gt);
+
+    // 8s gap, but GNSS time jumps 38s forward (30s beyond elapsed → unrealistic).
+    let after_gap_ms = t + 8000;
+    let spoof_gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                             last_gt.hour, last_gt.min,
+                             last_gt.sec + 38, after_gap_ms);
+    let r = det.analyze(pos_with_time(BASE_LAT, BASE_LON, after_gap_ms, spoof_gt));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "forward time jump 30s beyond elapsed must still be detected after a gap");
+}
+
+#[test]
 fn test_gap_does_not_update_last_good() {
     let mut det = SpoofDetector::new();
     let t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);

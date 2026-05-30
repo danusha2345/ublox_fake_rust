@@ -65,8 +65,10 @@ pub mod thresholds {
 
     // ===== Time-based detection thresholds =====
 
-    /// Maximum realistic GNSS time jump forward in seconds (5s)
-    /// Must be >= MAX_GAP_MS/1000 to avoid false positives from brief GPS gaps
+    /// Maximum GNSS time jump forward, in seconds, BEYOND the elapsed real time (5s).
+    /// check_gnss_time compares the GNSS advance against the elapsed system-clock time,
+    /// so a legitimate GPS gap (which advances GNSS time by ~elapsed) does not trip this;
+    /// only a jump exceeding the real elapsed time by >5s is flagged.
     pub const MAX_TIME_JUMP_FORWARD_S: i64 = 5;
 
     /// Time jump backwards threshold (even 1s backwards is suspicious)
@@ -890,13 +892,21 @@ impl SpoofDetector {
         let last_unix = last_good.to_unix_timestamp();
         let time_diff = curr_unix - last_unix;
 
+        // Elapsed real time since the reference GNSS sample, from the monotonic
+        // system clock. For back-to-back ~200ms frames this truncates to 0, so the
+        // forward check below behaves identically to a plain `time_diff > MAX`.
+        // Across a GPS gap (signal loss in a tunnel, brief module reboot) real GNSS
+        // time legitimately advances by ~elapsed; subtracting it keeps that natural
+        // advance from being mistaken for a forward time jump (false spoof).
+        let elapsed_s = (system_ms.wrapping_sub(last_good.system_time_ms) / 1000) as i64;
+
         // Check 1: Time jumped backwards (strong spoof indicator)
         // Real GPS time should never go backwards
         let time_backwards = time_diff < -thresholds::TIME_BACKWARDS_THRESHOLD_S;
 
-        // Check 2: Time jumped forward too much (unrealistic)
-        // GPS should maintain continuous time within reasonable bounds
-        let time_forward_jump = time_diff > thresholds::MAX_TIME_JUMP_FORWARD_S;
+        // Check 2: Time jumped forward MORE than the elapsed real time (unrealistic).
+        // A spoofer setting time far ahead trips this; a legitimate gap does not.
+        let time_forward_jump = (time_diff - elapsed_s) > thresholds::MAX_TIME_JUMP_FORWARD_S;
 
         let is_spoof = time_backwards || time_forward_jump;
 
