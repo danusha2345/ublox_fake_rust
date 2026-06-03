@@ -321,25 +321,25 @@ pub fn recalc_checksum(frame: &mut [u8]) {
     frame[len - 1] = ck_b;
 }
 
-/// Modify NAV-PVT (0x01 0x07): set fix_type=0, flags=0, num_sv=92
+/// Modify NAV-PVT (0x01 0x07): set fix_type=0, flags=0, num_sv=2
 /// Payload: 92 bytes, offsets: fix_type=20, flags=21, num_sv=23
-/// num_sv=92 is an impossible value (max real ~40) used as spoof marker
+/// num_sv=2 (too few sats for a valid fix) used as spoof marker
 pub fn modify_nav_pvt(frame: &mut [u8]) {
     // Frame = sync(2) + class(1) + id(1) + len(2) + payload(92) + ck(2) = 100 bytes
     if frame.len() >= 100 {
         frame[6 + 20] = 0;  // fix_type = 0 (no fix)
         frame[6 + 21] = 0;  // flags = 0
-        frame[6 + 23] = 92; // num_sv = 92 (spoof marker)
+        frame[6 + 23] = 2; // num_sv = 2 (spoof marker — too few sats for valid fix)
     }
 }
 
-/// Modify NAV-SOL (0x01 0x06): set gps_fix=0, num_sv=92
+/// Modify NAV-SOL (0x01 0x06): set gps_fix=0, num_sv=2
 /// Payload: 52 bytes, offsets: gps_fix=10, num_sv=47
 pub fn modify_nav_sol(frame: &mut [u8]) {
     // Frame = sync(2) + class(1) + id(1) + len(2) + payload(52) + ck(2) = 60 bytes
     if frame.len() >= 60 {
         frame[6 + 10] = 0;  // gps_fix = 0
-        frame[6 + 47] = 92; // num_sv = 92 (spoof marker)
+        frame[6 + 47] = 2; // num_sv = 2 (spoof marker — too few sats for valid fix)
     }
 }
 
@@ -353,21 +353,21 @@ pub fn modify_nav_status(frame: &mut [u8]) {
     }
 }
 
-/// Modify NAV-SAT (0x01 0x35): set num_svs=92
+/// Modify NAV-SAT (0x01 0x35): set num_svs=2
 /// Payload: 8 + 12*n bytes, offset: num_svs=5
 pub fn modify_nav_sat(frame: &mut [u8]) {
     // Frame header = 8 bytes minimum
     if frame.len() >= 14 {  // 6 + 8 minimum
-        frame[6 + 5] = 92;  // num_svs = 92 (spoof marker)
+        frame[6 + 5] = 2;  // num_svs = 2 (spoof marker — too few sats)
     }
 }
 
-/// Modify NAV-SVINFO (0x01 0x30): set num_ch=92
+/// Modify NAV-SVINFO (0x01 0x30): set num_ch=2
 /// Payload: 8 + 12*n bytes, offset: num_ch=4
 pub fn modify_nav_svinfo(frame: &mut [u8]) {
     // Frame header = 8 bytes minimum
     if frame.len() >= 14 {  // 6 + 8 minimum
-        frame[6 + 4] = 92;  // num_ch = 92 (spoof marker)
+        frame[6 + 4] = 2;  // num_ch = 2 (spoof marker — too few sats)
     }
 }
 
@@ -472,7 +472,7 @@ pub fn modify_nav_pvt_spoof(frame: &mut [u8], lat: i32, lon: i32, alt: i32) {
     // Degrade status
     frame[6 + 20] = 0; // fix_type = 0
     frame[6 + 21] = 0; // flags = 0
-    frame[6 + 23] = 92; // num_sv = 92 (spoof marker)
+    frame[6 + 23] = 2; // num_sv = 2 (spoof marker — too few sats for valid fix)
 }
 
 /// Modify NAV-POSLLH (0x01 0x02) during spoofing: replace coordinates + degrade accuracy
@@ -553,7 +553,7 @@ pub fn modify_nav_sol_spoof(frame: &mut [u8], ecef_x: i32, ecef_y: i32, ecef_z: 
     frame[6 + 36..6 + 40].copy_from_slice(&0i32.to_le_bytes()); // ecefVZ
     // Degrade status
     frame[6 + 10] = 0;  // gps_fix = 0
-    frame[6 + 47] = 92; // num_sv = 92 (spoof marker)
+    frame[6 + 47] = 2; // num_sv = 2 (spoof marker — too few sats for valid fix)
 }
 
 /// Extract position data from NAV-PVT payload

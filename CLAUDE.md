@@ -304,18 +304,18 @@ Emulation не запускает `SpoofDetector::analyze()`, т.к. не пот
 
 | Сообщение | Замена/деградация полей |
 |-----------|--------------------------|
-| NAV-PVT (0x07) | lon, lat, height, hMSL → LAST_GOOD; velN/E/D → 0; fix_type=0, flags=0, num_sv=92 |
+| NAV-PVT (0x07) | lon, lat, height, hMSL → LAST_GOOD; velN/E/D → 0; fix_type=0, flags=0, num_sv=2 |
 | NAV-POSLLH (0x02) | lon, lat, height, hMSL → LAST_GOOD; hAcc/vAcc → 9999999 |
 | NAV-POSECEF (0x01) | ecefX/Y/Z → LAST_GOOD_ECEF; pAcc → 9999999 |
 | NAV-HPPOSECEF (0x13) | ecefX/Y/Z → LAST_GOOD_ECEF; Hp → 0; invalidEcef; pAcc → 9999999 |
-| NAV-SOL (0x06) | ecefX/Y/Z → LAST_GOOD_ECEF; ecefVX/Y/Z → 0; gps_fix=0, num_sv=92 |
+| NAV-SOL (0x06) | ecefX/Y/Z → LAST_GOOD_ECEF; ecefVX/Y/Z → 0; gps_fix=0, num_sv=2 |
 | NAV-VELECEF (0x11) | ecefVX/Y/Z → 0; sAcc → 9999999 |
 | NAV-VELNED (0x12) | velN/E/D → 0; speed/gSpeed → 0; heading → 0; sAcc/cAcc → 9999999 |
 | NAV-STATUS (0x03) | gps_fix=0, flags=0 |
-| NAV-SAT (0x35) | num_svs=92 |
-| NAV-SVINFO (0x30) | num_ch=92 |
+| NAV-SAT (0x35) | num_svs=2 |
+| NAV-SVINFO (0x30) | num_ch=2 |
 
-`num_sv=92` — невозможное значение (реальный максимум ~40), используется как маркер spoof.
+`num_sv=2` — слишком мало спутников для валидного фикса (вместе с fix_type=0), используется как маркер spoof.
 
 **Историческое замечание (январь 2026)**: авто-детект модели через SEC-UNIQID может рейсить, потому что Mavic 4 Pro может прислать SEC-UNIQID poll до CFG-VALSET. Теперь это не контролирует штатный путь private key: `sec_sign::get_private_key()` сначала использует flash-извлечённый ключ. Выбор модели влияет в основном на тайминги NAV/SEC-SIGN, SEC-UNIQID, шаблон CFG-0x41 и hardcoded fallback ключи.
 
