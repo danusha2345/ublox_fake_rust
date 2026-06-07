@@ -27,6 +27,7 @@ fn pos(lat: i32, lon: i32, time_ms: u32) -> Position {
         pdop: 150,
         gnss_time: None,
         cno_values: heapless::Vec::new(),
+        reported_speed_mms: 0,
     }
 }
 
@@ -43,6 +44,7 @@ fn pos_with_time(lat: i32, lon: i32, time_ms: u32, gnss: GnssTime) -> Position {
         pdop: 150,
         gnss_time: Some(gnss),
         cno_values: heapless::Vec::new(),
+        reported_speed_mms: 0,
     }
 }
 
@@ -1559,6 +1561,7 @@ fn pos_with_alt(lat: i32, lon: i32, alt_mm: i32, time_ms: u32) -> Position {
         pdop: 150,
         gnss_time: None,
         cno_values: heapless::Vec::new(),
+        reported_speed_mms: 0,
     }
 }
 
@@ -1704,6 +1707,7 @@ fn pos_nofix(lat: i32, lon: i32, time_ms: u32) -> Position {
         pdop: 9999,
         gnss_time: None,
         cno_values: heapless::Vec::new(),
+        reported_speed_mms: 0,
     }
 }
 
@@ -2156,4 +2160,199 @@ fn test_anomaly_counter_through_cycles() {
     // Second spoof
     det.analyze(pos(BASE_LAT + DELTA_2001M_LAT, BASE_LON, t));
     assert!(det.total_anomalies() > after_first, "Counter should increment again after second spoof");
+}
+
+// ============================================================================
+// Group 15: CNO uniformity detection (carrier-to-noise spoof signature)
+// ============================================================================
+
+/// Build a heapless CNO vector from a slice.
+fn cno_vec(vals: &[u8]) -> heapless::Vec<u8, 16> {
+    let mut v: heapless::Vec<u8, 16> = heapless::Vec::new();
+    for &x in vals {
+        let _ = v.push(x);
+    }
+    v
+}
+
+/// Position with a 3D fix carrying explicit per-satellite CNO values.
+/// Stays at a fixed lat/lon so only the CNO path can trigger detection.
+fn pos_with_cno(lat: i32, lon: i32, time_ms: u32, cno: &[u8]) -> Position {
+    Position {
+        lat,
+        lon,
+        alt_mm: 100_000,
+        time_ms,
+        fix_type: FixType::Fix3D,
+        h_acc_mm: 1000,
+        num_sv: 12,
+        pdop: 150,
+        gnss_time: None,
+        cno_values: cno_vec(cno),
+        reported_speed_mms: 0,
+    }
+}
+
+/// Sustained uniform-high C/N0 across many used sats → spoof, even with the
+/// position perfectly still (no teleport / speed / time anomaly). This is the
+/// "no jump, situation unclear" case: detection driven purely by signal shape.
+#[test]
+fn test_cno_uniform_high_sustained_detected() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // 8 used sats sitting at ~47 dB-Hz: stddev < 1, mean > 40.
+    let uniform = [47u8, 47, 46, 47, 47, 46, 47, 47];
+    let mut result = AnalysisResult::Normal;
+    for _ in 0..(CNO_CONFIRM_COUNT as u32 + 2) {
+        result = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &uniform));
+        t += 200;
+    }
+    assert_eq!(result, AnalysisResult::Spoofed,
+        "sustained uniform-high CNO must latch spoof");
+}
+
+/// A realistic spread of C/N0 (varying elevation/atmosphere) must never trip
+/// the CNO check, no matter how long it runs.
+#[test]
+fn test_cno_realistic_spread_not_spoofed() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    let spread = [19u8, 31, 44, 27, 49, 22, 38, 35];
+    let mut result = AnalysisResult::Normal;
+    for _ in 0..40 {
+        result = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &spread));
+        t += 200;
+    }
+    assert_eq!(result, AnalysisResult::Normal,
+        "varied C/N0 spread is normal, must not be flagged");
+}
+
+/// Uniform-high C/N0 but too few used sats (< MIN_SATS_FOR_CNO_CHECK) → no
+/// detection: the variance estimate is unreliable and was false-positive prone.
+#[test]
+fn test_cno_too_few_sats_not_spoofed() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // Only 4 used sats — below the 6-sat minimum.
+    let few = [47u8, 47, 46, 47];
+    let mut result = AnalysisResult::Normal;
+    for _ in 0..40 {
+        result = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &few));
+        t += 200;
+    }
+    assert_eq!(result, AnalysisResult::Normal,
+        "uniform CNO with too few sats must not be flagged");
+}
+
+/// A short burst of uniform CNO (< CNO_CONFIRM_COUNT) broken up by a normal
+/// spread must not latch — the sustained counter resets each time.
+#[test]
+fn test_cno_transient_uniform_not_spoofed() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    let uniform = [47u8, 47, 46, 47, 47, 46, 47, 47];
+    let spread = [19u8, 31, 44, 27, 49, 22, 38, 35];
+    let mut result = AnalysisResult::Normal;
+    for _ in 0..6 {
+        for _ in 0..5 {
+            // 5 uniform epochs (below the 10-epoch threshold)...
+            result = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &uniform));
+            t += 200;
+        }
+        // ...then one normal spread epoch resets the counter.
+        result = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &spread));
+        t += 200;
+    }
+    assert_eq!(result, AnalysisResult::Normal,
+        "transient uniform CNO broken by spread must not latch spoof");
+}
+
+// ============================================================================
+// Group 16: reported-velocity detection (velN/velE injection)
+// ============================================================================
+
+/// Position with explicit reported GNSS horizontal speed (mm/s), fixed 3D fix.
+fn pos_with_vel(lat: i32, lon: i32, time_ms: u32, reported_mms: u32) -> Position {
+    Position {
+        lat,
+        lon,
+        alt_mm: 100_000,
+        time_ms,
+        fix_type: FixType::Fix3D,
+        h_acc_mm: 1000,
+        num_sv: 12,
+        pdop: 150,
+        gnss_time: None,
+        cno_values: heapless::Vec::new(),
+        reported_speed_mms: reported_mms,
+    }
+}
+
+/// Reported horizontal speed above the physical ceiling (impossible for the
+/// fleet) → spoof, even with the position perfectly still.
+#[test]
+fn test_reported_speed_ceiling_detected() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+    let mut r = AnalysisResult::Normal;
+    for _ in 0..(VEL_ANOMALY_CONFIRM_COUNT as u32 + 2) {
+        r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 40_000)); // 40 m/s, static
+        t += 200;
+    }
+    assert_eq!(r, AnalysisResult::Spoofed, "reported speed above ceiling must flag");
+}
+
+/// Reported velocity far above the position-derived speed (velocity injected
+/// without matching movement — the 2026-06-07 crash signature) → spoof.
+#[test]
+fn test_velocity_position_desync_detected() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+    let mut r = AnalysisResult::Normal;
+    for _ in 0..(VEL_ANOMALY_CONFIRM_COUNT as u32 + 2) {
+        // Static position (track ~0) but reported 30 m/s (< 35 ceiling): desync 30 > 15.
+        r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 30_000));
+        t += 200;
+    }
+    assert_eq!(r, AnalysisResult::Spoofed, "reported >> track must flag desync");
+}
+
+/// Consistent fast flight (reported speed matches actual movement) must NOT be
+/// flagged — proves the check keys on inconsistency, not on speed alone.
+#[test]
+fn test_consistent_fast_flight_not_spoofed() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+    // ~4 m north per 200 ms = 20 m/s; reported matches at 20 m/s.
+    let step = 359; // ~4 m in 1e-7 deg latitude
+    let mut lat = BASE_LAT;
+    let mut r = AnalysisResult::Normal;
+    for _ in 0..30 {
+        lat += step;
+        r = det.analyze(pos_with_vel(lat, BASE_LON, t, 20_000));
+        t += 200;
+    }
+    assert_eq!(r, AnalysisResult::Normal, "consistent fast flight must not flag");
+}
+
+/// A brief desync burst (< VEL_ANOMALY_CONFIRM_COUNT) broken by consistent
+/// frames must not latch — the sustained counter resets.
+#[test]
+fn test_velocity_transient_not_spoofed() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+    let mut r = AnalysisResult::Normal;
+    for _ in 0..6 {
+        for _ in 0..3 {
+            r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 30_000)); // desync, only 3
+            t += 200;
+        }
+        r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 0)); // consistent → resets counter
+        t += 200;
+    }
+    assert_eq!(r, AnalysisResult::Normal, "transient desync must not latch spoof");
 }

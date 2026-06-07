@@ -82,17 +82,23 @@ pub mod thresholds {
     // ===== CNO (Carrier-to-Noise) detection thresholds =====
     // Currently disabled but kept for future use
 
-    /// Minimum CNO standard deviation (dB-Hz)
-    #[allow(dead_code)]
+    /// Minimum CNO standard deviation (dB-Hz). Below this the used-satellite
+    /// C/N0 spread is suspiciously flat (spoof signature).
     pub const MIN_CNO_STDDEV: f32 = 3.0;
 
     /// High CNO threshold (dB-Hz)
     #[allow(dead_code)]
     pub const HIGH_CNO_THRESHOLD: u8 = 45;
 
-    /// Minimum satellites needed for CNO variance analysis
-    #[allow(dead_code)]
-    pub const MIN_SATS_FOR_CNO_CHECK: u8 = 4;
+    /// Minimum satellites needed for CNO variance analysis.
+    /// 6+ used satellites gives a stable variance estimate and avoids flagging
+    /// sparse legitimate fixes whose few strong sats happen to look uniform.
+    pub const MIN_SATS_FOR_CNO_CHECK: u8 = 6;
+
+    /// Consecutive epochs of uniform-high CNO required before treating it as a
+    /// spoof. A single-antenna spoofer holds near-flat high C/N0 indefinitely;
+    /// transient open-sky uniformity does not persist this long. ~2s at 5 Hz.
+    pub const CNO_CONFIRM_COUNT: u8 = 10;
 
     // ===== System clock drift detection thresholds =====
 
@@ -107,6 +113,23 @@ pub mod thresholds {
     /// Warmup samples after recovery to ignore coordinate jumps during GPS re-acquisition
     /// GPS needs time to stabilize after re-acquiring satellites
     pub const RECOVERY_WARMUP_COUNT: u8 = 10; // ~2 seconds at 5 Hz
+
+    // ===== Reported-velocity (velN/velE) detection thresholds =====
+
+    /// Physically impossible reported horizontal speed (m/s). Target fleet
+    /// (Air3/Air3S/Mavic) tops out ~21 m/s; anything above this in the GNSS
+    /// velocity field is injected. Fleet-dependent — raise for FPV airframes.
+    pub const REPORTED_SPEED_MAX_MS: f32 = 35.0;
+
+    /// Max gap between GNSS-reported speed and position-derived speed (m/s).
+    /// Both come from the same receiver and must agree; a velocity-injection
+    /// spoof drives reported >> position-derived. Field baseline (3 normal
+    /// flights vs the 2026-06-07 crash): 15 m/s gives 0 false / 104 true frames.
+    pub const VEL_CONSISTENCY_MAX_MS: f32 = 15.0;
+
+    /// Consecutive epochs of a velocity anomaly required before acting on it
+    /// (~1s at 5 Hz) — filters single-sample position/velocity glitches.
+    pub const VEL_ANOMALY_CONFIRM_COUNT: u8 = 5;
 }
 
 /// GNSS time from NAV-PVT (UTC time with GPS week reference)
@@ -229,6 +252,9 @@ pub struct Position {
     /// Number of satellites used
     #[allow(dead_code)]
     pub num_sv: u8,
+    /// Horizontal speed reported by the GNSS (mm/s, from NAV-PVT velN/velE).
+    /// Compared against the position-derived speed to catch injected velocity.
+    pub reported_speed_mms: u32,
     /// PDOP * 100 (from NAV-DOP)
     #[allow(dead_code)]
     pub pdop: u16,
@@ -310,6 +336,14 @@ pub struct SpoofDetector {
     /// Recovery warmup counter - ignore coordinate anomalies after spoofing ends
     /// to allow GPS to stabilize during re-acquisition
     recovery_warmup_samples: u8,
+
+    /// Consecutive epochs with a uniform-high CNO anomaly. Sustained count
+    /// (>= CNO_CONFIRM_COUNT) confirms a spoof independent of coordinate motion.
+    cno_anomaly_count: u8,
+
+    /// Consecutive epochs with a reported-velocity anomaly (impossible speed or
+    /// reported >> position-derived). Sustained count confirms velocity injection.
+    vel_anomaly_count: u8,
 }
 
 /// Result of position analysis
@@ -357,6 +391,8 @@ impl SpoofDetector {
             warmup_samples: 0,
             // Recovery warmup counter (starts at max to disable until first recovery)
             recovery_warmup_samples: thresholds::RECOVERY_WARMUP_COUNT,
+            cno_anomaly_count: 0,
+            vel_anomaly_count: 0,
         }
     }
 
@@ -492,12 +528,6 @@ impl SpoofDetector {
             }
         }
 
-        // DISABLED: CNO anomaly check - too many false positives, keeping code for future use
-        // let cno_anomaly = self.check_cno_anomaly(&pos);
-        // if cno_anomaly {
-        //     warn!("CNO ANOMALY detected - uniform high signal strength across satellites");
-        // }
-
         // Warmup period - ignore anomalies during first N samples
         // This prevents false positives when GNSS first acquires fix
         let in_warmup = self.warmup_samples < Self::WARMUP_SAMPLES;
@@ -531,7 +561,7 @@ impl SpoofDetector {
         // - During RECOVERY warmup, coordinate anomalies are ignored to prevent
         //   false positives from GPS re-acquisition jitter
         //
-        // Disabled: is_accel_anomaly, cno_anomaly
+        // Disabled: is_accel_anomaly
 
         // Coordinate anomalies - disabled during recovery warmup
         let coord_anomaly = analysis.is_teleport || analysis.is_speed_anomaly || analysis.is_alt_anomaly;
@@ -583,7 +613,35 @@ impl SpoofDetector {
             false
         };
 
-        let is_anomaly = coord_anomaly_effective || time_anomaly || last_good_anomaly || origin_drift_anomaly;
+        // CNO uniformity — a spoof signal independent of coordinate behaviour.
+        // Disabled during startup warmup (acquisition C/N0 is unstable) and gated
+        // behind a sustained counter so transient uniformity is ignored.
+        let cno_anomaly_raw = !in_warmup && self.check_cno_anomaly(&pos);
+        if cno_anomaly_raw {
+            self.cno_anomaly_count = self.cno_anomaly_count.saturating_add(1);
+        } else {
+            self.cno_anomaly_count = 0;
+        }
+        let cno_spoof = self.cno_anomaly_count >= thresholds::CNO_CONFIRM_COUNT;
+
+        // Reported-velocity checks — GNSS-reported horizontal speed (velN/velE) must
+        // match the position-derived speed (same receiver). A velocity-injection spoof
+        // (crash 2026-06-07: reported ~41 m/s on a real ~few-m/s track) shows up as an
+        // impossible absolute speed and/or reported >> position-derived. Directional:
+        // position >> reported is the teleport/speed case, already handled above.
+        let reported_speed_ms = pos.reported_speed_mms as f32 / 1000.0;
+        let vel_ceiling = reported_speed_ms > thresholds::REPORTED_SPEED_MAX_MS;
+        let vel_desync = !in_recovery_warmup
+            && (reported_speed_ms - analysis.speed_ms) > thresholds::VEL_CONSISTENCY_MAX_MS;
+        let vel_anomaly_raw = !in_warmup && (vel_ceiling || vel_desync);
+        if vel_anomaly_raw {
+            self.vel_anomaly_count = self.vel_anomaly_count.saturating_add(1);
+        } else {
+            self.vel_anomaly_count = 0;
+        }
+        let vel_spoof = self.vel_anomaly_count >= thresholds::VEL_ANOMALY_CONFIRM_COUNT;
+
+        let is_anomaly = coord_anomaly_effective || time_anomaly || last_good_anomaly || origin_drift_anomaly || cno_spoof || vel_spoof;
 
         // Детальное логирование состояния детектора (trace — не выводится без явного включения)
         trace!(
@@ -688,6 +746,18 @@ impl SpoofDetector {
                     "ACCELERATION anomaly: {} m/s² (max {})",
                     analysis.accel_ms2 as i32,
                     thresholds::MAX_ACCEL_MS2 as i32
+                );
+            }
+            if cno_spoof {
+                warn!(
+                    "CNO anomaly: uniform-high C/N0 for {} epochs (spoof signature)",
+                    self.cno_anomaly_count
+                );
+            }
+            if vel_spoof {
+                warn!(
+                    "VELOCITY anomaly: reported {} m/s vs track {} m/s (injected velocity)",
+                    reported_speed_ms as i32, analysis.speed_ms as i32
                 );
             }
 
@@ -867,6 +937,8 @@ impl SpoofDetector {
         self.warmup_samples = 0;
         // Reset recovery warmup (start at max to disable until first recovery)
         self.recovery_warmup_samples = thresholds::RECOVERY_WARMUP_COUNT;
+        self.cno_anomaly_count = 0;
+        self.vel_anomaly_count = 0;
         info!("Spoof detector reset");
     }
 
@@ -936,11 +1008,10 @@ impl SpoofDetector {
         (is_spoof, is_recovery)
     }
 
-    /// Check CNO (Carrier-to-Noise) values for spoofing indicators
-    /// Spoofers often have uniform high CNO across all satellites
-    /// Returns true if CNO pattern is suspiciously uniform
-    /// NOTE: Currently disabled in analyze() but kept for future use
-    #[allow(dead_code)]
+    /// Check CNO (Carrier-to-Noise) values for spoofing indicators.
+    /// A single-antenna spoofer drives all used satellites to a near-uniform,
+    /// elevated C/N0. Returns true for that signature; the caller requires it to
+    /// persist (CNO_CONFIRM_COUNT epochs) before acting on it.
     fn check_cno_anomaly(&self, pos: &Position) -> bool {
         let cno_count = pos.cno_values.len();
 
@@ -965,21 +1036,13 @@ impl SpoofDetector {
             / cno_count as f32;
         let stddev = libm::sqrtf(variance);
 
-        // Check 1: All satellites have suspiciously high CNO (>45 dB-Hz)
-        let all_high = pos
-            .cno_values
-            .iter()
-            .all(|&v| v > thresholds::HIGH_CNO_THRESHOLD);
-
-        // Check 2: Very low variance with high mean (uniform high signal)
-        // Real satellites have varying signal strengths due to atmosphere, multipath, etc.
-        let uniform_high = stddev < thresholds::MIN_CNO_STDDEV && mean > 40.0;
-
-        if all_high || uniform_high {
-            return true;
-        }
-
-        false
+        // Spoof signature: many used satellites at a near-uniform, elevated C/N0.
+        // Real constellations spread out by elevation/atmosphere/multipath (stddev
+        // typically >4 dB-Hz); a single-antenna spoofer drives them to near-equal
+        // power. The old "all sats > HIGH_CNO_THRESHOLD" OR-term is NOT used — an
+        // open-sky legitimate fix can show all-strong sats with real spread, which
+        // is exactly what made this check false-positive before.
+        stddev < thresholds::MIN_CNO_STDDEV && mean > 40.0
     }
 
     /// Check and update system clock calibration

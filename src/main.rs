@@ -1675,7 +1675,7 @@ async fn gnss_processing_task() {
 
                     // Detect spoofing ONLY from NAV-PVT (0x01, 0x07)
                     if class == 0x01 && id == 0x07 && frame.len() >= 100 {
-                        if let Some((lat, lon, alt, h_acc, _speed, num_sv)) =
+                        if let Some((lat, lon, alt, h_acc, speed, num_sv)) =
                             extract_position_from_pvt(&frame[6..])
                         {
                             let fix_type = FixType::from_u8(frame[6 + 20]);
@@ -1697,6 +1697,7 @@ async fn gnss_processing_task() {
                                 pdop: 100,
                                 gnss_time,
                                 cno_values: last_cno_values.clone(),
+                                reported_speed_mms: speed.max(0) as u32,
                             };
 
                             let result = detector.analyze(pos);
