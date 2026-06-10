@@ -468,6 +468,35 @@ impl SpoofDetector {
                 }
             }
 
+            // Check 3: per-frame channels remain valid across a gap — CNO uniformity
+            // and the reported-speed ceiling. The desync check is skipped: the
+            // position-derived speed over a >5s gap is meaningless. Counters keep
+            // their normal-path semantics (a clean gap frame resets them), so a
+            // sustained anomaly straddling the gap still latches.
+            let in_warmup = self.warmup_samples < Self::WARMUP_SAMPLES;
+            let cno_anomaly_raw = !in_warmup && self.check_cno_anomaly(&pos);
+            self.cno_anomaly_count = if cno_anomaly_raw {
+                self.cno_anomaly_count.saturating_add(1)
+            } else {
+                0
+            };
+            if self.cno_anomaly_count >= thresholds::CNO_CONFIRM_COUNT {
+                warn!("CNO anomaly across gap: uniform-high C/N0 (gap={}ms)", dt_ms);
+                gap_spoof = true;
+            }
+
+            let vel_ceiling = !in_warmup
+                && pos.reported_speed_mms as f32 / 1000.0 > thresholds::REPORTED_SPEED_MAX_MS;
+            self.vel_anomaly_count = if vel_ceiling {
+                self.vel_anomaly_count.saturating_add(1)
+            } else {
+                0
+            };
+            if self.vel_anomaly_count >= thresholds::VEL_ANOMALY_CONFIRM_COUNT {
+                warn!("VELOCITY anomaly across gap: reported speed above ceiling (gap={}ms)", dt_ms);
+                gap_spoof = true;
+            }
+
             if gap_spoof {
                 self.total_anomalies += 1;
                 // Immediate confirmation for gap+teleport/time — no need for consecutive count

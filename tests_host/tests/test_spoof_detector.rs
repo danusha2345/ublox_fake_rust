@@ -2271,6 +2271,50 @@ fn test_cno_transient_uniform_not_spoofed() {
         "transient uniform CNO broken by spread must not latch spoof");
 }
 
+/// Uniform-high CNO sustained right across a >5s gap must still latch: the
+/// gap path evaluates the per-frame CNO channel, so the gap frame itself can
+/// confirm (counter 9 before the gap + the gap frame = 10).
+#[test]
+fn test_cno_uniform_straddles_gap_detected() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    let uniform = [47u8, 47, 46, 47, 47, 46, 47, 47];
+    for _ in 0..(CNO_CONFIRM_COUNT as u32 - 1) {
+        let r = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &uniform));
+        assert_eq!(r, AnalysisResult::Normal, "below threshold, must not flag yet");
+        t += 200;
+    }
+    t += 6000; // > MAX_GAP_MS
+    let r = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &uniform));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "uniform CNO straddling a gap must confirm at the gap frame");
+}
+
+/// A gap frame with a normal CNO spread resets the sustained counter — the
+/// pre-gap uniform burst must not carry across the gap.
+#[test]
+fn test_gap_clean_frame_resets_cno_counter() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    let uniform = [47u8, 47, 46, 47, 47, 46, 47, 47];
+    let spread = [19u8, 31, 44, 27, 49, 22, 38, 35];
+    for _ in 0..(CNO_CONFIRM_COUNT as u32 - 1) {
+        det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &uniform));
+        t += 200;
+    }
+    t += 6000; // > MAX_GAP_MS
+    let r = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &spread));
+    assert_eq!(r, AnalysisResult::GapReset, "clean gap frame must reset reference");
+    // Counter was reset: a full CNO_CONFIRM_COUNT is needed again.
+    for _ in 0..(CNO_CONFIRM_COUNT as u32 - 1) {
+        t += 200;
+        let r = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &uniform));
+        assert_eq!(r, AnalysisResult::Normal, "counter must restart after clean gap frame");
+    }
+}
+
 // ============================================================================
 // Group 16: reported-velocity detection (velN/velE injection)
 // ============================================================================
@@ -2355,4 +2399,45 @@ fn test_velocity_transient_not_spoofed() {
         t += 200;
     }
     assert_eq!(r, AnalysisResult::Normal, "transient desync must not latch spoof");
+}
+
+/// Reported speed above the ceiling sustained right across a >5s gap must
+/// still latch: the gap path evaluates the ceiling channel, so the gap frame
+/// itself can confirm (counter 4 before the gap + the gap frame = 5).
+#[test]
+fn test_vel_ceiling_straddles_gap_detected() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    for _ in 0..(VEL_ANOMALY_CONFIRM_COUNT as u32 - 1) {
+        let r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 40_000)); // 40 m/s
+        assert_eq!(r, AnalysisResult::Normal, "below threshold, must not flag yet");
+        t += 200;
+    }
+    t += 6000; // > MAX_GAP_MS
+    let r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 40_000));
+    assert_eq!(r, AnalysisResult::Spoofed,
+        "reported-speed ceiling straddling a gap must confirm at the gap frame");
+}
+
+/// A gap frame with a normal reported speed resets the sustained counter —
+/// the pre-gap burst must not carry across the gap.
+#[test]
+fn test_gap_clean_frame_resets_vel_counter() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    for _ in 0..(VEL_ANOMALY_CONFIRM_COUNT as u32 - 1) {
+        det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 40_000));
+        t += 200;
+    }
+    t += 6000; // > MAX_GAP_MS
+    let r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 0));
+    assert_eq!(r, AnalysisResult::GapReset, "clean gap frame must reset reference");
+    // Counter was reset: a full VEL_ANOMALY_CONFIRM_COUNT is needed again.
+    for _ in 0..(VEL_ANOMALY_CONFIRM_COUNT as u32 - 1) {
+        t += 200;
+        let r = det.analyze(pos_with_vel(BASE_LAT, BASE_LON, t, 40_000));
+        assert_eq!(r, AnalysisResult::Normal, "counter must restart after clean gap frame");
+    }
 }

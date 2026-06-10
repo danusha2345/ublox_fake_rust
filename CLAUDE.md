@@ -31,7 +31,7 @@ make rp2350                           # Build UF2 for RP2350
 make rp2354                           # Build UF2 for RP2354
 make flash                            # Flash via probe-rs (RP2350)
 make flash-rp2354                     # Flash via probe-rs (RP2354)
-make test                             # Run all 147 host-side tests
+make test                             # Run all 151 host-side tests
 
 cargo rb                              # run release binary (alias)
 cargo rp2350                          # build ELF only (alias)
@@ -43,15 +43,15 @@ cargo rp2354                          # build ELF only (alias)
 `spoof_detector.rs` — чистая логика (без зависимостей от embassy/cortex-m), может тестироваться на хосте через `tests_host/`.
 
 ```bash
-cd tests_host && cargo test            # All 147 tests
+cd tests_host && cargo test            # All 151 tests
 cd tests_host && cargo test vuln       # Только регрессионные тесты
 ```
 
 **Структура**: `tests_host/` — standalone-крейт (НЕ в workspace) с `defmt_mock/` (no-op макросы) и `#[path]` к `../../src/spoof_detector.rs`.
 
-**Группы тестов** (147 тестов — 97 spoof_detector + 42 passthrough + 8 coordinates):
+**Группы тестов** (151 тест — 101 spoof_detector + 42 passthrough + 8 coordinates):
 
-Spoof detector (97 тестов):
+Spoof detector (101 тест):
 | Группа | Тесты | Покрытие |
 |--------|-------|----------|
 | 0: Утилиты | 8 | GnssTime, calc_distance, FixType |
@@ -69,8 +69,8 @@ Spoof detector (97 тестов):
 | 12: Bug fixes | 6 | Time recovery+distance, last_good check, origin drift |
 | 13: Leash+altitude | 5 | Постепенный drift, leash freeze, altitude jump |
 | 14: Satellite loss | 12 | Циклы потеря+spoof+recovery, gap thresholds, NoFix persistence |
-| 15: CNO uniformity | 4 | Устойчивый uniform-high C/N0 = спуф; разброс / мало спутников / transient = норма |
-| 16: Velocity inject | 4 | Потолок reported>35 м/с, рассинхрон reported−track>15 м/с; consistent fast = норма |
+| 15: CNO uniformity | 6 | Устойчивый uniform-high C/N0 = спуф; разброс / мало спутников / transient = норма; счётчик через gap |
+| 16: Velocity inject | 6 | Потолок reported>35 м/с, рассинхрон reported−track>15 м/с; consistent fast = норма; счётчик через gap |
 
 Passthrough (42 теста):
 | Группа | Тесты | Покрытие |
@@ -198,6 +198,8 @@ Emulation не запускает `SpoofDetector::analyze()`, т.к. не пот
                               │ last_good >2km? ││
                               │ clock drift?    ││
                               │ GNSS time jump? ││
+                              │ CNO uniform?    ││
+                              │ vel ceiling?    ││
                               └──┬───────┬──────┘│
                               ANY│    NONE│       │
                              ┌───▼───┐ ┌──▼────┐  │
