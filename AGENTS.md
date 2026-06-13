@@ -1,43 +1,43 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-Этот проект индексирован GitNexus как **ublox_fake_rust** (1668 символов, 3294 связи, 20 execution flows). Используйте MCP-инструменты GitNexus для понимания кода, оценки impact и безопасной навигации.
+This project is indexed by GitNexus as **ublox_fake_rust** (1712 symbols, 3401 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
-> Если какой-то инструмент GitNexus сообщает, что индекс устарел — сначала запустите в терминале `npx gitnexus analyze`.
+> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
-## Что делать всегда
+## Always Do
 
-- **ОБЯЗАТЕЛЬНО запускать impact analysis перед правкой любого символа.** Перед изменением функции, класса или метода вызывайте `gitnexus_impact({target: "symbolName", direction: "upstream"})` и сообщайте пользователю blast radius (прямые вызывающие, затронутые процессы, уровень риска).
-- **ОБЯЗАТЕЛЬНО запускать `gitnexus_detect_changes()` перед коммитом**, чтобы убедиться, что изменения затронули только ожидаемые символы и execution flows.
-- **ОБЯЗАТЕЛЬНО предупреждать пользователя**, если impact analysis возвращает риск HIGH или CRITICAL, до начала правок.
-- При исследовании незнакомого кода используйте `gitnexus_query({query: "concept"})` для поиска execution flows вместо grep. Он возвращает результаты, сгруппированные по процессам и отсортированные по релевантности.
-- Когда нужен полный контекст по конкретному символу — вызывающие, вызываемые, в каких execution flows он участвует — используйте `gitnexus_context({name: "symbolName"})`.
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
 
-## Что делать никогда
+## Never Do
 
-- НИКОГДА не править функцию, класс или метод, не запустив сначала `gitnexus_impact`.
-- НИКОГДА не игнорировать предупреждения HIGH или CRITICAL от impact analysis.
-- НИКОГДА не переименовывать символы через find-and-replace — используйте `gitnexus_rename`, который понимает call graph.
-- НИКОГДА не коммитить изменения без `gitnexus_detect_changes()` для проверки затронутого scope.
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
 
-## Ресурсы
+## Resources
 
-| Ресурс | Использование |
-|--------|---------------|
-| `gitnexus://repo/ublox_fake_rust/context` | Обзор кодовой базы, проверка свежести индекса |
-| `gitnexus://repo/ublox_fake_rust/clusters` | Все функциональные области |
-| `gitnexus://repo/ublox_fake_rust/processes` | Все execution flows |
-| `gitnexus://repo/ublox_fake_rust/process/{name}` | Пошаговая трассировка выполнения |
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/ublox_fake_rust/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/ublox_fake_rust/clusters` | All functional areas |
+| `gitnexus://repo/ublox_fake_rust/processes` | All execution flows |
+| `gitnexus://repo/ublox_fake_rust/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
-| Задача | Какой skill-файл читать |
-|--------|------------------------|
-| Понять архитектуру / «Как работает X?» | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / «Что сломается, если изменить X?» | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Трассировка багов / «Почему X падает?» | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / рефакторинг | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Инструменты, ресурсы, справка по схеме | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Команды CLI: index, status, clean, wiki | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->

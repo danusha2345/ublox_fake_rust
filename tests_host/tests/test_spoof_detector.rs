@@ -2166,11 +2166,23 @@ fn test_anomaly_counter_through_cycles() {
 // Group 15: CNO uniformity detection (carrier-to-noise spoof signature)
 // ============================================================================
 
-/// Build a heapless CNO vector from a slice.
-fn cno_vec(vals: &[u8]) -> heapless::Vec<u8, 16> {
-    let mut v: heapless::Vec<u8, 16> = heapless::Vec::new();
+/// Build a heapless CNO vector from a slice, all on one constellation (GPS,
+/// gnssId 0). Per-constellation grouping then reduces to a plain spread over
+/// these values — matching the original single-pool semantics of these tests.
+fn cno_vec(vals: &[u8]) -> heapless::Vec<(u8, u8), 16> {
+    let mut v: heapless::Vec<(u8, u8), 16> = heapless::Vec::new();
     for &x in vals {
-        let _ = v.push(x);
+        let _ = v.push((0, x));
+    }
+    v
+}
+
+/// Build a CNO vector from explicit (gnssId, cno) pairs — for multi-constellation
+/// scenarios (e.g. a flat fake plateau alongside a real residual constellation).
+fn cno_vec_multi(pairs: &[(u8, u8)]) -> heapless::Vec<(u8, u8), 16> {
+    let mut v: heapless::Vec<(u8, u8), 16> = heapless::Vec::new();
+    for &p in pairs {
+        let _ = v.push(p);
     }
     v
 }
@@ -2189,6 +2201,23 @@ fn pos_with_cno(lat: i32, lon: i32, time_ms: u32, cno: &[u8]) -> Position {
         pdop: 150,
         gnss_time: None,
         cno_values: cno_vec(cno),
+        reported_speed_mms: 0,
+    }
+}
+
+/// Position carrying explicit (gnssId, cno) pairs (multi-constellation).
+fn pos_with_cno_multi(lat: i32, lon: i32, time_ms: u32, pairs: &[(u8, u8)]) -> Position {
+    Position {
+        lat,
+        lon,
+        alt_mm: 100_000,
+        time_ms,
+        fix_type: FixType::Fix3D,
+        h_acc_mm: 1000,
+        num_sv: 12,
+        pdop: 150,
+        gnss_time: None,
+        cno_values: cno_vec_multi(pairs),
         reported_speed_mms: 0,
     }
 }
@@ -2313,6 +2342,97 @@ fn test_gap_clean_frame_resets_cno_counter() {
         let r = det.analyze(pos_with_cno(BASE_LAT, BASE_LON, t, &uniform));
         assert_eq!(r, AnalysisResult::Normal, "counter must restart after clean gap frame");
     }
+}
+
+/// Field log 1 (weak spoof, Pulkovo June 2026): a constellation sitting flat at
+/// LOW C/N0 (~22 dB-Hz, σ<1) over >=6 used sats. Flatness — not absolute level —
+/// is the signature; the old `mean>40` gate let this through (0% detection on the
+/// real recording). Now caught.
+#[test]
+fn test_cno_flat_low_constellation_detected() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    // 7 GPS sats ~22 dB-Hz: mean ≈ 22 (> MIN_CNO_MEAN floor), σ < 1.
+    let flat_low = [(0u8, 22u8), (0, 23), (0, 22), (0, 21), (0, 23), (0, 22), (0, 22)];
+    let mut result = AnalysisResult::Normal;
+    for _ in 0..(CNO_CONFIRM_COUNT as u32 + 2) {
+        result = det.analyze(pos_with_cno_multi(BASE_LAT, BASE_LON, t, &flat_low));
+        t += 200;
+    }
+    assert_eq!(result, AnalysisResult::Spoofed,
+        "sustained flat low-C/N0 constellation must latch spoof");
+}
+
+/// Field log 2 (strong spoof): a flat fake constellation (Galileo, σ<1 at ~47)
+/// coexists with a real residual (GLONASS, wide spread 21-52). The POOLED σ over
+/// all sats exceeds the flatness threshold (so the old single-pool check missed
+/// it ~22% of epochs), but the per-constellation test still flags Galileo.
+#[test]
+fn test_cno_per_constellation_not_masked_by_residual() {
+    let mut det = SpoofDetector::new();
+    let mut t = feed_warmup(&mut det, BASE_LAT, BASE_LON, 1000);
+
+    let mixed = [
+        // Galileo (gnssId 2): flat fake plateau, 7 sats, σ < 1
+        (2u8, 47u8), (2, 47), (2, 48), (2, 47), (2, 46), (2, 47), (2, 48),
+        // GLONASS (gnssId 6): real residual, wide spread, 6 sats, σ > 8
+        (6, 21), (6, 52), (6, 33), (6, 45), (6, 28), (6, 49),
+    ];
+    // Sanity: pooled σ over all 13 values is > MIN_CNO_STDDEV (old check misses),
+    // but Galileo alone is implausibly flat.
+    let pooled_vals: Vec<f32> = mixed.iter().map(|&(_, c)| c as f32).collect();
+    let pmean = pooled_vals.iter().sum::<f32>() / pooled_vals.len() as f32;
+    let pstd = (pooled_vals.iter().map(|v| (v - pmean).powi(2)).sum::<f32>()
+        / pooled_vals.len() as f32).sqrt();
+    assert!(pstd > MIN_CNO_STDDEV,
+        "test premise: pooled σ ({pstd:.1}) must exceed threshold so pooling would miss it");
+
+    let mut result = AnalysisResult::Normal;
+    for _ in 0..(CNO_CONFIRM_COUNT as u32 + 2) {
+        result = det.analyze(pos_with_cno_multi(BASE_LAT, BASE_LON, t, &mixed));
+        t += 200;
+    }
+    assert_eq!(result, AnalysisResult::Spoofed,
+        "flat fake constellation must be detected despite a noisy real residual");
+}
+
+/// Fix (June 2026): a coordinate spoof that mirrors real GPS time must STAY
+/// latched. The spoofer keeps clock drift ≈0, so clock_drift_recovery fires
+/// every epoch; without the coord-anomaly guard the time-recovery path cleared
+/// the latch on the spot, letting fake coords flap through. Here the platform
+/// "moves" at ~40 m/s (speed anomaly) but stays within 2 km of last_good (so
+/// near_last_good is true) — exactly the condition that used to mis-clear.
+#[test]
+fn test_honest_time_coord_spoof_stays_latched() {
+    let mut det = SpoofDetector::new();
+    let base_gt = gnss_time(2026, 3, 15, 12, 0, 0, 1000);
+    let (mut t, last_gt) = feed_warmup_with_time(&mut det, BASE_LAT, BASE_LON, 1000, base_gt);
+
+    let mut gnss_sec = last_gt.sec;
+    let mut lat = BASE_LAT;
+    let mut detected = false;
+    for _ in 0..20 {
+        // Honest time: advance GNSS by 1 s every real second (drift ≈ 0).
+        if (t - 1000) % 1000 == 0 {
+            gnss_sec += 1;
+        }
+        // ~8 m north per 200 ms = 40 m/s → continuous speed anomaly,
+        // but cumulative drift stays well under the 2 km leash.
+        lat += 720;
+        let gt = gnss_time(last_gt.year, last_gt.month, last_gt.day,
+                           last_gt.hour, last_gt.min, gnss_sec, t);
+        let r = det.analyze(pos_with_time(lat, BASE_LON, t, gt));
+        if detected {
+            assert_eq!(r, AnalysisResult::Spoofed,
+                "honest-time coordinate spoof must not flap back to Normal");
+        }
+        if r == AnalysisResult::Spoofed {
+            detected = true;
+        }
+        t += 200;
+    }
+    assert!(detected, "fast-moving coordinate spoof must be detected");
 }
 
 // ============================================================================

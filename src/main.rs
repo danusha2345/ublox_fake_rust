@@ -1611,8 +1611,8 @@ async fn gnss_processing_task() {
     let mut cached_offset_llh: Option<(i32, i32, i32)> = None; // (lat, lon, height_mm) after offset
     let mut first_offset_logged = false;
 
-    // CNO buffer - accumulates CNO values from NAV-SAT messages
-    let mut last_cno_values: heapless::Vec<u8, 16> = heapless::Vec::new();
+    // CNO buffer - accumulates (gnssId, cno) values from NAV-SAT messages
+    let mut last_cno_values: heapless::Vec<(u8, u8), 16> = heapless::Vec::new();
 
     info!("GNSS processing task ready");
 

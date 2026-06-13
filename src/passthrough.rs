@@ -645,50 +645,52 @@ pub fn extract_gnss_time_from_pvt(payload: &[u8], system_time_ms: u32) -> Option
     })
 }
 
-/// Extract CNO (Carrier-to-Noise) values from NAV-SAT payload
-/// Returns Vec of CNO values (dB-Hz) for satellites with valid signal
-/// Used for detecting uniform high CNO (spoof indicator)
-pub fn extract_cno_from_nav_sat(payload: &[u8]) -> heapless::Vec<u8, 16> {
-    let mut cno_values: heapless::Vec<u8, 16> = heapless::Vec::new();
-    
+/// Extract C/N0 from NAV-SAT payload as (gnssId, cno) pairs.
+/// gnssId is needed so the spoof detector can test each constellation's C/N0
+/// flatness independently (a real residual in one system must not mask a flat
+/// fake plateau in another). Only used satellites with a valid (non-zero) C/N0.
+pub fn extract_cno_from_nav_sat(payload: &[u8]) -> heapless::Vec<(u8, u8), 16> {
+    let mut cno_values: heapless::Vec<(u8, u8), 16> = heapless::Vec::new();
+
     // NAV-SAT structure:
     // Header: 8 bytes (iTOW[4], version[1], numSvs[1], reserved[2])
     // Per-satellite block: 12 bytes each
     //   - gnssId[1], svId[1], cno[1], elev[1], azim[2], prRes[2], flags[4]
-    
+
     if payload.len() < 8 {
         return cno_values;
     }
-    
+
     let num_svs = payload[5] as usize;
-    
+
     // Check payload size
     let expected_size = 8 + num_svs * 12;
     if payload.len() < expected_size {
         return cno_values;
     }
-    
-    // Extract CNO for each satellite with valid signal
+
+    // Extract (gnssId, CNO) for each satellite with valid signal
     for i in 0..num_svs.min(16) {
         let offset = 8 + i * 12;
-        let cno = payload[offset + 2]; // CNO at offset 2 within satellite block
+        let gnss_id = payload[offset];     // gnssId at offset 0 within sat block
+        let cno = payload[offset + 2];     // CNO at offset 2 within sat block
         let flags = u32::from_le_bytes([
             payload[offset + 8],
             payload[offset + 9],
             payload[offset + 10],
             payload[offset + 11],
         ]);
-        
+
         // Check if satellite is used in solution (bit 3 of flags)
         // Only consider satellites that are actually being used
         let sv_used = (flags & 0x08) != 0;
-        
+
         // Only include satellites with valid CNO (not 0) that are used
         if cno > 0 && sv_used {
-            let _ = cno_values.push(cno);
+            let _ = cno_values.push((gnss_id, cno));
         }
     }
-    
+
     cno_values
 }
 

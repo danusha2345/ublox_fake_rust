@@ -80,11 +80,18 @@ pub mod thresholds {
     pub const TIME_RECOVERY_TOLERANCE_S: i64 = 5;
 
     // ===== CNO (Carrier-to-Noise) detection thresholds =====
-    // Currently disabled but kept for future use
+    // Active: per-constellation C/N0 flatness check (see check_cno_anomaly).
 
     /// Minimum CNO standard deviation (dB-Hz). Below this the used-satellite
-    /// C/N0 spread is suspiciously flat (spoof signature).
+    /// C/N0 spread (per constellation) is suspiciously flat (spoof signature).
     pub const MIN_CNO_STDDEV: f32 = 3.0;
+
+    /// Minimum mean C/N0 (dB-Hz) for a constellation to be considered for the
+    /// flatness test. Flatness — not absolute level — is the spoof signature: a
+    /// real weak spoof was as flat (σ<1) at 22-27 dB-Hz as a strong one at 47.
+    /// This low floor only rejects the noise floor / all-zero junk that would
+    /// otherwise read as "perfectly flat". (June 2026 Pulkovo recordings.)
+    pub const MIN_CNO_MEAN: f32 = 20.0;
 
     /// High CNO threshold (dB-Hz)
     #[allow(dead_code)]
@@ -260,10 +267,11 @@ pub struct Position {
     pub pdop: u16,
     /// GNSS time (optional, extracted from NAV-PVT)
     pub gnss_time: Option<GnssTime>,
-    /// CNO values from satellites (up to 16 values, from NAV-SAT)
-    /// Used for detecting uniform high CNO (spoof indicator)
+    /// Per-satellite C/N0 from NAV-SAT as (gnssId, cno) pairs (up to 16).
+    /// gnssId follows u-blox numbering (0=GPS, 2=Galileo, 3=BeiDou, 6=GLONASS,
+    /// …). Grouped by constellation for the flatness (uniform-C/N0) spoof check.
     #[allow(dead_code)]
-    pub cno_values: heapless::Vec<u8, 16>,
+    pub cno_values: heapless::Vec<(u8, u8), 16>,
 }
 
 /// Velocity state for EMA filtering
@@ -733,7 +741,14 @@ impl SpoofDetector {
                 info!("Recalibrated system clock after time recovery");
             }
 
-            if near_last_good {
+            // Clear only if coordinates are near last_good AND not currently
+            // anomalous. A spoofer that mirrors real GPS time keeps clock drift
+            // ≈0, so clock_drift_recovery fires every epoch — without the
+            // coord_anomaly guard it would clear a still-active coordinate spoof
+            // (e.g. a fake platform "moving" at >30 m/s) on the spot. Field
+            // recordings (June 2026, Pulkovo) confirmed honest-time spoofing
+            // un-latched the detector ~every frame through this path.
+            if near_last_good && !coord_anomaly {
                 self.spoofed = false;
                 self.normal_count = 0;
                 self.anomaly_count = 0;
@@ -742,8 +757,8 @@ impl SpoofDetector {
                 self.prev = Some(pos);
                 return AnalysisResult::Normal;
             } else {
-                // Time ok but coordinates still far from last_good → stay spoofed
-                info!("Time recovered but position still far from last_good - staying spoofed");
+                // Time ok but coordinates still far/anomalous → stay spoofed
+                info!("Time recovered but coordinates still spoofed - staying spoofed");
                 self.prev = Some(pos);
                 return AnalysisResult::Spoofed;
             }
@@ -1038,40 +1053,49 @@ impl SpoofDetector {
     }
 
     /// Check CNO (Carrier-to-Noise) values for spoofing indicators.
-    /// A single-antenna spoofer drives all used satellites to a near-uniform,
-    /// elevated C/N0. Returns true for that signature; the caller requires it to
-    /// persist (CNO_CONFIRM_COUNT epochs) before acting on it.
+    /// A single-antenna spoofer drives a whole constellation to a near-uniform
+    /// C/N0 (flat — at any level, low or high). Returns true for that signature
+    /// on any constellation; the caller requires it to persist (CNO_CONFIRM_COUNT
+    /// epochs) before acting on it.
     fn check_cno_anomaly(&self, pos: &Position) -> bool {
-        let cno_count = pos.cno_values.len();
-
-        // Need enough satellites for meaningful analysis
-        if cno_count < thresholds::MIN_SATS_FOR_CNO_CHECK as usize {
-            return false;
+        // Test each constellation INDEPENDENTLY. A single-antenna spoofer drives
+        // a whole constellation to a near-uniform C/N0; real sky always spreads
+        // by elevation/atmosphere/multipath (σ typically >4 dB-Hz). Pooling all
+        // constellations into one σ lets a genuine residual (e.g. a real GLONASS
+        // sat the spoofer didn't overpower) inflate the pooled σ above threshold
+        // and mask the flat fake plateau — observed in the field (pooled σ>3
+        // while per-constellation σ<1). gnssId is 0..=7 in u-blox numbering.
+        for gid in 0u8..=7 {
+            let mut n: u32 = 0;
+            let mut sum: u32 = 0;
+            for &(g, c) in pos.cno_values.iter() {
+                if g == gid {
+                    n += 1;
+                    sum += c as u32;
+                }
+            }
+            if n < thresholds::MIN_SATS_FOR_CNO_CHECK as u32 {
+                continue;
+            }
+            let mean = sum as f32 / n as f32;
+            // Low floor only rejects the noise floor / all-zero junk; flatness,
+            // not level, is the signature (a 22-27 dB-Hz spoof was as flat as 47).
+            if mean < thresholds::MIN_CNO_MEAN {
+                continue;
+            }
+            let mut variance_acc: f32 = 0.0;
+            for &(g, c) in pos.cno_values.iter() {
+                if g == gid {
+                    let diff = c as f32 - mean;
+                    variance_acc += diff * diff;
+                }
+            }
+            let stddev = libm::sqrtf(variance_acc / n as f32);
+            if stddev < thresholds::MIN_CNO_STDDEV {
+                return true; // this constellation is implausibly flat → spoof
+            }
         }
-
-        // Calculate mean CNO
-        let sum: u32 = pos.cno_values.iter().map(|&v| v as u32).sum();
-        let mean = sum as f32 / cno_count as f32;
-
-        // Calculate standard deviation
-        let variance: f32 = pos
-            .cno_values
-            .iter()
-            .map(|&v| {
-                let diff = v as f32 - mean;
-                diff * diff
-            })
-            .sum::<f32>()
-            / cno_count as f32;
-        let stddev = libm::sqrtf(variance);
-
-        // Spoof signature: many used satellites at a near-uniform, elevated C/N0.
-        // Real constellations spread out by elevation/atmosphere/multipath (stddev
-        // typically >4 dB-Hz); a single-antenna spoofer drives them to near-equal
-        // power. The old "all sats > HIGH_CNO_THRESHOLD" OR-term is NOT used — an
-        // open-sky legitimate fix can show all-strong sats with real spread, which
-        // is exactly what made this check false-positive before.
-        stddev < thresholds::MIN_CNO_STDDEV && mean > 40.0
+        false
     }
 
     /// Check and update system clock calibration

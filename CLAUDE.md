@@ -31,7 +31,7 @@ make rp2350                           # Build UF2 for RP2350
 make rp2354                           # Build UF2 for RP2354
 make flash                            # Flash via probe-rs (RP2350)
 make flash-rp2354                     # Flash via probe-rs (RP2354)
-make test                             # Run all 151 host-side tests
+make test                             # Run all 154 host-side tests
 
 cargo rb                              # run release binary (alias)
 cargo rp2350                          # build ELF only (alias)
@@ -43,15 +43,15 @@ cargo rp2354                          # build ELF only (alias)
 `spoof_detector.rs` — чистая логика (без зависимостей от embassy/cortex-m), может тестироваться на хосте через `tests_host/`.
 
 ```bash
-cd tests_host && cargo test            # All 151 tests
+cd tests_host && cargo test            # All 154 tests
 cd tests_host && cargo test vuln       # Только регрессионные тесты
 ```
 
 **Структура**: `tests_host/` — standalone-крейт (НЕ в workspace) с `defmt_mock/` (no-op макросы) и `#[path]` к `../../src/spoof_detector.rs`.
 
-**Группы тестов** (151 тест — 101 spoof_detector + 42 passthrough + 8 coordinates):
+**Группы тестов** (154 теста — 104 spoof_detector + 42 passthrough + 8 coordinates):
 
-Spoof detector (101 тест):
+Spoof detector (104 теста):
 | Группа | Тесты | Покрытие |
 |--------|-------|----------|
 | 0: Утилиты | 8 | GnssTime, calc_distance, FixType |
@@ -62,14 +62,14 @@ Spoof detector (101 тест):
 | 5: Clock drift | 6 | calibration, порог 10s, recovery |
 | 6: Recovery | 9 | coord (5+1 samples), time (immediate), warmup |
 | 7: Gap handling | 8 | gap >5s, gap+teleport/drift/time, gap-aware time (чистый гэп ≠ спуф) |
-| 8: Регрессии | 6 | март 2026 vulns: immediate detect, last_good guard |
+| 8: Регрессии | 7 | март 2026 vulns: immediate detect, last_good guard; honest-time coord-спуф остаётся latched (июнь 2026) |
 | 9: last_good | 4 | Invariant: заморожен при spoof, переживает recovery |
 | 10: Complex | 4 | Циклы spoof/recovery, реалистичная атака |
 | 11: Reset | 2 | Чистое состояние после reset |
 | 12: Bug fixes | 6 | Time recovery+distance, last_good check, origin drift |
 | 13: Leash+altitude | 5 | Постепенный drift, leash freeze, altitude jump |
 | 14: Satellite loss | 12 | Циклы потеря+spoof+recovery, gap thresholds, NoFix persistence |
-| 15: CNO uniformity | 6 | Устойчивый uniform-high C/N0 = спуф; разброс / мало спутников / transient = норма; счётчик через gap |
+| 15: CNO uniformity | 8 | Устойчивый uniform C/N0 = спуф (per-constellation σ, не маскируется реальным остатком; плоский низкий C/N0 тоже спуф); разброс / мало спутников / transient = норма; счётчик через gap |
 | 16: Velocity inject | 6 | Потолок reported>35 м/с, рассинхрон reported−track>15 м/с; consistent fast = норма; счётчик через gap |
 
 Passthrough (42 теста):
@@ -220,8 +220,8 @@ Emulation не запускает `SpoofDetector::analyze()`, т.к. не пот
                    └────┬──────────────────────────┬────────┘
                       YES                          │NO
                ┌───────▼────────┐                  │
-               │dist(last_good, │                  │
-               │    curr) < 2km?│                  │
+               │near last_good &│                  │
+               │NO coord_anomaly│                  │
                └──┬──────────┬──┘                  │
                 YES        NO│                     │
          ┌──────▼──────┐ ┌──▼───────────┐         │
@@ -254,8 +254,8 @@ Emulation не запускает `SpoofDetector::analyze()`, т.к. не пот
                                            │   [disabled in startup warmup]  │
                                            │                                 │
                                            │ cno_spoof =                     │
-                                           │   uniform-high C/N0             │
-                                           │   (stddev<3, mean>40, >=6 sat)  │
+                                           │   uniform C/N0 per-con          │
+                                           │   (std<3, mean>20, >=6/con)     │
                                            │   sustained >=10 epochs         │
                                            │                                 │
                                            │ vel_spoof =                     │
@@ -572,3 +572,47 @@ probe-rs read --chip RP2354 0x101FD000 37   # RP2354 (2MB flash)
   `insert_before_symbol` вместо ручных правок по строкам.
 
 Полное тело файла читать только если символьные инструменты не покрывают задачу.
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **ublox_fake_rust** (1712 symbols, 3401 relationships, 20 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/ublox_fake_rust/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/ublox_fake_rust/clusters` | All functional areas |
+| `gitnexus://repo/ublox_fake_rust/processes` | All execution flows |
+| `gitnexus://repo/ublox_fake_rust/process/{name}` | Step-by-step execution trace |
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->
